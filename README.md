@@ -1,3 +1,5 @@
+![ProxylFit](proxylfit.png)
+
 # ProxylFit: Dynamic MRI Kinetic Analysis
 
 ProxylFit is a comprehensive Python toolkit for analyzing time-resolved MRI data after Proxyl contrast injection. The software provides robust image registration, interactive ROI selection, and sophisticated kinetic modeling capabilities.
@@ -152,25 +154,6 @@ python run_analysis.py --dicom data.dcm --z 4 \
     --create-parameter-maps \
     --window-size-x 5 --window-size-y 5 --window-size-z 3
 ```
-
-## Performance Notes
-
-- **Extended Model**: Requires ≥8 timepoints (vs 5 for basic model)
-- **Parameter Mapping**: Computationally intensive; use appropriate window sizes
-- **Registration Caching**: Automatic caching reduces repeat processing time
-- **Memory Usage**: Scales with 4D dataset size and window dimensions
-
-## Troubleshooting
-
-See individual module documentation for specific troubleshooting guides:
-- Registration quality issues → [REGISTRATION.md](REGISTRATION.md)
-- ROI selection problems → [ROI_SELECTION.md](ROI_SELECTION.md)  
-- Fitting convergence → [KINETIC_FITTING.md](KINETIC_FITTING.md)
-- Parameter mapping performance → [PARAMETER_MAPPING.md](PARAMETER_MAPPING.md)
-
-## Citation
-
-When using ProxylFit, please cite the relevant publications and acknowledge the extended kinetic modeling framework.
 
 ---
 
