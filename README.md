@@ -18,8 +18,6 @@ I(t) = A0 + A1*(1 - exp(-kb*(t - t0))) * exp(-kd*(t - t0)) + A2*(1 - exp(-knt*(t
 - **Interactive ROI Selection**: Multiple modes including rectangular, manual contour drawing, and SegmentAnything-based segmentation
 - **Extended Kinetic Modeling**: Fits tracer dynamics with non-tracer effects
 - **Parameter Mapping**: Spatial parameter maps using sliding window analysis
-- **Accept Button Workflows**: Intuitive GUI interactions with explicit accept buttons
-- **70-Second Time Intervals**: Optimized for typical Proxyl acquisition protocols
 
 ## Quick Start
 
@@ -51,22 +49,10 @@ python run_analysis.py --dicom data.dcm --z 4 --create-parameter-maps --window-s
 
 ### Model Components
 
-1. **Baseline**: `A0` - constant background signal
-2. **Tracer Term**: `A1*(1 - exp(-kb*(t - t0))) * exp(-kd*(t - t0))` - contrast buildup and decay
-3. **Non-tracer Term**: `A2*(1 - exp(-knt*(t - tmax)))` - physiological effects
+1. **Baseline**: `A0`
+2. **Tracer Term**: `A1*(1 - exp(-kb*(t - t0))) * exp(-kd*(t - t0))
+3. **Non-tracer Term**: `A2*(1 - exp(-knt*(t - tmax)))`
 
-## Timing Protocol
-
-- **Timestep**: 70 seconds per timepoint
-- **Display Units**: Minutes (70 sec = 1.167 min)
-- **Acquisition**: Optimized for dynamic Proxyl MRI protocols
-
-## Module Documentation
-
-- [**Registration**](REGISTRATION.md) - Image registration and quality assessment
-- [**ROI Selection**](ROI_SELECTION.md) - Interactive region of interest tools
-- [**Kinetic Fitting**](KINETIC_FITTING.md) - Extended model fitting and analysis
-- [**Parameter Mapping**](PARAMETER_MAPPING.md) - Spatial parameter map generation
 
 ## Installation
 
@@ -86,22 +72,13 @@ pip install seaborn plotly
 
 ## Workflow
 
-1. **Load DICOM Data** - Import 4D time series MRI data
-2. **Registration** - Rigid alignment across timepoints with quality visualization
-3. **ROI Selection** - Interactive selection using multiple methods
-4. **Injection Time Selection** - Define contrast injection timepoint
-5. **Kinetic Fitting** - Extended model parameter estimation
+1. **Load DICOM Data** - Import 4D time series PROXYL MRI data
+2. **Registration** - Rigid registration across timepoints with quality visualization
+3. **ROI Selection** - Interactive ROI selection
+4. **Injection Time Selection** - Define PROXYL contrast injection timepoint
+5. **Kinetic Fitting** - Kinetic model parameter estimation
 6. **Parameter Mapping** (optional) - Spatial parameter distribution analysis
-7. **Results Export** - Comprehensive results and visualization
 
-## GUI Features
-
-All interactive components now use **Accept buttons** instead of "close window" workflows:
-
-- **Registration Viewer**: "Accept Registration" button
-- **ROI Selection**: "Accept ROI" button  
-- **Injection Time**: "Set Injection Time" button
-- **Export Functionality**: CSV export with "Export CSV" button
 
 ## Output Files
 
