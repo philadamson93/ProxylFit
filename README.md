@@ -1,8 +1,8 @@
 ![ProxylFit](proxylfit.png)
 
-# ProxylFit: Dynamic MRI Kinetic Analysis
+# ProxylFit: PROXYL MRI Analysis
 
-ProxylFit is a comprehensive Python toolkit for analyzing time-resolved MRI data after Proxyl contrast injection. The software provides robust image registration, interactive ROI selection, and sophisticated kinetic modeling capabilities.
+ProxylFit is a comprehensive Python toolkit for analyzing time-resolved MRI data after PROXYL contrast injection. The software provides robust image registration, interactive ROI selection, and sophisticated kinetic modeling capabilities.
 
 ## Overview
 
