@@ -1,0 +1,9 @@
+numpy>=1.20.0
+scipy>=1.7.0
+matplotlib>=3.3.0
+SimpleITK>=2.1.0
+
+# Optional dependencies for SegmentAnything segmentation mode
+# Install with: pip install segment-anything opencv-python
+# segment-anything
+# opencv-python

@@ -1,0 +1,13 @@
+name: proxyl
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - numpy>=1.20.0
+  - scipy>=1.7.0
+  - matplotlib>=3.3.0
+  - simpleitk>=2.1.0
+  - pip
+  - pip:
+    - pydicom  # Additional DICOM support if needed
