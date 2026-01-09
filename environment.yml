@@ -8,6 +8,7 @@ dependencies:
   - scipy>=1.7.0
   - matplotlib>=3.3.0
   - simpleitk>=2.1.0
+  - pyside6>=6.5.0
   - pip
   - pip:
     - pydicom  # Additional DICOM support if needed

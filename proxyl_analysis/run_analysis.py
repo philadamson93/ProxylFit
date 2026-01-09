@@ -21,6 +21,15 @@ from proxyl_analysis.roi_selection import select_rectangle_roi, select_segmentat
 from proxyl_analysis.model import fit_proxyl_kinetics, plot_fit_results, print_fit_summary, calculate_derived_parameters, select_injection_time
 from proxyl_analysis.parameter_mapping import create_parameter_maps, visualize_parameter_maps, save_parameter_maps, print_progress, enhanced_parameter_mapping_workflow
 
+# Import Qt-based UI (modern, responsive layout)
+from proxyl_analysis.ui import (
+    select_rectangle_roi_qt,
+    select_manual_contour_roi_qt,
+    select_injection_time_qt,
+    plot_fit_results_qt,
+    init_qt_app
+)
+
 
 def create_time_array(num_timepoints: int, time_units: str = 'minutes') -> np.ndarray:
     """
@@ -54,7 +63,10 @@ def create_time_array(num_timepoints: int, time_units: str = 'minutes') -> np.nd
 
 def main():
     """Main analysis pipeline."""
-    
+
+    # Initialize Qt application for GUI components
+    app = init_qt_app()
+
     # Parse command line arguments
     parser = argparse.ArgumentParser(
         description='Analyze time-resolved MRI data after Proxyl injection',
@@ -448,13 +460,13 @@ def main():
             
             if args.roi_mode == 'rectangle':
                 print(f"  Please select a rectangular ROI on slice {args.z}")
-                print("  Instructions will appear in the plot window.")
-                roi_mask = select_rectangle_roi(registered_4d, args.z)
-                
+                print("  Using Qt-based UI with proper layout management.")
+                roi_mask = select_rectangle_roi_qt(registered_4d, args.z)
+
             elif args.roi_mode == 'contour':
                 print(f"  Please draw a contour around the ROI on slice {args.z}")
-                print("  Drag to draw, 'c' to close contour, 'r' to reset.")
-                roi_mask = select_manual_contour_roi(registered_4d, args.z)
+                print("  Using Qt-based UI with proper layout management.")
+                roi_mask = select_manual_contour_roi_qt(registered_4d, args.z)
                 
             elif args.roi_mode == 'segment':
                 print(f"  Please segment the ROI using SegmentAnything on slice {args.z}")
@@ -462,18 +474,18 @@ def main():
                 print("  Press 's' to run segmentation, 'c' to confirm, 'r' to reset.")
                 try:
                     roi_mask = select_segmentation_roi(
-                        registered_4d, args.z, 
+                        registered_4d, args.z,
                         model_path=args.sam_model_path,
                         model_type=args.sam_model_type
                     )
                 except ImportError as e:
                     print(f"Error: {e}")
-                    print("Falling back to rectangle selection...")
-                    roi_mask = select_rectangle_roi(registered_4d, args.z)
+                    print("Falling back to rectangle selection (Qt UI)...")
+                    roi_mask = select_rectangle_roi_qt(registered_4d, args.z)
                 except Exception as e:
                     print(f"Segmentation failed: {e}")
-                    print("Falling back to rectangle selection...")
-                    roi_mask = select_rectangle_roi(registered_4d, args.z)
+                    print("Falling back to rectangle selection (Qt UI)...")
+                    roi_mask = select_rectangle_roi_qt(registered_4d, args.z)
             
             if not np.any(roi_mask):
                 print("Error: No ROI was selected. Exiting.")
@@ -504,8 +516,8 @@ def main():
                 next_step = "5"
             print(f"Step {next_step}: Selecting injection time...")
             print("  Please click on the time point when contrast was injected.")
-            print("  Press 'e' or click 'Export CSV' button to save timecourse data.")
-            injection_index = select_injection_time(time_array, signal_timeseries, args.time_units, str(output_dir))
+            print("  Using Qt-based UI with proper layout management.")
+            injection_index = select_injection_time_qt(time_array, signal_timeseries, args.time_units, str(output_dir))
             
             # Trim data to start from injection time
             time_array_fit = time_array[injection_index:]
@@ -638,8 +650,8 @@ def main():
             # Create and save plot
             if not args.no_plot:
                 plot_file = output_dir / "kinetic_fit.png"
-                plot_fit_results(time_array_fit, signal_timeseries_fit, fitted_signal, 
-                               fit_results, str(plot_file))
+                plot_fit_results_qt(time_array_fit, signal_timeseries_fit, fitted_signal,
+                                   fit_results, str(plot_file))
         
         print("\nAnalysis completed successfully!")
         print("="*60)
