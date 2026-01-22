@@ -15,8 +15,8 @@ from pathlib import Path
 # Add the parent directory to the path so we can import our package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from proxyl_analysis.io import load_dicom_series
-from proxyl_analysis.registration import register_timeseries, load_registration_data, save_registration_data
+from proxyl_analysis.io import load_dicom_series, load_t2_volume
+from proxyl_analysis.registration import register_timeseries, load_registration_data, save_registration_data, register_t2_to_t1
 from proxyl_analysis.roi_selection import select_rectangle_roi, select_segmentation_roi, select_manual_contour_roi, compute_roi_timeseries, print_roi_mode_info, get_available_roi_modes
 from proxyl_analysis.model import fit_proxyl_kinetics, plot_fit_results, print_fit_summary, calculate_derived_parameters, select_injection_time
 from proxyl_analysis.parameter_mapping import create_parameter_maps, visualize_parameter_maps, save_parameter_maps, print_progress, enhanced_parameter_mapping_workflow
@@ -27,7 +27,11 @@ from proxyl_analysis.ui import (
     select_manual_contour_roi_qt,
     select_injection_time_qt,
     plot_fit_results_qt,
-    init_qt_app
+    init_qt_app,
+    show_main_menu,
+    run_registration_with_progress,
+    show_registration_review_qt,
+    show_image_tools_dialog
 )
 
 
@@ -74,15 +78,27 @@ def main():
     )
     
     parser.add_argument(
-        '--dicom', 
-        type=str, 
-        required=True,
-        help='Path to the DICOM file'
+        '--dicom',
+        type=str,
+        required=False,
+        help='Path to the T1 DICOM file (optional if using menu to load)'
     )
-    
+
     parser.add_argument(
-        '--z', 
-        type=int, 
+        '--batch',
+        action='store_true',
+        help='Batch mode: skip main menu and use command-line arguments directly'
+    )
+
+    parser.add_argument(
+        '--t2',
+        type=str,
+        help='Path to T2 DICOM file for ROI selection (optional). T2 provides better tumor definition for RANO criteria.'
+    )
+
+    parser.add_argument(
+        '--z',
+        type=int,
         default=4,
         help='Z-slice index for ROI selection (0-8 for 9 slices)'
     )
@@ -223,20 +239,61 @@ def main():
     args = parser.parse_args()
     
     # Validate inputs
-    if not os.path.exists(args.dicom):
+    if args.batch and not args.dicom:
+        print("Error: --dicom is required when using --batch mode")
+        sys.exit(1)
+
+    if args.dicom and not os.path.exists(args.dicom):
         print(f"Error: DICOM file not found: {args.dicom}")
         sys.exit(1)
-    
+
     if not (0 <= args.z <= 8):
         print(f"Error: Z-slice index must be between 0-8, got {args.z}")
         sys.exit(1)
-    
+
     # Validate ROI mode
     available_modes = get_available_roi_modes()
     if args.roi_mode not in available_modes:
         print(f"Error: ROI mode '{args.roi_mode}' not available.")
         print_roi_mode_info()
         sys.exit(1)
+
+    # If no DICOM provided and not in batch mode, show menu to load
+    if not args.dicom and not args.batch:
+        print("="*60)
+        print("PROXYL MRI ANALYSIS - INTERACTIVE MODE")
+        print("="*60)
+        print("No DICOM file specified. Opening main menu...")
+        print()
+
+        # Show menu with no data loaded
+        result = show_main_menu(
+            registered_4d=None,
+            spacing=None,
+            time_array=None,
+            dicom_path="",
+            output_dir=args.output_dir,
+            registered_t2=None
+        )
+
+        if result is None or result.get('action') == 'exit':
+            print("Exiting.")
+            sys.exit(0)
+
+        # Handle menu result
+        if result.get('action') == 'load_new':
+            args.dicom = result['dicom_path']
+        elif result.get('action') == 'load_previous':
+            args.load_registration = result['session_path']
+            # Try to find original DICOM path from metadata
+            metrics_file = Path(result['session_path']) / "registration_metrics.json"
+            if metrics_file.exists():
+                with open(metrics_file, 'r') as f:
+                    metadata = json.load(f).get('metadata', {})
+                    args.dicom = metadata.get('dicom_path', '')
+        else:
+            print(f"Unexpected menu action: {result.get('action')}")
+            sys.exit(1)
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -331,8 +388,7 @@ def main():
                     
                     # Show registration visualization window
                     print("  Showing registration quality visualization...")
-                    from proxyl_analysis.registration import visualize_registration_quality
-                    visualize_registration_quality(image_4d, registered_4d, reg_metrics)
+                    show_registration_review_qt(image_4d, registered_4d, reg_metrics, output_dir=args.load_registration)
                 else:
                     image_4d = None
                     
@@ -356,14 +412,268 @@ def main():
             else:
                 print("Step 2: Performing rigid registration...")
                 show_reg_window = not args.no_registration_window
-                registered_4d, reg_metrics = register_timeseries(
-                    image_4d, spacing, 
-                    output_dir=str(auto_registration_dir),
-                    show_quality_window=show_reg_window,
-                    dicom_path=args.dicom
-                )
+
+                if args.batch:
+                    # Batch mode: use direct registration (no progress dialog)
+                    registered_4d, reg_metrics = register_timeseries(
+                        image_4d, spacing,
+                        output_dir=str(auto_registration_dir),
+                        show_quality_window=show_reg_window,
+                        dicom_path=args.dicom
+                    )
+                else:
+                    # Interactive mode: use progress dialog
+                    registered_4d, reg_metrics = run_registration_with_progress(
+                        image_4d, spacing,
+                        output_dir=str(auto_registration_dir),
+                        dicom_path=args.dicom
+                    )
+                    if registered_4d is None:
+                        print("Registration cancelled.")
+                        sys.exit(0)
+                    # Show quality window after progress dialog closes
+                    if show_reg_window:
+                        show_registration_review_qt(image_4d, registered_4d, reg_metrics, output_dir=str(auto_registration_dir))
         print()
-        
+
+        # Show main menu (if not in batch mode)
+        if not args.batch:
+            # Create time array for menu
+            time_array = create_time_array(registered_4d.shape[3], args.time_units)
+
+            # ROI state preserved across menu returns
+            roi_state = None
+            registered_t2 = None
+
+            # Menu loop - keep showing menu until user exits
+            while True:
+                # Show menu with loaded data and ROI state
+                menu_result = show_main_menu(
+                    registered_4d=registered_4d,
+                    spacing=spacing,
+                    time_array=time_array,
+                    dicom_path=args.dicom,
+                    output_dir=str(auto_registration_dir),
+                    registered_t2=registered_t2,
+                    roi_state=roi_state
+                )
+
+                if menu_result is None or menu_result.get('action') == 'exit':
+                    print("Exiting.")
+                    sys.exit(0)
+
+                # Handle menu actions
+                action = menu_result.get('action')
+
+                if action == 'load_new':
+                    # User wants to load different data - restart
+                    print(f"Loading new DICOM: {menu_result['dicom_path']}")
+                    print("Please restart the application with the new file.")
+                    sys.exit(0)
+
+                elif action == 'load_previous':
+                    # User wants to load different session - restart
+                    print(f"Loading session from: {menu_result['session_path']}")
+                    print("Please restart the application with --load-registration flag.")
+                    sys.exit(0)
+
+                elif action == 'load_t2':
+                    # Load and register T2
+                    print(f"Loading T2 from: {menu_result['t2_path']}")
+                    try:
+                        from proxyl_analysis.io import load_t2_volume
+                        t2_volume, t2_spacing = load_t2_volume(menu_result['t2_path'])
+                        print(f"  T2 volume shape: {t2_volume.shape}")
+                        t1_reference = registered_4d[:, :, :, 0]
+                        registered_t2, reg_info = register_t2_to_t1(
+                            t2_volume=t2_volume,
+                            t2_spacing=t2_spacing,
+                            t1_reference=t1_reference,
+                            t1_spacing=spacing,
+                            show_quality=True
+                        )
+                        print(f"  T2-T1 registration complete")
+                    except Exception as e:
+                        print(f"  Error loading T2: {e}")
+                        registered_t2 = None
+                    continue  # Return to menu with T2 loaded
+
+                elif action == 'draw_roi':
+                    # Draw ROI -> Extract time series -> Select injection time -> Return to menu
+                    args.roi_mode = menu_result['roi_mode']
+                    args.z = menu_result['z_slice']
+
+                    # Choose image for ROI selection: T2 (if registered) or T1
+                    if registered_t2 is not None and menu_result.get('roi_source') == 't2':
+                        roi_selection_image = registered_t2[:, :, :, np.newaxis]
+                        print("  Using registered T2 for ROI selection")
+                    else:
+                        roi_selection_image = registered_4d
+                        print("  Using T1 for ROI selection")
+
+                    # Do ROI selection
+                    print(f"ROI selection ({args.roi_mode}) on slice {args.z}...")
+                    if args.roi_mode == 'rectangle':
+                        roi_mask = select_rectangle_roi_qt(roi_selection_image, args.z)
+                    elif args.roi_mode == 'contour':
+                        roi_mask = select_manual_contour_roi_qt(roi_selection_image, args.z)
+                    elif args.roi_mode == 'segment':
+                        try:
+                            roi_mask = select_segmentation_roi(
+                                roi_selection_image, args.z,
+                                model_path=args.sam_model_path,
+                                model_type=args.sam_model_type
+                            )
+                        except Exception as e:
+                            print(f"Segmentation failed: {e}, falling back to contour")
+                            roi_mask = select_manual_contour_roi_qt(roi_selection_image, args.z)
+
+                    if not np.any(roi_mask):
+                        print("No ROI was selected.")
+                        continue  # Return to menu
+
+                    print(f"  ROI selected with {np.sum(roi_mask)} pixels")
+
+                    # Extract time series from T1 (always use T1 for signal)
+                    roi_signal = compute_roi_timeseries(registered_4d, roi_mask)
+                    print(f"  Extracted {len(roi_signal)} time points")
+
+                    # Select injection time
+                    print("Select injection time point...")
+                    injection_idx = select_injection_time_qt(time_array, roi_signal, args.time_units, str(auto_registration_dir))
+                    injection_time = time_array[injection_idx]
+                    print(f"  Injection time: {injection_time:.1f} {args.time_units} (index {injection_idx})")
+
+                    # Store ROI state
+                    roi_state = {
+                        'roi_mask': roi_mask,
+                        'roi_signal': roi_signal,
+                        'injection_idx': injection_idx,
+                        'injection_time': injection_time
+                    }
+                    print("ROI and injection time set. Returning to menu.")
+                    continue  # Return to menu with ROI state
+
+                elif action == 'kinetic_fit':
+                    # Run kinetic fitting on existing ROI data
+                    if roi_state is None:
+                        print("Error: No ROI data. Draw ROI first.")
+                        continue
+
+                    roi_mask = roi_state['roi_mask']
+                    roi_signal = roi_state['roi_signal']
+                    injection_idx = roi_state['injection_idx']
+
+                    # Trim data to start from injection time
+                    time_array_fit = time_array[injection_idx:]
+                    signal_fit = roi_signal[injection_idx:]
+
+                    print(f"Fitting kinetic model ({len(signal_fit)} points from injection)...")
+                    try:
+                        kb, kd, knt, fitted_signal, fit_results = fit_proxyl_kinetics(
+                            time_array_fit, signal_fit, args.time_units
+                        )
+
+                        # Print results
+                        print_fit_summary(fit_results)
+
+                        # Calculate derived parameters
+                        derived_params = calculate_derived_parameters(
+                            kb, kd, knt, fit_results['kb_error'], fit_results['kd_error'], fit_results['knt_error']
+                        )
+
+                        print("\nDerived Parameters:")
+                        print(f"  Tracer half-life (buildup):  {derived_params['half_life_buildup']:.2f} ± {derived_params['half_life_buildup_error']:.2f} {args.time_units}")
+                        print(f"  Tracer half-life (decay):    {derived_params['half_life_decay']:.2f} ± {derived_params['half_life_decay_error']:.2f} {args.time_units}")
+
+                        # Show fit plot (Qt-based)
+                        plot_file = auto_registration_dir / "kinetic_fit.png"
+                        plot_fit_results_qt(time_array_fit, signal_fit, fitted_signal,
+                                           fit_results, str(plot_file))
+
+                        # Save results
+                        results_file = auto_registration_dir / "kinetic_results.txt"
+                        with open(results_file, 'w') as f:
+                            f.write("EXTENDED PROXYL KINETIC ANALYSIS RESULTS\n")
+                            f.write("="*40 + "\n\n")
+                            f.write(f"DICOM file: {args.dicom}\n")
+                            f.write(f"ROI pixels: {np.sum(roi_mask)}\n")
+                            f.write(f"Injection time: {time_array[injection_idx]:.1f} {args.time_units} (index {injection_idx})\n\n")
+                            f.write("FITTED PARAMETERS:\n")
+                            f.write(f"kb (buildup rate):       {kb:.4f} ± {fit_results['kb_error']:.4f} /{args.time_units}\n")
+                            f.write(f"kd (decay rate):         {kd:.4f} ± {fit_results['kd_error']:.4f} /{args.time_units}\n")
+                            f.write(f"knt (non-tracer rate):   {knt:.4f} ± {fit_results['knt_error']:.4f} /{args.time_units}\n")
+                            f.write(f"\nFIT QUALITY:\n")
+                            f.write(f"R-squared: {fit_results['r_squared']:.4f}\n")
+                            f.write(f"RMSE:      {fit_results['rmse']:.3f}\n")
+
+                        print(f"\nResults saved to: {results_file}")
+
+                    except Exception as e:
+                        print(f"Error in kinetic fitting: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                    print("Returning to menu.")
+                    continue  # Return to menu
+
+                elif action == 'parameter_maps':
+                    # Set up for parameter mapping
+                    window_size = menu_result['window_size']
+                    args.window_size_x = window_size[0]
+                    args.window_size_y = window_size[1]
+                    args.window_size_z = window_size[2]
+                    args.create_parameter_maps = True
+                    args.skip_roi_analysis = True  # We handle ROI separately now
+                    break  # Proceed with parameter mapping (exit menu loop)
+
+                elif action == 'image_tools':
+                    # Launch Image Tools dialog (T002/T003)
+                    if roi_state is None:
+                        print("Error: No ROI data. Draw ROI first.")
+                        continue
+
+                    mode = menu_result.get('mode', 'average')
+                    print(f"Opening Image Tools ({mode} mode)...")
+
+                    show_image_tools_dialog(
+                        image_4d=registered_4d,
+                        time_array=time_array,
+                        roi_signal=roi_state['roi_signal'],
+                        time_units=args.time_units,
+                        output_dir=str(auto_registration_dir),
+                        initial_mode=mode
+                    )
+
+                    print("Returning to menu.")
+                    continue  # Return to menu
+
+                elif action == 'export':
+                    export_type = menu_result.get('export_type')
+                    if export_type == 'registered_data':
+                        print(f"Registered data saved to: {auto_registration_dir}")
+                    elif export_type == 'registration_report':
+                        print(f"Registration metrics saved to: {auto_registration_dir / 'registration_metrics.json'}")
+                    elif export_type == 'timeseries' and roi_state is not None:
+                        # Export time series CSV
+                        csv_file = auto_registration_dir / "roi_timeseries.csv"
+                        import csv
+                        with open(csv_file, 'w', newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow(['time', 'signal'])
+                            for t, s in zip(time_array, roi_state['roi_signal']):
+                                writer.writerow([t, s])
+                        print(f"Time series CSV saved to: {csv_file}")
+                    print("Export complete.")
+                    continue  # Return to menu
+
+                else:
+                    # Unknown action, show menu again
+                    continue
+
+            # If we break out of the menu loop, skip the rest and do parameter maps
+            args.skip_roi_analysis = True
+
         # Step 3: Enhanced parameter mapping (if requested)
         if args.enhanced_parameter_maps:
             print("Step 3: Enhanced parameter mapping workflow...")
@@ -448,7 +758,47 @@ def main():
             param_map_dir = output_dir / f"parameter_maps_{dicom_name}"
             save_parameter_maps(param_maps, spacing, str(param_map_dir), args.dicom)
             print()
-        
+
+        # T2-T1 Registration (if T2 provided via command line in batch mode)
+        # T2 images provide better tumor volume definition per RANO criteria
+        # In interactive mode, T2 is handled inside the menu loop
+        if not args.batch:
+            registered_t2 = None  # Already handled in menu loop, just ensure it's defined
+        elif args.t2:
+            print("Loading and registering T2 volume...")
+            try:
+                t2_volume, t2_spacing = load_t2_volume(args.t2)
+                print(f"  T2 volume shape: {t2_volume.shape}")
+                print(f"  T2 spacing: {t2_spacing}")
+
+                # Use first timepoint of T1 as reference
+                t1_reference = registered_4d[:, :, :, 0]
+
+                # Register T2 to T1
+                registered_t2, reg_info = register_t2_to_t1(
+                    t2_volume=t2_volume,
+                    t2_spacing=t2_spacing,
+                    t1_reference=t1_reference,
+                    t1_spacing=spacing,
+                    show_quality=not args.no_plot
+                )
+
+                print(f"  T2-T1 registration complete")
+                print(f"  Registered T2 shape: {registered_t2.shape}")
+                print(f"  Using registered T2 for ROI selection (better tumor definition)")
+                print()
+            except FileNotFoundError:
+                print(f"  Error: T2 file not found: {args.t2}")
+                print(f"  Falling back to T1 for ROI selection")
+                registered_t2 = None
+            except Exception as e:
+                print(f"  Error registering T2: {e}")
+                print(f"  Falling back to T1 for ROI selection")
+                registered_t2 = None
+        else:
+            # Batch mode without T2
+            registered_t2 = None
+
         # Step 5: ROI selection (skip if requested)
         if not args.skip_roi_analysis:
             # Determine step number based on what parameter mapping was done
@@ -457,35 +807,44 @@ def main():
             else:
                 step_num = "3"
             print(f"Step {step_num}: ROI selection...")
-            
+
+            # Choose image for ROI selection: T2 (if registered) or T1
+            if registered_t2 is not None:
+                # Create 4D volume from T2 for ROI selection UI (add time dimension)
+                roi_selection_image = registered_t2[:, :, :, np.newaxis]
+                print("  Using registered T2 for ROI selection (better tumor visualization)")
+            else:
+                roi_selection_image = registered_4d
+                print("  Using T1 for ROI selection")
+
             if args.roi_mode == 'rectangle':
                 print(f"  Please select a rectangular ROI on slice {args.z}")
                 print("  Using Qt-based UI with proper layout management.")
-                roi_mask = select_rectangle_roi_qt(registered_4d, args.z)
+                roi_mask = select_rectangle_roi_qt(roi_selection_image, args.z)
 
             elif args.roi_mode == 'contour':
                 print(f"  Please draw a contour around the ROI on slice {args.z}")
                 print("  Using Qt-based UI with proper layout management.")
-                roi_mask = select_manual_contour_roi_qt(registered_4d, args.z)
-                
+                roi_mask = select_manual_contour_roi_qt(roi_selection_image, args.z)
+
             elif args.roi_mode == 'segment':
                 print(f"  Please segment the ROI using SegmentAnything on slice {args.z}")
                 print("  Click to add points, 't' to toggle positive/negative mode.")
                 print("  Press 's' to run segmentation, 'c' to confirm, 'r' to reset.")
                 try:
                     roi_mask = select_segmentation_roi(
-                        registered_4d, args.z,
+                        roi_selection_image, args.z,
                         model_path=args.sam_model_path,
                         model_type=args.sam_model_type
                     )
                 except ImportError as e:
                     print(f"Error: {e}")
                     print("Falling back to rectangle selection (Qt UI)...")
-                    roi_mask = select_rectangle_roi_qt(registered_4d, args.z)
+                    roi_mask = select_rectangle_roi_qt(roi_selection_image, args.z)
                 except Exception as e:
                     print(f"Segmentation failed: {e}")
                     print("Falling back to rectangle selection (Qt UI)...")
-                    roi_mask = select_rectangle_roi_qt(registered_4d, args.z)
+                    roi_mask = select_rectangle_roi_qt(roi_selection_image, args.z)
             
             if not np.any(roi_mask):
                 print("Error: No ROI was selected. Exiting.")
