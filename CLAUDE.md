@@ -4,6 +4,7 @@
 
 - Keep commit messages short (one sentence)
 - Do not include "Co-Authored-By" lines
+- Do not put "authored by Claude" in commit messages
 - Use imperative mood (e.g., "Add feature" not "Added feature")
 
 ## Code Style
