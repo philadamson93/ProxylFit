@@ -226,7 +226,7 @@ def get_timepoint_volume(image_4d: np.ndarray, timepoint: int) -> np.ndarray:
 def get_slice_at_timepoint(image_4d: np.ndarray, z_index: int, timepoint: int = 0) -> np.ndarray:
     """
     Extract a 2D slice from a specific z-index and timepoint.
-    
+
     Parameters
     ----------
     image_4d : np.ndarray
@@ -235,7 +235,7 @@ def get_slice_at_timepoint(image_4d: np.ndarray, z_index: int, timepoint: int = 
         Z-slice index to extract
     timepoint : int, optional
         Time index to extract (default: 0)
-        
+
     Returns
     -------
     slice_2d : np.ndarray
@@ -245,5 +245,57 @@ def get_slice_at_timepoint(image_4d: np.ndarray, z_index: int, timepoint: int = 
         raise IndexError(f"Z-index {z_index} exceeds available slices ({image_4d.shape[2]})")
     if timepoint >= image_4d.shape[3]:
         raise IndexError(f"Timepoint {timepoint} exceeds available timepoints ({image_4d.shape[3]})")
-        
+
     return image_4d[:, :, z_index, timepoint]
+
+
+def load_t2_volume(filepath: str) -> Tuple[np.ndarray, Tuple[float, float, float]]:
+    """
+    Load a T2-weighted DICOM volume (single 3D volume, not time series).
+
+    T2 images provide better tumor volume definition (RANO criteria) and are
+    more useful for segmentation and ROI selection. This function loads a T2
+    volume that can be registered to the T1 series for ROI selection.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the T2 DICOM file
+
+    Returns
+    -------
+    t2_volume : np.ndarray
+        3D array with shape [x, y, z]
+    spacing : tuple of float
+        Voxel spacing (x, y, z) from DICOM metadata
+
+    Raises
+    ------
+    FileNotFoundError
+        If the DICOM file cannot be found
+    """
+    try:
+        # Load DICOM using SimpleITK
+        image = sitk.ReadImage(filepath)
+
+        # Get voxel spacing
+        spacing = _extract_robust_spacing(filepath)
+
+        if spacing == (1.0, 1.0, 1.0):
+            print("WARNING: T2 spacing could not be read from DICOM metadata")
+
+        # Convert to numpy array
+        # SimpleITK returns [z, y, x], transpose to [x, y, z]
+        image_array = sitk.GetArrayFromImage(image)
+        t2_volume = np.transpose(image_array, (2, 1, 0))
+
+        print(f"Loaded T2 volume with shape: {t2_volume.shape}")
+        print(f"T2 spacing: {spacing}")
+
+        return t2_volume, spacing
+
+    except Exception as e:
+        if "does not exist" in str(e).lower() or "cannot find" in str(e).lower():
+            raise FileNotFoundError(f"T2 DICOM file not found: {filepath}")
+        else:
+            raise RuntimeError(f"Error loading T2 DICOM file: {e}")

@@ -11,7 +11,7 @@ from matplotlib.widgets import Button
 from pathlib import Path
 import json
 import time
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, Callable
 from dataclasses import dataclass, asdict
 from .model import add_proxylfit_logo, set_proxylfit_style
 
@@ -31,12 +31,13 @@ class RegistrationMetrics:
 
 
 def register_timeseries(image_4d: np.ndarray, spacing: Tuple[float, float, float],
-                       output_dir: Optional[str] = None, 
+                       output_dir: Optional[str] = None,
                        show_quality_window: bool = True,
-                       dicom_path: Optional[str] = None) -> Tuple[np.ndarray, List[RegistrationMetrics]]:
+                       dicom_path: Optional[str] = None,
+                       progress_callback: Optional[Callable[[int, int, str], None]] = None) -> Tuple[np.ndarray, List[RegistrationMetrics]]:
     """
     Register each timepoint volume to the first timepoint using rigid registration.
-    
+
     Parameters
     ----------
     image_4d : np.ndarray
@@ -47,7 +48,14 @@ def register_timeseries(image_4d: np.ndarray, spacing: Tuple[float, float, float
         Directory to save registration data and metrics
     show_quality_window : bool
         Whether to show the registration quality visualization window
-        
+    dicom_path : str, optional
+        Path to the source DICOM file (for metadata)
+    progress_callback : callable, optional
+        Function called with (current, total, message, metrics_info) for progress updates.
+        Signature: progress_callback(current: int, total: int, message: str, metrics_info: dict|None) -> None
+        metrics_info is None when starting a timepoint, or a dict with 'mse', 'translation_mm',
+        'translation_px', 'time' after completion.
+
     Returns
     -------
     registered_4d : np.ndarray
@@ -84,7 +92,12 @@ def register_timeseries(image_4d: np.ndarray, spacing: Tuple[float, float, float
     
     # Register each subsequent timepoint
     for timepoint in range(1, t):
-        print(f"  Registering timepoint {timepoint}/{t-1}")
+        status_msg = f"Registering timepoint {timepoint}/{t-1}"
+        print(f"  {status_msg}")
+
+        # Call progress callback if provided (None for metrics_info means "in progress")
+        if progress_callback:
+            progress_callback(timepoint, t - 1, status_msg, None)
         
         start_time = time.time()
         
@@ -142,6 +155,16 @@ def register_timeseries(image_4d: np.ndarray, spacing: Tuple[float, float, float
         print(f"    Translation (pixels): X={tx_pixels:.1f}, Y={ty_pixels:.1f}, Z={tz_pixels:.1f} (mag={trans_mag_pixels:.1f})")
         print(f"    Voxel spacing (mm): X={spacing[0]:.3f}, Y={spacing[1]:.3f}, Z={spacing[2]:.3f}")
         print(f"    Time: {registration_time:.1f}s")
+
+        # Call progress callback with metrics after completion
+        if progress_callback:
+            metrics_info = {
+                'mse': mse,
+                'translation_mm': trans_mag,
+                'translation_px': trans_mag_pixels,
+                'time': registration_time
+            }
+            progress_callback(timepoint, t - 1, f"Completed timepoint {timepoint}/{t-1}", metrics_info)
     
     print("Registration complete.")
     
@@ -809,6 +832,273 @@ def compute_mean_squared_error(reference: np.ndarray, registered: np.ndarray) ->
         return np.mean((reference - registered) ** 2)
     except Exception:
         return float('inf')
+
+
+def register_t2_to_t1(t2_volume: np.ndarray, t2_spacing: Tuple[float, float, float],
+                      t1_reference: np.ndarray, t1_spacing: Tuple[float, float, float],
+                      show_quality: bool = True) -> Tuple[np.ndarray, Dict]:
+    """
+    Register T2 volume to T1 reference frame.
+
+    Uses mutual information metric which works well for multi-modal registration.
+    Supports different resolutions - T2 will be resampled to T1 grid.
+
+    Parameters
+    ----------
+    t2_volume : np.ndarray
+        T2 volume with shape [x, y, z]
+    t2_spacing : tuple of float
+        T2 voxel spacing (x, y, z)
+    t1_reference : np.ndarray
+        T1 reference volume with shape [x, y, z] (typically first timepoint)
+    t1_spacing : tuple of float
+        T1 voxel spacing (x, y, z)
+    show_quality : bool
+        Whether to show registration quality visualization
+
+    Returns
+    -------
+    registered_t2 : np.ndarray
+        T2 volume registered and resampled to T1 grid, shape matches T1
+    reg_info : dict
+        Registration information (transform parameters, metrics)
+    """
+    print("Registering T2 to T1 reference frame...")
+    print(f"  T2 shape: {t2_volume.shape}, spacing: {t2_spacing}")
+    print(f"  T1 shape: {t1_reference.shape}, spacing: {t1_spacing}")
+
+    start_time = time.time()
+
+    # Convert to SimpleITK images
+    t1_image = _numpy_to_sitk(t1_reference, t1_spacing)
+    t2_image = _numpy_to_sitk(t2_volume, t2_spacing)
+
+    # Initialize registration framework
+    registration_method = sitk.ImageRegistrationMethod()
+
+    # Use Mutual Information - works well for multi-modal (T1/T2)
+    registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=100)
+    registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
+    registration_method.SetMetricSamplingPercentage(0.1)  # More sampling for accuracy
+
+    # Linear interpolation
+    registration_method.SetInterpolator(sitk.sitkLinear)
+
+    # Optimizer
+    registration_method.SetOptimizerAsRegularStepGradientDescent(
+        learningRate=1.0,
+        minStep=1e-6,
+        numberOfIterations=2000,
+        gradientMagnitudeTolerance=1e-10
+    )
+    registration_method.SetOptimizerScalesFromPhysicalShift()
+
+    # Use rigid transform (Euler3D = rotation + translation)
+    initial_transform = sitk.CenteredTransformInitializer(
+        t1_image,
+        t2_image,
+        sitk.Euler3DTransform(),
+        sitk.CenteredTransformInitializerFilter.GEOMETRY
+    )
+    registration_method.SetInitialTransform(initial_transform)
+
+    # Multi-resolution
+    registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[8, 4, 2, 1])
+    registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[4, 2, 1, 0])
+    registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+
+    # Track iterations
+    iteration_count = [0]
+
+    def iteration_callback():
+        iteration_count[0] += 1
+
+    registration_method.AddCommand(sitk.sitkIterationEvent, iteration_callback)
+
+    # Execute registration
+    try:
+        final_transform = registration_method.Execute(t1_image, t2_image)
+
+        # Resample T2 to T1 grid
+        registered_t2_sitk = sitk.Resample(
+            t2_image,
+            t1_image,
+            final_transform,
+            sitk.sitkLinear,
+            0.0,
+            t2_image.GetPixelID()
+        )
+
+        # Convert back to numpy
+        registered_t2 = _sitk_to_numpy(registered_t2_sitk)
+
+        # Get transform parameters
+        translation = final_transform.GetTranslation()
+        rotation = (final_transform.GetAngleX(), final_transform.GetAngleY(), final_transform.GetAngleZ())
+
+        # Compute quality metrics
+        mi = compute_mutual_information(t1_image, registered_t2_sitk)
+        mse = compute_mean_squared_error(t1_reference, registered_t2)
+
+        registration_time = time.time() - start_time
+
+        reg_info = {
+            'translation_mm': translation,
+            'rotation_rad': rotation,
+            'rotation_deg': tuple(r * 180 / np.pi for r in rotation),
+            'mutual_information': mi,
+            'mean_squared_error': mse,
+            'iterations': iteration_count[0],
+            'final_metric': registration_method.GetMetricValue(),
+            'registration_time': registration_time,
+            'stop_condition': registration_method.GetOptimizerStopConditionDescription(),
+            'resampled': t2_volume.shape != t1_reference.shape
+        }
+
+        print(f"  Registration completed in {registration_time:.1f}s")
+        print(f"  Translation (mm): X={translation[0]:.2f}, Y={translation[1]:.2f}, Z={translation[2]:.2f}")
+        print(f"  Rotation (deg): X={reg_info['rotation_deg'][0]:.2f}, Y={reg_info['rotation_deg'][1]:.2f}, Z={reg_info['rotation_deg'][2]:.2f}")
+        print(f"  Mutual Information: {mi:.2f}")
+        if reg_info['resampled']:
+            print(f"  T2 resampled from {t2_volume.shape} to {registered_t2.shape}")
+
+        # Show quality visualization if requested
+        if show_quality:
+            _visualize_t2_t1_registration(t1_reference, t2_volume, registered_t2, reg_info)
+
+        return registered_t2, reg_info
+
+    except Exception as e:
+        print(f"WARNING: T2-T1 registration failed: {e}")
+        print("Returning original T2 volume (may need manual alignment)")
+
+        # If registration fails, try to just resample T2 to T1 grid
+        identity = sitk.Transform()
+        resampled_t2_sitk = sitk.Resample(
+            t2_image,
+            t1_image,
+            identity,
+            sitk.sitkLinear,
+            0.0,
+            t2_image.GetPixelID()
+        )
+        registered_t2 = _sitk_to_numpy(resampled_t2_sitk)
+
+        reg_info = {
+            'translation_mm': (0, 0, 0),
+            'rotation_rad': (0, 0, 0),
+            'rotation_deg': (0, 0, 0),
+            'mutual_information': 0,
+            'mean_squared_error': float('inf'),
+            'iterations': 0,
+            'final_metric': float('inf'),
+            'registration_time': time.time() - start_time,
+            'stop_condition': f'Failed: {e}',
+            'resampled': True,
+            'failed': True
+        }
+
+        return registered_t2, reg_info
+
+
+def _visualize_t2_t1_registration(t1_volume: np.ndarray, t2_original: np.ndarray,
+                                   t2_registered: np.ndarray, reg_info: Dict,
+                                   z_slice: int = None) -> None:
+    """
+    Visualize T2-T1 registration quality.
+
+    Parameters
+    ----------
+    t1_volume : np.ndarray
+        T1 reference volume
+    t2_original : np.ndarray
+        Original T2 volume (before registration)
+    t2_registered : np.ndarray
+        Registered T2 volume
+    reg_info : dict
+        Registration information
+    z_slice : int, optional
+        Z-slice to display (default: middle slice)
+    """
+    if z_slice is None:
+        z_slice = t1_volume.shape[2] // 2
+
+    set_proxylfit_style()
+
+    fig, axes = plt.subplots(2, 3, figsize=(14, 9))
+    fig.suptitle('ProxylFit - T2 to T1 Registration Quality', fontsize=14, fontweight='bold')
+
+    # Top row: T1, Registered T2, Overlay
+    axes[0, 0].imshow(t1_volume[:, :, z_slice].T, cmap='gray', origin='lower')
+    axes[0, 0].set_title('T1 Reference')
+    axes[0, 0].axis('off')
+
+    axes[0, 1].imshow(t2_registered[:, :, z_slice].T, cmap='gray', origin='lower')
+    axes[0, 1].set_title('Registered T2')
+    axes[0, 1].axis('off')
+
+    # Overlay: T1 in red channel, T2 in green
+    t1_norm = (t1_volume[:, :, z_slice].T - t1_volume[:, :, z_slice].min()) / (t1_volume[:, :, z_slice].max() - t1_volume[:, :, z_slice].min() + 1e-8)
+    t2_norm = (t2_registered[:, :, z_slice].T - t2_registered[:, :, z_slice].min()) / (t2_registered[:, :, z_slice].max() - t2_registered[:, :, z_slice].min() + 1e-8)
+    overlay = np.zeros((*t1_norm.shape, 3))
+    overlay[:, :, 0] = t1_norm  # Red = T1
+    overlay[:, :, 1] = t2_norm  # Green = T2
+    axes[0, 2].imshow(overlay, origin='lower')
+    axes[0, 2].set_title('Overlay (T1=Red, T2=Green)')
+    axes[0, 2].axis('off')
+
+    # Bottom row: Difference, Original T2, Info
+    diff = np.abs(t1_volume[:, :, z_slice].T.astype(float) - t2_registered[:, :, z_slice].T.astype(float))
+    im_diff = axes[1, 0].imshow(diff, cmap='hot', origin='lower')
+    axes[1, 0].set_title('|T1 - Registered T2|')
+    axes[1, 0].axis('off')
+    plt.colorbar(im_diff, ax=axes[1, 0], fraction=0.046)
+
+    # Show original T2 (may be different size, so handle carefully)
+    if t2_original.shape[2] > z_slice:
+        orig_z = z_slice
+    else:
+        orig_z = t2_original.shape[2] // 2
+    axes[1, 1].imshow(t2_original[:, :, orig_z].T, cmap='gray', origin='lower')
+    axes[1, 1].set_title(f'Original T2 (z={orig_z})')
+    axes[1, 1].axis('off')
+
+    # Info panel
+    axes[1, 2].axis('off')
+    tx, ty, tz = reg_info['translation_mm']
+    rx, ry, rz = reg_info['rotation_deg']
+    info_text = (
+        f"Registration Results\n"
+        f"{'=' * 25}\n\n"
+        f"Translation (mm):\n"
+        f"  X: {tx:.2f}\n"
+        f"  Y: {ty:.2f}\n"
+        f"  Z: {tz:.2f}\n\n"
+        f"Rotation (deg):\n"
+        f"  X: {rx:.2f}\n"
+        f"  Y: {ry:.2f}\n"
+        f"  Z: {rz:.2f}\n\n"
+        f"Mutual Info: {reg_info['mutual_information']:.2f}\n"
+        f"Time: {reg_info['registration_time']:.1f}s\n"
+        f"Resampled: {reg_info['resampled']}"
+    )
+    axes[1, 2].text(0.1, 0.9, info_text, transform=axes[1, 2].transAxes,
+                   fontsize=10, verticalalignment='top', fontfamily='monospace',
+                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+
+    plt.tight_layout()
+
+    # Add accept button
+    ax_btn = plt.axes([0.45, 0.02, 0.1, 0.04])
+    btn = Button(ax_btn, 'Accept')
+    btn.label.set_fontsize(10)
+
+    def accept(event):
+        plt.close(fig)
+
+    btn.on_clicked(accept)
+
+    plt.show()
 
 
 # Legacy function for compatibility
