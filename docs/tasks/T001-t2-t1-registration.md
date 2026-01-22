@@ -1,6 +1,6 @@
 # T001: T2 to T1 Registration
 
-**Status**: planned
+**Status**: implemented
 **Priority**: high
 **Created**: 2025-01-08
 
@@ -60,10 +60,10 @@ python run_analysis.py --dicom t1_data.dcm --t2 t2_data.dcm --z 4 --roi-mode con
 
 ## Acceptance Criteria
 
-- [ ] CLI option `--t2` to load T2 DICOM
-- [ ] T2 registered to T1 coordinate space
-- [ ] Resampling works for different resolutions
-- [ ] Visual verification of registration quality
-- [ ] ROI selection works on registered T2
-- [ ] ROI mask in T1 coordinates for analysis
+- [x] CLI option `--t2` to load T2 DICOM
+- [x] T2 registered to T1 coordinate space
+- [x] Resampling works for different resolutions
+- [x] Visual verification of registration quality
+- [x] ROI selection works on registered T2
+- [x] ROI mask in T1 coordinates for analysis
 - [ ] Documentation updated

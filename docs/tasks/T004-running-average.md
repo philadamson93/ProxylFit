@@ -1,7 +1,7 @@
 # T004: Running Average Dynamic Images
 
-**Status**: planned
-**Priority**: medium
+**Status**: backlog
+**Priority**: low
 **Created**: 2025-01-08
 
 ## Description
