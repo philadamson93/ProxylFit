@@ -1,6 +1,6 @@
 # T005: Pixel-Level Parameter Maps (kb, kd)
 
-**Status**: planned
+**Status**: backlog
 **Priority**: high
 **Created**: 2025-01-08
 

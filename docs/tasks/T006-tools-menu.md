@@ -1,6 +1,6 @@
 # T006: Main Workflow Menu
 
-**Status**: planned
+**Status**: complete
 **Priority**: high
 **Created**: 2025-01-15
 
