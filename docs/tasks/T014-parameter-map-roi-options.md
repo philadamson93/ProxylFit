@@ -151,29 +151,22 @@ Create dedicated UI for parameter map results:
 
 ## Export Format
 
-Metrics saved to `{dataset_dir}/parameter_maps/roi_metrics.json`:
+Metrics saved to `{dataset_dir}/parameter_maps/roi_metrics.csv`:
 
-```json
-{
-  "roi": {
-    "type": "contour",
-    "z_slice": 4,
-    "n_voxels": 342
-  },
-  "parameters": {
-    "kb": {"mean": 0.0234, "std": 0.0089, "min": 0.008, "max": 0.051},
-    "kd": {"mean": 0.0156, "std": 0.0042, "min": 0.009, "max": 0.028},
-    "knt": {"mean": 0.0021, "std": 0.0008, "min": 0.001, "max": 0.004},
-    "r_squared": {"mean": 0.923, "std": 0.045, "min": 0.78, "max": 0.99}
-  },
-  "processing": {
-    "mode": "single_slice",
-    "slice": 4,
-    "roi_restricted": true,
-    "fitting_method": "sliding_window",
-    "window_size": 3
-  }
-}
+```csv
+parameter,mean,std,min,max
+kb,0.0234,0.0089,0.008,0.051
+kd,0.0156,0.0042,0.009,0.028
+knt,0.0021,0.0008,0.001,0.004
+r_squared,0.923,0.045,0.78,0.99
+
+roi_type,contour
+z_slice,4
+n_voxels,342
+processing_mode,single_slice
+roi_restricted,true
+fitting_method,sliding_window
+window_size,3
 ```
 
 ## Dependencies

@@ -67,23 +67,21 @@ For **Difference Images:**
 
 When saving (per T012), include metrics in:
 - DICOM ImageComments tag
-- Separate JSON sidecar file: `{filename}_metrics.json`
+- Separate CSV sidecar file: `{filename}_metrics.csv`
 - NPZ metadata dict
 
-**Metrics JSON structure:**
-```json
-{
-  "operation": "difference",
-  "region_a": {"start": 0, "end": 5, "mean": 1247.3, "std": 89.2},
-  "region_b": {"start": 10, "end": 15, "mean": 1089.5, "std": 76.4},
-  "difference": {"mean": 157.8, "std": 42.1, "min": -23.4, "max": 289.6},
-  "percent_change": 14.5,
-  "roi": {
-    "type": "contour",
-    "n_pixels": 342,
-    "z_slice": 4
-  }
-}
+**Metrics CSV format:**
+```csv
+metric,region,value,std,min,max
+mean_intensity,region_a,1247.3,89.2,,
+mean_intensity,region_b,1089.5,76.4,,
+mean_intensity,difference,157.8,42.1,-23.4,289.6
+percent_change,difference,14.5,,,
+n_pixels,roi,342,,,
+z_slice,roi,4,,,
+operation,info,difference,,,
+timepoints_a,info,0-5,,,
+timepoints_b,info,10-15,,,
 ```
 
 ## Files to Modify
