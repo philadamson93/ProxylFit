@@ -18,9 +18,12 @@ Carry the ROI contour through to difference and averaged image views, displaying
 
 ### Contour Display
 
-- If an ROI exists from the main workflow, overlay it on the diff/avg preview
-- Option to draw a new contour if none exists or user wants different region
+- Two options for ROI selection:
+  - **Use Existing ROI**: Reuse contour from main workflow (if available)
+  - **Draw New ROI**: Draw a new contour directly on the diff/avg image
 - Contour displayed as colored outline (e.g., cyan) on the image
+- Checkbox to toggle contour visibility
+- "Redraw ROI" button to replace current contour at any time
 
 ### Metrics Panel (Side Panel)
 
