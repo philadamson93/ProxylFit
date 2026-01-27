@@ -70,7 +70,7 @@ class DicomScanResultsDialog(QDialog):
 
         # Table
         self.table = QTableWidget()
-        columns = ['Series#', 'Description', 'Size', 'Slices', 'Frames', 'Type', 'Study Date', 'File']
+        columns = ['Series#', 'Description', 'Size', 'Slices', 'Type', 'Study Date', 'File']
         self.table.setColumnCount(len(columns))
         self.table.setHorizontalHeaderLabels(columns)
         self.table.setRowCount(len(self.scan_results))
@@ -94,7 +94,6 @@ class DicomScanResultsDialog(QDialog):
                 QTableWidgetItem(s.get('series_description', '')[:50]),
                 QTableWidgetItem(f"{s.get('rows', 0)}x{s.get('cols', 0)}"),
                 QTableWidgetItem(str(s.get('num_slices', 0))),
-                QTableWidgetItem(str(s.get('num_frames', 0))),
                 QTableWidgetItem(type_str),
                 QTableWidgetItem(s.get('study_date', '')),
                 QTableWidgetItem(Path(sample_file).name if sample_file else '')
@@ -105,8 +104,8 @@ class DicomScanResultsDialog(QDialog):
 
         # Resize columns
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
-        for i in [0, 2, 3, 4, 5, 6]:
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        for i in [0, 2, 3, 4, 5]:
             self.table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
 
         layout.addWidget(self.table)
