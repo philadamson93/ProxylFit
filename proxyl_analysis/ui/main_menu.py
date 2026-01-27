@@ -65,26 +65,32 @@ class DicomScanResultsDialog(QDialog):
         self.table.setRowCount(len(self.scan_results))
 
         for row, s in enumerate(self.scan_results):
-            self.table.setItem(row, 0, QTableWidgetItem(str(s.get('series_number', ''))))
-            self.table.setItem(row, 1, QTableWidgetItem(s.get('series_description', '')[:50]))
-            self.table.setItem(row, 2, QTableWidgetItem(f"{s.get('rows', 0)}x{s.get('cols', 0)}"))
-            self.table.setItem(row, 3, QTableWidgetItem(str(s.get('num_slices', 0))))
-            self.table.setItem(row, 4, QTableWidgetItem(str(s.get('num_frames', 0))))
-
+            # Determine row color based on type
+            row_color = None
             type_str = ''
             if s.get('is_proxyl'):
                 type_str = 'PROXYL'
+                row_color = QColor(200, 230, 200)  # Light green
             elif s.get('is_t2'):
                 type_str = 'T2'
-            type_item = QTableWidgetItem(type_str)
-            if type_str:
-                type_item.setBackground(QColor(200, 230, 200) if s.get('is_proxyl') else QColor(200, 200, 230))
-            self.table.setItem(row, 5, type_item)
+                row_color = QColor(200, 200, 230)  # Light blue
 
-            self.table.setItem(row, 6, QTableWidgetItem(s.get('study_date', '')))
+            # Create items and apply row color
+            items = [
+                QTableWidgetItem(str(s.get('series_number', ''))),
+                QTableWidgetItem(s.get('series_description', '')[:50]),
+                QTableWidgetItem(f"{s.get('rows', 0)}x{s.get('cols', 0)}"),
+                QTableWidgetItem(str(s.get('num_slices', 0))),
+                QTableWidgetItem(str(s.get('num_frames', 0))),
+                QTableWidgetItem(type_str),
+                QTableWidgetItem(s.get('study_date', '')),
+                QTableWidgetItem(Path(s.get('sample_file', '')).name)
+            ]
 
-            sample_file = Path(s.get('sample_file', '')).name
-            self.table.setItem(row, 7, QTableWidgetItem(sample_file))
+            for col, item in enumerate(items):
+                if row_color:
+                    item.setBackground(row_color)
+                self.table.setItem(row, col, item)
 
         # Resize columns
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -332,18 +338,18 @@ class MainMenuDialog(QDialog):
         # Buttons row
         btn_layout = QHBoxLayout()
 
-        load_new_btn = QPushButton("Load New T1 DICOM...")
+        scan_btn = QPushButton("Scan DICOM Folder...")
+        scan_btn.clicked.connect(self._scan_dicom_folder)
+        scan_btn.setToolTip("Scan a folder to identify PROXYL and T2 series")
+        btn_layout.addWidget(scan_btn)
+
+        load_new_btn = QPushButton("Load T1 DICOM...")
         load_new_btn.clicked.connect(self._load_new_experiment)
         btn_layout.addWidget(load_new_btn)
 
         load_prev_btn = QPushButton("Load Previous Session...")
         load_prev_btn.clicked.connect(self._load_previous_session)
         btn_layout.addWidget(load_prev_btn)
-
-        scan_btn = QPushButton("Scan DICOM Folder...")
-        scan_btn.clicked.connect(self._scan_dicom_folder)
-        scan_btn.setToolTip("Scan a folder to identify PROXYL and T2 series")
-        btn_layout.addWidget(scan_btn)
 
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
