@@ -10,25 +10,32 @@ import numpy as np
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame,
     QGroupBox, QSpinBox, QRadioButton, QFileDialog, QMessageBox,
-    QScrollArea, QWidget, QTableWidget, QTableWidgetItem, QHeaderView
+    QScrollArea, QWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+    QComboBox
 )
 from PySide6.QtCore import Signal, Qt
+from PySide6.QtGui import QColor
 
 from .styles import init_qt_app
 from .components import HeaderWidget, ButtonBar
 
 
 class DicomScanResultsDialog(QDialog):
-    """Dialog to display DICOM scan results with ability to save to CSV."""
+    """Dialog to display DICOM scan results with ability to load selected series."""
 
     def __init__(self, scan_results: list, folder_path: str, parent=None):
         super().__init__(parent)
         self.scan_results = scan_results
         self.folder_path = folder_path
+        self.result = None  # Will hold the load action result
+
+        # Filter series by type
+        self.proxyl_series = [s for s in scan_results if s.get('is_proxyl')]
+        self.t2_series = [s for s in scan_results if s.get('is_t2')]
 
         self.setWindowTitle("DICOM Scan Results")
-        self.setMinimumSize(900, 500)
-        self.resize(1000, 600)
+        self.setMinimumSize(900, 600)
+        self.resize(1000, 700)
 
         self._setup_ui()
 
@@ -41,9 +48,11 @@ class DicomScanResultsDialog(QDialog):
         layout.addWidget(header)
 
         # Summary
-        proxyl_count = sum(1 for s in self.scan_results if s.get('is_proxyl'))
-        t2_count = sum(1 for s in self.scan_results if s.get('is_t2'))
-        summary_label = QLabel(f"PROXYL series: {proxyl_count}  |  T2 series: {t2_count}  |  Folder: {self.folder_path}")
+        summary_label = QLabel(
+            f"PROXYL series: {len(self.proxyl_series)}  |  "
+            f"T2 series: {len(self.t2_series)}  |  "
+            f"Folder: {self.folder_path}"
+        )
         summary_label.setStyleSheet("color: #666; font-size: 11px;")
         summary_label.setWordWrap(True)
         layout.addWidget(summary_label)
@@ -69,7 +78,7 @@ class DicomScanResultsDialog(QDialog):
                 type_str = 'T2'
             type_item = QTableWidgetItem(type_str)
             if type_str:
-                type_item.setBackground(Qt.lightGray)
+                type_item.setBackground(QColor(200, 230, 200) if s.get('is_proxyl') else QColor(200, 200, 230))
             self.table.setItem(row, 5, type_item)
 
             self.table.setItem(row, 6, QTableWidgetItem(s.get('study_date', '')))
@@ -85,6 +94,50 @@ class DicomScanResultsDialog(QDialog):
 
         layout.addWidget(self.table)
 
+        # Load Selection section
+        load_group = QGroupBox("Load Selection")
+        load_layout = QVBoxLayout(load_group)
+
+        # T1 (PROXYL) selector
+        t1_layout = QHBoxLayout()
+        t1_label = QLabel("T1 (PROXYL):")
+        t1_label.setMinimumWidth(80)
+        t1_layout.addWidget(t1_label)
+
+        self.t1_combo = QComboBox()
+        self.t1_combo.addItem("-- None --", None)
+        for s in self.proxyl_series:
+            desc = s.get('series_description', 'Unknown')[:40]
+            series_num = s.get('series_number', 0)
+            frames = s.get('num_frames', 0)
+            label = f"{desc} (series {series_num}, {frames} frames)"
+            self.t1_combo.addItem(label, s.get('sample_file'))
+        if self.proxyl_series:
+            self.t1_combo.setCurrentIndex(1)  # Select first PROXYL
+        t1_layout.addWidget(self.t1_combo, stretch=1)
+        load_layout.addLayout(t1_layout)
+
+        # T2 selector
+        t2_layout = QHBoxLayout()
+        t2_label = QLabel("T2:")
+        t2_label.setMinimumWidth(80)
+        t2_layout.addWidget(t2_label)
+
+        self.t2_combo = QComboBox()
+        self.t2_combo.addItem("-- None --", None)
+        for s in self.t2_series:
+            desc = s.get('series_description', 'Unknown')[:40]
+            series_num = s.get('series_number', 0)
+            slices = s.get('num_slices', 0)
+            label = f"{desc} (series {series_num}, {slices} slices)"
+            self.t2_combo.addItem(label, s.get('sample_file'))
+        if self.t2_series:
+            self.t2_combo.setCurrentIndex(1)  # Select first T2
+        t2_layout.addWidget(self.t2_combo, stretch=1)
+        load_layout.addLayout(t2_layout)
+
+        layout.addWidget(load_group)
+
         # Buttons
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -93,8 +146,23 @@ class DicomScanResultsDialog(QDialog):
         save_btn.clicked.connect(self._save_csv)
         btn_layout.addWidget(save_btn)
 
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
+        btn_layout.addSpacing(20)
+
+        load_btn = QPushButton("Load Selected")
+        load_btn.setMinimumSize(120, 35)
+        load_btn.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; "
+            "padding: 8px 16px; border-radius: 4px; border: none; }"
+            "QPushButton:hover { background-color: #45a049; }"
+            "QPushButton:disabled { background-color: #cccccc; }"
+        )
+        load_btn.clicked.connect(self._load_selected)
+        btn_layout.addWidget(load_btn)
+
+        btn_layout.addSpacing(10)
+
+        close_btn = QPushButton("Cancel")
+        close_btn.clicked.connect(self.reject)
         btn_layout.addWidget(close_btn)
 
         btn_layout.addStretch()
@@ -119,6 +187,26 @@ class DicomScanResultsDialog(QDialog):
                 QMessageBox.information(self, "Saved", f"Scan results saved to:\n{filepath}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+
+    def _load_selected(self):
+        """Load the selected T1 and T2 series."""
+        t1_path = self.t1_combo.currentData()
+        t2_path = self.t2_combo.currentData()
+
+        if not t1_path and not t2_path:
+            QMessageBox.warning(self, "No Selection", "Please select at least one series to load.")
+            return
+
+        self.result = {
+            'action': 'load_from_scan',
+            't1_path': t1_path,
+            't2_path': t2_path
+        }
+        self.accept()
+
+    def get_result(self):
+        """Get the dialog result."""
+        return self.result
 
 
 class MainMenuDialog(QDialog):
@@ -597,15 +685,10 @@ class MainMenuDialog(QDialog):
         if not folder_path:
             return
 
-        # Show scanning message
-        QMessageBox.information(
-            self, "Scanning",
-            f"Scanning folder:\n{folder_path}\n\nThis may take a moment..."
-        )
-
         try:
-            from ..dicom_scanner import scan_dicom_folder, save_scan_to_csv
+            from ..dicom_scanner import scan_dicom_folder
 
+            # Scan the folder
             results = scan_dicom_folder(folder_path)
 
             if not results:
@@ -614,7 +697,10 @@ class MainMenuDialog(QDialog):
 
             # Show results dialog
             dialog = DicomScanResultsDialog(results, folder_path, self)
-            dialog.exec()
+            if dialog.exec() and dialog.get_result():
+                # User clicked "Load Selected" - pass result to main menu caller
+                self.result = dialog.get_result()
+                self.accept()
 
         except ImportError as e:
             QMessageBox.critical(self, "Missing Package", f"Required package not found: {e}")

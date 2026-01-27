@@ -537,6 +537,40 @@ def main():
                     print("Please restart the application with --load-registration flag.")
                     sys.exit(0)
 
+                elif action == 'load_from_scan':
+                    # User selected T1 and/or T2 from DICOM scan
+                    t1_path = menu_result.get('t1_path')
+                    t2_path = menu_result.get('t2_path')
+
+                    if t1_path:
+                        print(f"\nSelected T1 (PROXYL): {t1_path}")
+                        print("Please restart the application with:")
+                        print(f"  python -m proxyl_analysis --dicom \"{t1_path}\"")
+                        if t2_path:
+                            print(f"\nSelected T2: {t2_path}")
+                            print("After loading, use 'Load T2 Volume...' to load the T2.")
+                        sys.exit(0)
+                    elif t2_path:
+                        # Only T2 selected, load it into current session
+                        print(f"Loading T2 from scan: {t2_path}")
+                        try:
+                            from proxyl_analysis.io import load_t2_volume
+                            t2_volume, t2_spacing = load_t2_volume(t2_path)
+                            print(f"  T2 volume shape: {t2_volume.shape}")
+                            t1_reference = registered_4d[:, :, :, 0]
+                            registered_t2, reg_info = register_t2_to_t1(
+                                t2_volume=t2_volume,
+                                t2_spacing=t2_spacing,
+                                t1_reference=t1_reference,
+                                t1_spacing=spacing,
+                                show_quality=True
+                            )
+                            print(f"  T2-T1 registration complete")
+                        except Exception as e:
+                            print(f"  Error loading T2: {e}")
+                            registered_t2 = None
+                        continue  # Return to menu with T2 loaded
+
                 elif action == 'load_t2':
                     # Load and register T2
                     print(f"Loading T2 from: {menu_result['t2_path']}")
