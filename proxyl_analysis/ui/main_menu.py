@@ -10,12 +10,115 @@ import numpy as np
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame,
     QGroupBox, QSpinBox, QRadioButton, QFileDialog, QMessageBox,
-    QScrollArea, QWidget
+    QScrollArea, QWidget, QTableWidget, QTableWidgetItem, QHeaderView
 )
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 
 from .styles import init_qt_app
 from .components import HeaderWidget, ButtonBar
+
+
+class DicomScanResultsDialog(QDialog):
+    """Dialog to display DICOM scan results with ability to save to CSV."""
+
+    def __init__(self, scan_results: list, folder_path: str, parent=None):
+        super().__init__(parent)
+        self.scan_results = scan_results
+        self.folder_path = folder_path
+
+        self.setWindowTitle("DICOM Scan Results")
+        self.setMinimumSize(900, 500)
+        self.resize(1000, 600)
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        """Build the dialog UI."""
+        layout = QVBoxLayout(self)
+
+        # Header
+        header = HeaderWidget("DICOM Scan Results", f"Found {len(self.scan_results)} series")
+        layout.addWidget(header)
+
+        # Summary
+        proxyl_count = sum(1 for s in self.scan_results if s.get('is_proxyl'))
+        t2_count = sum(1 for s in self.scan_results if s.get('is_t2'))
+        summary_label = QLabel(f"PROXYL series: {proxyl_count}  |  T2 series: {t2_count}  |  Folder: {self.folder_path}")
+        summary_label.setStyleSheet("color: #666; font-size: 11px;")
+        summary_label.setWordWrap(True)
+        layout.addWidget(summary_label)
+
+        # Table
+        self.table = QTableWidget()
+        columns = ['Series#', 'Description', 'Size', 'Slices', 'Frames', 'Type', 'Study Date', 'File']
+        self.table.setColumnCount(len(columns))
+        self.table.setHorizontalHeaderLabels(columns)
+        self.table.setRowCount(len(self.scan_results))
+
+        for row, s in enumerate(self.scan_results):
+            self.table.setItem(row, 0, QTableWidgetItem(str(s.get('series_number', ''))))
+            self.table.setItem(row, 1, QTableWidgetItem(s.get('series_description', '')[:50]))
+            self.table.setItem(row, 2, QTableWidgetItem(f"{s.get('rows', 0)}x{s.get('cols', 0)}"))
+            self.table.setItem(row, 3, QTableWidgetItem(str(s.get('num_slices', 0))))
+            self.table.setItem(row, 4, QTableWidgetItem(str(s.get('num_frames', 0))))
+
+            type_str = ''
+            if s.get('is_proxyl'):
+                type_str = 'PROXYL'
+            elif s.get('is_t2'):
+                type_str = 'T2'
+            type_item = QTableWidgetItem(type_str)
+            if type_str:
+                type_item.setBackground(Qt.lightGray)
+            self.table.setItem(row, 5, type_item)
+
+            self.table.setItem(row, 6, QTableWidgetItem(s.get('study_date', '')))
+
+            sample_file = Path(s.get('sample_file', '')).name
+            self.table.setItem(row, 7, QTableWidgetItem(sample_file))
+
+        # Resize columns
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        for i in [0, 2, 3, 4, 5, 6]:
+            self.table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+
+        layout.addWidget(self.table)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        save_btn = QPushButton("Save to CSV")
+        save_btn.clicked.connect(self._save_csv)
+        btn_layout.addWidget(save_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+    def _save_csv(self):
+        """Save scan results to CSV."""
+        from ..dicom_scanner import save_scan_to_csv
+
+        folder_name = Path(self.folder_path).name
+        default_name = f"{folder_name}_dicom_scan.csv"
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Scan Results",
+            str(Path(self.folder_path).parent / default_name),
+            "CSV Files (*.csv)"
+        )
+
+        if filepath:
+            try:
+                save_scan_to_csv(self.scan_results, filepath)
+                QMessageBox.information(self, "Saved", f"Scan results saved to:\n{filepath}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
 
 
 class MainMenuDialog(QDialog):
@@ -148,6 +251,11 @@ class MainMenuDialog(QDialog):
         load_prev_btn = QPushButton("Load Previous Session...")
         load_prev_btn.clicked.connect(self._load_previous_session)
         btn_layout.addWidget(load_prev_btn)
+
+        scan_btn = QPushButton("Scan DICOM Folder...")
+        scan_btn.clicked.connect(self._scan_dicom_folder)
+        scan_btn.setToolTip("Scan a folder to identify PROXYL and T2 series")
+        btn_layout.addWidget(scan_btn)
 
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
@@ -479,6 +587,39 @@ class MainMenuDialog(QDialog):
             't2_path': file_path
         }
         self.accept()
+
+    def _scan_dicom_folder(self):
+        """Scan a DICOM folder and show metadata summary."""
+        folder_path = QFileDialog.getExistingDirectory(
+            self, "Select DICOM Folder to Scan",
+            str(Path.home())
+        )
+        if not folder_path:
+            return
+
+        # Show scanning message
+        QMessageBox.information(
+            self, "Scanning",
+            f"Scanning folder:\n{folder_path}\n\nThis may take a moment..."
+        )
+
+        try:
+            from ..dicom_scanner import scan_dicom_folder, save_scan_to_csv
+
+            results = scan_dicom_folder(folder_path)
+
+            if not results:
+                QMessageBox.warning(self, "No DICOM Files", "No DICOM files found in the selected folder.")
+                return
+
+            # Show results dialog
+            dialog = DicomScanResultsDialog(results, folder_path, self)
+            dialog.exec()
+
+        except ImportError as e:
+            QMessageBox.critical(self, "Missing Package", f"Required package not found: {e}")
+        except Exception as e:
+            QMessageBox.critical(self, "Scan Error", f"Error scanning folder:\n{e}")
 
     def _draw_roi(self):
         """Launch ROI drawing workflow (just ROI + injection time, no fitting)."""
