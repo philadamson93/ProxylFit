@@ -287,6 +287,16 @@ def main():
         # Handle menu result
         if result.get('action') == 'load_new':
             args.dicom = result['dicom_path']
+        elif result.get('action') == 'load_from_scan':
+            # User selected T1 (and optionally T2) from DICOM scan
+            if result.get('t1_path'):
+                args.dicom = result['t1_path']
+                # Store T2 path for later loading after registration
+                if result.get('t2_path'):
+                    args.t2 = result['t2_path']
+            else:
+                print("No T1 series selected. Exiting.")
+                sys.exit(1)
         elif result.get('action') == 'load_previous':
             args.load_registration = result['session_path']
             # Try to find original DICOM path from metadata
