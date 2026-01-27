@@ -1,15 +1,21 @@
 """
 Image tools dialog for averaged and difference images (T002/T003).
+
+Enhanced with:
+- T012: DICOM export for derived images
+- T013: ROI contour overlay and metrics display
 """
 
+import csv
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional, Dict, Any
 
 import numpy as np
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox,
-    QSpinBox, QSlider, QMessageBox, QWidget
+    QSpinBox, QSlider, QMessageBox, QWidget, QCheckBox, QFileDialog,
+    QComboBox
 )
 from PySide6.QtCore import Qt
 
@@ -72,6 +78,8 @@ class ImageToolsDialog(QDialog):
 
     T002: Single region selection -> averaged image
     T003: Two region selection -> difference image (B - A)
+    T012: DICOM export with descriptive filenames
+    T013: ROI overlay and metrics display
     """
 
     def __init__(self,
@@ -81,6 +89,9 @@ class ImageToolsDialog(QDialog):
                  time_units: str = 'minutes',
                  output_dir: str = './output',
                  initial_mode: str = 'average',
+                 roi_mask: Optional[np.ndarray] = None,
+                 spacing: Optional[Tuple[float, float, float]] = None,
+                 source_dicom: Optional[str] = None,
                  parent=None):
         super().__init__(parent)
         self.image_4d = image_4d
@@ -90,6 +101,15 @@ class ImageToolsDialog(QDialog):
         self.output_dir = output_dir
         self.num_timepoints = len(time_array)
         self.num_slices = image_4d.shape[2]
+
+        # ROI overlay state (T013)
+        self.roi_mask = roi_mask
+        self.spacing = spacing or (1.0, 1.0, 1.0)
+        self.source_dicom = source_dicom
+        self.show_roi_overlay = roi_mask is not None
+
+        # Metrics cache
+        self.metrics = None
 
         # State
         self.mode = initial_mode  # 'average' or 'difference'
@@ -111,6 +131,10 @@ class ImageToolsDialog(QDialog):
 
         self._setup_ui()
         self._update_mode_ui()
+
+        # Initialize time labels and auto-start selection for region A
+        self._update_time_labels()
+        self._start_selection('a')
 
     def _setup_ui(self):
         """Build the dialog UI."""
@@ -168,11 +192,19 @@ class ImageToolsDialog(QDialog):
         self.region_a_start_spin.valueChanged.connect(self._on_region_a_start_changed)
         region_a_layout.addWidget(self.region_a_start_spin)
 
+        self.region_a_start_time_label = QLabel("(-- min)")
+        self.region_a_start_time_label.setStyleSheet("color: #666; min-width: 60px;")
+        region_a_layout.addWidget(self.region_a_start_time_label)
+
         region_a_layout.addWidget(QLabel("End:"))
         self.region_a_end_spin = QSpinBox()
         self.region_a_end_spin.setRange(0, self.num_timepoints - 1)
         self.region_a_end_spin.valueChanged.connect(self._on_region_a_end_changed)
         region_a_layout.addWidget(self.region_a_end_spin)
+
+        self.region_a_end_time_label = QLabel("(-- min)")
+        self.region_a_end_time_label.setStyleSheet("color: #666; min-width: 60px;")
+        region_a_layout.addWidget(self.region_a_end_time_label)
 
         self.select_a_btn = QPushButton("Select on Plot")
         self.select_a_btn.clicked.connect(lambda: self._start_selection('a'))
@@ -195,11 +227,19 @@ class ImageToolsDialog(QDialog):
         self.region_b_start_spin.valueChanged.connect(self._on_region_b_start_changed)
         region_b_layout.addWidget(self.region_b_start_spin)
 
+        self.region_b_start_time_label = QLabel("(-- min)")
+        self.region_b_start_time_label.setStyleSheet("color: #666; min-width: 60px;")
+        region_b_layout.addWidget(self.region_b_start_time_label)
+
         region_b_layout.addWidget(QLabel("End:"))
         self.region_b_end_spin = QSpinBox()
         self.region_b_end_spin.setRange(0, self.num_timepoints - 1)
         self.region_b_end_spin.valueChanged.connect(self._on_region_b_end_changed)
         region_b_layout.addWidget(self.region_b_end_spin)
+
+        self.region_b_end_time_label = QLabel("(-- min)")
+        self.region_b_end_time_label.setStyleSheet("color: #666; min-width: 60px;")
+        region_b_layout.addWidget(self.region_b_end_time_label)
 
         self.select_b_btn = QPushButton("Select on Plot")
         self.select_b_btn.clicked.connect(lambda: self._start_selection('b'))
@@ -255,6 +295,32 @@ class ImageToolsDialog(QDialog):
         self.preview_btn.clicked.connect(self._update_preview)
         self.preview_btn.setEnabled(False)
         right_layout.addWidget(self.preview_btn)
+
+        # ROI overlay checkbox (T013)
+        roi_layout = QHBoxLayout()
+        self.roi_checkbox = QCheckBox("Show ROI contour")
+        self.roi_checkbox.setChecked(self.show_roi_overlay)
+        self.roi_checkbox.toggled.connect(self._on_roi_toggle)
+        self.roi_checkbox.setEnabled(self.roi_mask is not None)
+        roi_layout.addWidget(self.roi_checkbox)
+        roi_layout.addStretch()
+        right_layout.addLayout(roi_layout)
+
+        # Metrics panel (T013)
+        self.metrics_group = QGroupBox("ROI Metrics")
+        metrics_layout = QVBoxLayout(self.metrics_group)
+        self.metrics_label = QLabel("Select regions to see metrics")
+        self.metrics_label.setWordWrap(True)
+        self.metrics_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        metrics_layout.addWidget(self.metrics_label)
+
+        # Export metrics button
+        self.export_metrics_btn = QPushButton("Export Metrics (CSV)")
+        self.export_metrics_btn.clicked.connect(self._export_metrics)
+        self.export_metrics_btn.setEnabled(False)
+        metrics_layout.addWidget(self.export_metrics_btn)
+
+        right_layout.addWidget(self.metrics_group)
 
         right_layout.addStretch()
         content_layout.addWidget(right_panel, stretch=1)
@@ -373,27 +439,45 @@ class ImageToolsDialog(QDialog):
         self._update_plot()
         self._check_can_preview()
 
+    def _format_time(self, index: int) -> str:
+        """Format time value for display."""
+        if index is None or index < 0 or index >= len(self.time_array):
+            return "(-- min)"
+        time_val = self.time_array[index]
+        return f"({time_val:.1f} {self.time_units})"
+
+    def _update_time_labels(self):
+        """Update all time labels based on current spinbox values."""
+        self.region_a_start_time_label.setText(self._format_time(self.region_a_start_spin.value()))
+        self.region_a_end_time_label.setText(self._format_time(self.region_a_end_spin.value()))
+        self.region_b_start_time_label.setText(self._format_time(self.region_b_start_spin.value()))
+        self.region_b_end_time_label.setText(self._format_time(self.region_b_end_spin.value()))
+
     def _on_region_a_start_changed(self, value):
         """Handle region A start spinbox change."""
         self.region_a_start = value
+        self.region_a_start_time_label.setText(self._format_time(value))
         self._update_plot()
         self._check_can_preview()
 
     def _on_region_a_end_changed(self, value):
         """Handle region A end spinbox change."""
         self.region_a_end = value
+        self.region_a_end_time_label.setText(self._format_time(value))
         self._update_plot()
         self._check_can_preview()
 
     def _on_region_b_start_changed(self, value):
         """Handle region B start spinbox change."""
         self.region_b_start = value
+        self.region_b_start_time_label.setText(self._format_time(value))
         self._update_plot()
         self._check_can_preview()
 
     def _on_region_b_end_changed(self, value):
         """Handle region B end spinbox change."""
         self.region_b_end = value
+        self.region_b_end_time_label.setText(self._format_time(value))
         self._update_plot()
         self._check_can_preview()
 
@@ -524,7 +608,7 @@ class ImageToolsDialog(QDialog):
         self._show_preview()
 
     def _show_preview(self):
-        """Display the preview image."""
+        """Display the preview image with optional ROI overlay."""
         if self.preview_image is None:
             return
 
@@ -543,29 +627,40 @@ class ImageToolsDialog(QDialog):
                                         vmin=vmin, vmax=vmax, origin='lower')
             self.preview_ax.set_title(f'Difference B-A (z={self.current_z})')
 
+        # Add ROI contour overlay (T013)
+        if self.show_roi_overlay and self.roi_mask is not None:
+            # Get the ROI mask for current z-slice
+            if self.roi_mask.ndim == 3 and self.current_z < self.roi_mask.shape[2]:
+                roi_slice = self.roi_mask[:, :, self.current_z].T
+            elif self.roi_mask.ndim == 2:
+                roi_slice = self.roi_mask.T
+            else:
+                roi_slice = None
+
+            if roi_slice is not None and np.any(roi_slice):
+                self.preview_ax.contour(roi_slice, levels=[0.5], colors='cyan', linewidths=2)
+
         self.preview_ax.axis('off')
         self.preview_figure.tight_layout(pad=1)
         self.preview_canvas.draw()
 
+        # Update metrics
+        self._update_metrics()
+
     def _save_image(self):
-        """Save the computed image to disk."""
+        """Save the computed image to disk with format selection (T012)."""
         if self.preview_image is None:
             self._update_preview()
             if self.preview_image is None:
                 QMessageBox.warning(self, "No Image", "Please select regions first.")
                 return
 
-        # Generate filename
-        output_path = Path(self.output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
+        # Build operation params and filename
         if self.mode == 'average':
             start_idx = min(self.region_a_start, self.region_a_end)
             end_idx = max(self.region_a_start, self.region_a_end)
-            filename = f"averaged_image_frames{start_idx}-{end_idx}.npz"
-
-            metadata = {
-                'type': 'averaged_image',
+            base_filename = f"avg_t{start_idx}-t{end_idx}_{end_idx - start_idx + 1}frames"
+            operation_params = {
                 'start_idx': start_idx,
                 'end_idx': end_idx,
                 'n_frames': end_idx - start_idx + 1,
@@ -577,23 +672,241 @@ class ImageToolsDialog(QDialog):
             a_end = max(self.region_a_start, self.region_a_end)
             b_start = min(self.region_b_start, self.region_b_end)
             b_end = max(self.region_b_start, self.region_b_end)
-            filename = f"difference_image_A{a_start}-{a_end}_B{b_start}-{b_end}.npz"
-
-            metadata = {
-                'type': 'difference_image',
-                'region_a': {'start_idx': a_start, 'end_idx': a_end},
-                'region_b': {'start_idx': b_start, 'end_idx': b_end},
+            base_filename = f"diff_t{a_start}-t{a_end}_minus_t{b_start}-t{b_end}"
+            operation_params = {
+                'region_a_start': a_start,
+                'region_a_end': a_end,
+                'region_b_start': b_start,
+                'region_b_end': b_end,
                 'description': f'frames {b_start}-{b_end} minus frames {a_start}-{a_end}',
                 'time_units': self.time_units
             }
 
-        filepath = output_path / filename
-        np.savez(filepath, image=self.preview_image, **metadata)
+        # Use derived_images subdirectory per T011
+        from ..io import get_dataset_path
+        output_path = get_dataset_path(self.output_dir, 'derived_images')
+
+        # Ask user for format and filename
+        filename, selected_filter = QFileDialog.getSaveFileName(
+            self, "Save Derived Image",
+            str(output_path / base_filename),
+            "DICOM Files (*.dcm);;NumPy Files (*.npz);;NIfTI Files (*.nii.gz)"
+        )
+
+        if not filename:
+            return
+
+        filepath = Path(filename)
+
+        # Save based on format
+        if filepath.suffix == '.dcm':
+            # DICOM export (T012) - saves one 2D file per z-slice
+            from ..io import save_derived_image_as_dicom
+            saved_files = save_derived_image_as_dicom(
+                self.preview_image,
+                str(filepath),
+                'averaged' if self.mode == 'average' else 'difference',
+                operation_params,
+                self.spacing,
+                self.source_dicom
+            )
+            # Show appropriate message based on number of files
+            if len(saved_files) == 1:
+                msg = f"Image saved to:\n{saved_files[0]}"
+            else:
+                msg = f"Saved {len(saved_files)} DICOM slices to:\n{Path(saved_files[0]).parent}"
+            QMessageBox.information(self, "Saved", msg)
+            return
+        elif filepath.suffix == '.gz' or str(filepath).endswith('.nii.gz'):
+            # NIfTI export
+            try:
+                import nibabel as nib
+                affine = np.diag([self.spacing[0], self.spacing[1], self.spacing[2], 1.0])
+                nifti_img = nib.Nifti1Image(self.preview_image, affine)
+                nib.save(nifti_img, str(filepath))
+            except ImportError:
+                QMessageBox.warning(self, "Missing Package",
+                                   "NIfTI export requires nibabel. Install with: pip install nibabel")
+                return
+        else:
+            # Default: NPZ format
+            np.savez(filepath, image=self.preview_image, **operation_params)
 
         QMessageBox.information(
             self, "Saved",
             f"Image saved to:\n{filepath}"
         )
+
+    def _on_roi_toggle(self, checked: bool):
+        """Handle ROI overlay checkbox toggle."""
+        self.show_roi_overlay = checked
+        if self.preview_image is not None:
+            self._show_preview()
+
+    def _calculate_metrics(self) -> Optional[Dict[str, Any]]:
+        """Calculate metrics within ROI for current preview image (T013)."""
+        if self.preview_image is None or self.roi_mask is None:
+            return None
+
+        # Get ROI values from the 3D preview image
+        if self.roi_mask.ndim == 3:
+            roi_values = self.preview_image[self.roi_mask > 0]
+        elif self.roi_mask.ndim == 2:
+            # 2D mask - apply to current z-slice only
+            slice_data = self.preview_image[:, :, self.current_z]
+            roi_values = slice_data[self.roi_mask > 0]
+        else:
+            return None
+
+        if len(roi_values) == 0:
+            return None
+
+        metrics = {
+            'n_pixels': len(roi_values),
+            'mean': float(np.mean(roi_values)),
+            'std': float(np.std(roi_values)),
+            'min': float(np.min(roi_values)),
+            'max': float(np.max(roi_values)),
+            'z_slice': self.current_z if self.roi_mask.ndim == 2 else 'all'
+        }
+
+        # For difference images, also calculate metrics for each input region
+        if self.mode == 'difference':
+            a_start = min(self.region_a_start, self.region_a_end)
+            a_end = max(self.region_a_start, self.region_a_end)
+            b_start = min(self.region_b_start, self.region_b_end)
+            b_end = max(self.region_b_start, self.region_b_end)
+
+            avg_a = np.mean(self.image_4d[:, :, :, a_start:a_end + 1], axis=3)
+            avg_b = np.mean(self.image_4d[:, :, :, b_start:b_end + 1], axis=3)
+
+            if self.roi_mask.ndim == 3:
+                region_a_vals = avg_a[self.roi_mask > 0]
+                region_b_vals = avg_b[self.roi_mask > 0]
+            else:
+                region_a_vals = avg_a[:, :, self.current_z][self.roi_mask > 0]
+                region_b_vals = avg_b[:, :, self.current_z][self.roi_mask > 0]
+
+            metrics['region_a'] = {
+                'timepoints': f't{a_start}-t{a_end}',
+                'mean': float(np.mean(region_a_vals)),
+                'std': float(np.std(region_a_vals))
+            }
+            metrics['region_b'] = {
+                'timepoints': f't{b_start}-t{b_end}',
+                'mean': float(np.mean(region_b_vals)),
+                'std': float(np.std(region_b_vals))
+            }
+
+            # Percent change
+            if metrics['region_a']['mean'] != 0:
+                metrics['percent_change'] = (
+                    (metrics['region_b']['mean'] - metrics['region_a']['mean'])
+                    / metrics['region_a']['mean'] * 100
+                )
+
+        return metrics
+
+    def _update_metrics(self):
+        """Update the metrics display panel (T013)."""
+        self.metrics = self._calculate_metrics()
+
+        if self.metrics is None:
+            if self.roi_mask is None:
+                self.metrics_label.setText("No ROI available.\nDraw ROI in main workflow to see metrics.")
+            else:
+                self.metrics_label.setText("Select regions to see metrics")
+            self.export_metrics_btn.setEnabled(False)
+            return
+
+        # Format metrics text
+        lines = []
+        lines.append(f"ROI: {self.metrics['n_pixels']} pixels")
+        if self.metrics['z_slice'] != 'all':
+            lines.append(f"Z-slice: {self.metrics['z_slice']}")
+        lines.append("")
+
+        if self.mode == 'average':
+            lines.append(f"Mean:  {self.metrics['mean']:.2f} +/- {self.metrics['std']:.2f}")
+            lines.append(f"Range: [{self.metrics['min']:.2f}, {self.metrics['max']:.2f}]")
+        else:
+            # Difference mode - show both regions
+            ra = self.metrics.get('region_a', {})
+            rb = self.metrics.get('region_b', {})
+
+            lines.append(f"Region A ({ra.get('timepoints', '')}):")
+            lines.append(f"  Mean: {ra.get('mean', 0):.2f} +/- {ra.get('std', 0):.2f}")
+            lines.append("")
+            lines.append(f"Region B ({rb.get('timepoints', '')}):")
+            lines.append(f"  Mean: {rb.get('mean', 0):.2f} +/- {rb.get('std', 0):.2f}")
+            lines.append("")
+            lines.append(f"Difference (B - A):")
+            lines.append(f"  Mean: {self.metrics['mean']:.2f} +/- {self.metrics['std']:.2f}")
+            lines.append(f"  Range: [{self.metrics['min']:.2f}, {self.metrics['max']:.2f}]")
+
+            if 'percent_change' in self.metrics:
+                pct = self.metrics['percent_change']
+                sign = '+' if pct > 0 else ''
+                lines.append(f"  Change: {sign}{pct:.1f}%")
+
+        self.metrics_label.setText('\n'.join(lines))
+        self.export_metrics_btn.setEnabled(True)
+
+    def _export_metrics(self):
+        """Export metrics to CSV file (T013)."""
+        if self.metrics is None:
+            QMessageBox.warning(self, "No Metrics", "No metrics available to export.")
+            return
+
+        # Use derived_images subdirectory
+        from ..io import get_dataset_path
+        output_path = get_dataset_path(self.output_dir, 'derived_images')
+
+        # Build default filename
+        if self.mode == 'average':
+            start_idx = min(self.region_a_start, self.region_a_end)
+            end_idx = max(self.region_a_start, self.region_a_end)
+            base_filename = f"avg_t{start_idx}-t{end_idx}_metrics.csv"
+        else:
+            a_start = min(self.region_a_start, self.region_a_end)
+            a_end = max(self.region_a_start, self.region_a_end)
+            b_start = min(self.region_b_start, self.region_b_end)
+            b_end = max(self.region_b_start, self.region_b_end)
+            base_filename = f"diff_t{a_start}-t{a_end}_minus_t{b_start}-t{b_end}_metrics.csv"
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Export Metrics",
+            str(output_path / base_filename),
+            "CSV Files (*.csv)"
+        )
+
+        if not filepath:
+            return
+
+        # Write CSV
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['metric', 'region', 'value', 'std', 'min', 'max'])
+
+            if self.mode == 'average':
+                writer.writerow(['mean_intensity', 'averaged', self.metrics['mean'],
+                               self.metrics['std'], self.metrics['min'], self.metrics['max']])
+            else:
+                ra = self.metrics.get('region_a', {})
+                rb = self.metrics.get('region_b', {})
+                writer.writerow(['mean_intensity', 'region_a', ra.get('mean', ''), ra.get('std', ''), '', ''])
+                writer.writerow(['mean_intensity', 'region_b', rb.get('mean', ''), rb.get('std', ''), '', ''])
+                writer.writerow(['mean_intensity', 'difference', self.metrics['mean'],
+                               self.metrics['std'], self.metrics['min'], self.metrics['max']])
+                if 'percent_change' in self.metrics:
+                    writer.writerow(['percent_change', 'difference', self.metrics['percent_change'], '', '', ''])
+
+            writer.writerow(['n_pixels', 'roi', self.metrics['n_pixels'], '', '', ''])
+            writer.writerow(['z_slice', 'roi', self.metrics['z_slice'], '', '', ''])
+            writer.writerow(['operation', 'info', self.mode, '', '', ''])
+            writer.writerow(['time_units', 'info', self.time_units, '', '', ''])
+
+        QMessageBox.information(self, "Exported", f"Metrics exported to:\n{filepath}")
 
 
 def show_image_tools_dialog(image_4d: np.ndarray,
@@ -601,7 +914,10 @@ def show_image_tools_dialog(image_4d: np.ndarray,
                             roi_signal: np.ndarray,
                             time_units: str = 'minutes',
                             output_dir: str = './output',
-                            initial_mode: str = 'average') -> None:
+                            initial_mode: str = 'average',
+                            roi_mask: Optional[np.ndarray] = None,
+                            spacing: Optional[Tuple[float, float, float]] = None,
+                            source_dicom: Optional[str] = None) -> None:
     """
     Show the image tools dialog for creating averaged/difference images.
 
@@ -619,6 +935,12 @@ def show_image_tools_dialog(image_4d: np.ndarray,
         Directory to save images
     initial_mode : str
         'average' or 'difference'
+    roi_mask : np.ndarray, optional
+        ROI mask for overlay and metrics calculation (T013)
+    spacing : tuple, optional
+        Voxel spacing (x, y, z) for DICOM export (T012)
+    source_dicom : str, optional
+        Path to source DICOM for metadata in exports (T012)
     """
     app = init_qt_app()
 
@@ -628,7 +950,10 @@ def show_image_tools_dialog(image_4d: np.ndarray,
         roi_signal=roi_signal,
         time_units=time_units,
         output_dir=output_dir,
-        initial_mode=initial_mode
+        initial_mode=initial_mode,
+        roi_mask=roi_mask,
+        spacing=spacing,
+        source_dicom=source_dicom
     )
 
     dialog.exec()

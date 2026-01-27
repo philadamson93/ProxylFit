@@ -10,7 +10,7 @@ import numpy as np
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame,
     QGroupBox, QSpinBox, QRadioButton, QFileDialog, QMessageBox,
-    QScrollArea
+    QScrollArea, QWidget
 )
 from PySide6.QtCore import Signal
 
@@ -296,64 +296,6 @@ class MainMenuDialog(QDialog):
         description.setStyleSheet("color: #666;")
         layout.addWidget(description)
 
-        # Map type selection
-        type_layout = QHBoxLayout()
-
-        self.sliding_window_radio = QRadioButton("Sliding Window")
-        self.pixel_level_radio = QRadioButton("Pixel-Level (slower, full resolution)")
-        self.sliding_window_radio.setChecked(True)
-
-        # Pixel-level not yet implemented
-        self.pixel_level_radio.setEnabled(False)
-        self.pixel_level_radio.setToolTip("Coming soon (T005)")
-
-        type_layout.addWidget(self.sliding_window_radio)
-        type_layout.addWidget(self.pixel_level_radio)
-        type_layout.addStretch()
-        layout.addLayout(type_layout)
-
-        # Window size (for sliding window)
-        window_layout = QHBoxLayout()
-        window_layout.addWidget(QLabel("Window:"))
-
-        self.window_x_spin = QSpinBox()
-        self.window_x_spin.setRange(3, 31)
-        self.window_x_spin.setValue(15)
-        self.window_x_spin.setSingleStep(2)
-        window_layout.addWidget(self.window_x_spin)
-
-        window_layout.addWidget(QLabel("x"))
-
-        self.window_y_spin = QSpinBox()
-        self.window_y_spin.setRange(3, 31)
-        self.window_y_spin.setValue(15)
-        self.window_y_spin.setSingleStep(2)
-        window_layout.addWidget(self.window_y_spin)
-
-        window_layout.addWidget(QLabel("x"))
-
-        self.window_z_spin = QSpinBox()
-        self.window_z_spin.setRange(1, 9)
-        self.window_z_spin.setValue(3)
-        window_layout.addWidget(self.window_z_spin)
-
-        window_layout.addWidget(QLabel("voxels"))
-        window_layout.addStretch()
-        layout.addLayout(window_layout)
-
-        # Scope
-        scope_layout = QHBoxLayout()
-        scope_layout.addWidget(QLabel("Scope:"))
-
-        self.whole_image_radio = QRadioButton("Whole image")
-        self.within_roi_radio = QRadioButton("Within ROI (select first)")
-        self.whole_image_radio.setChecked(True)
-
-        scope_layout.addWidget(self.whole_image_radio)
-        scope_layout.addWidget(self.within_roi_radio)
-        scope_layout.addStretch()
-        layout.addLayout(scope_layout)
-
         # Create button
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -501,13 +443,17 @@ class MainMenuDialog(QDialog):
         if not folder_path:
             return
 
-        # Check if valid registration data exists
-        reg_data_file = Path(folder_path) / "registered_4d_data.npz"
-        if not reg_data_file.exists():
+        # Check if valid registration data exists (2D DICOM slice format)
+        p = Path(folder_path)
+        dicom_dir = p / "registered" / "dicoms"
+
+        # Check for 2D slice format: z00_t00.dcm
+        if not (dicom_dir.exists() and (dicom_dir / "z00_t00.dcm").exists()):
             QMessageBox.warning(
                 self, "Invalid Session",
                 f"No registration data found in:\n{folder_path}\n\n"
-                "Expected file: registered_4d_data.npz"
+                "Expected: registered/dicoms/z00_t00.dcm, z00_t01.dcm, ...\n"
+                "If you have old data, please re-run registration."
             )
             return
 
@@ -613,14 +559,7 @@ class MainMenuDialog(QDialog):
     def _create_parameter_maps(self):
         """Launch parameter mapping workflow."""
         self.result = {
-            'action': 'parameter_maps',
-            'pixel_level': self.pixel_level_radio.isChecked(),
-            'window_size': (
-                self.window_x_spin.value(),
-                self.window_y_spin.value(),
-                self.window_z_spin.value()
-            ),
-            'within_roi': self.within_roi_radio.isChecked()
+            'action': 'parameter_maps'
         }
         self.accept()
 

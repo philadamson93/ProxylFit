@@ -8,6 +8,7 @@ Usage: python run_analysis.py --dicom path/to/file.dcm --z 4
 import argparse
 import sys
 import os
+import time
 import numpy as np
 import json
 from pathlib import Path
@@ -31,7 +32,10 @@ from proxyl_analysis.ui import (
     show_main_menu,
     run_registration_with_progress,
     show_registration_review_qt,
-    show_image_tools_dialog
+    show_image_tools_dialog,
+    show_parameter_map_options,
+    show_parameter_map_results,
+    ParameterMappingProgressDialog
 )
 
 
@@ -298,18 +302,41 @@ def main():
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
-    
-    # Auto-detect previous registration data based on DICOM filename
+
+    # Dataset directory structure (T011)
+    # New structure: output/{dicom_name}/registered/...
+    # Legacy structure: output/registration_{dicom_name}/...
     dicom_name = Path(args.dicom).stem  # Get filename without extension
-    auto_registration_dir = output_dir / f"registration_{dicom_name}"
-    
+
+    # Check for new structure first, then legacy
+    dataset_dir = output_dir / dicom_name
+    legacy_dir = output_dir / f"registration_{dicom_name}"
+
+    # Determine which directory to use
+    if dataset_dir.exists() and (dataset_dir / "registered").exists():
+        auto_registration_dir = dataset_dir
+    elif legacy_dir.exists():
+        auto_registration_dir = legacy_dir
+    else:
+        # New dataset - use new structure
+        auto_registration_dir = dataset_dir
+
     # Check if we should automatically load registration data
     auto_load = False
-    if not args.load_registration and not args.force_registration and auto_registration_dir.exists():
-        reg_data_file = auto_registration_dir / "registered_4d_data.npz"
-        metrics_file = auto_registration_dir / "registration_metrics.json"
-        
-        if reg_data_file.exists() and metrics_file.exists():
+
+    def _find_registration_data(dir_path):
+        """Check if registration data exists in directory (2D DICOM slice format)."""
+        p = Path(dir_path)
+        dicom_dir = p / "registered" / "dicoms"
+        # Check for 2D slice format: z00_t00.dcm
+        if dicom_dir.exists() and (dicom_dir / "z00_t00.dcm").exists():
+            return p / "registered" / "registration_metrics.json"
+        return None
+
+    if not args.load_registration and not args.force_registration:
+        metrics_file = _find_registration_data(auto_registration_dir)
+
+        if metrics_file and metrics_file.exists():
             print("="*60)
             print("FOUND PREVIOUS REGISTRATION DATA")
             print("="*60)
@@ -341,8 +368,18 @@ def main():
                 args.load_registration = str(auto_registration_dir)
                 auto_load = True
             else:
-                use_existing = input("Use existing registration data? [Y/n]: ").strip().lower()
-                if use_existing in ['', 'y', 'yes']:
+                # Show Qt dialog instead of command line prompt
+                from PySide6.QtWidgets import QMessageBox
+                msg = QMessageBox()
+                msg.setWindowTitle("Previous Registration Found")
+                msg.setText(f"Registration data found for:\n{dicom_name}")
+                msg.setInformativeText("Would you like to use the existing registration data?")
+                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                msg.setDefaultButton(QMessageBox.Yes)
+                result = msg.exec()
+
+                if result == QMessageBox.Yes:
+                    print("Using existing registration data...")
                     args.load_registration = str(auto_registration_dir)
                     auto_load = True
                 else:
@@ -403,7 +440,7 @@ def main():
             print(f"  Loaded 4D image with shape: {image_4d.shape} [x, y, z, t]")
             print(f"  Voxel spacing: {spacing}")
             print()
-            
+
             # Step 2: Registration
             if args.skip_registration:
                 print("Step 2: Skipping registration (as requested)")
@@ -412,6 +449,29 @@ def main():
             else:
                 print("Step 2: Performing rigid registration...")
                 show_reg_window = not args.no_registration_window
+
+                # Create dataset directory with full structure (T011)
+                from proxyl_analysis.io import create_dataset_directory, save_dataset_manifest
+                auto_registration_dir = create_dataset_directory(str(output_dir), dicom_name)
+
+                # Initialize manifest with source info
+                manifest = {
+                    "dataset_name": dicom_name,
+                    "created_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                    "source": {
+                        "dicom_path": str(args.dicom),
+                        "dicom_filename": Path(args.dicom).name,
+                        "shape": list(image_4d.shape),
+                        "spacing": list(spacing)
+                    },
+                    "analysis": {
+                        "registration": {"completed": False},
+                        "roi_analysis": {"completed": False},
+                        "parameter_maps": {"completed": False},
+                        "derived_images": {"averaged_images": [], "difference_images": []}
+                    }
+                }
+                save_dataset_manifest(str(auto_registration_dir), manifest)
 
                 if args.batch:
                     # Batch mode: use direct registration (no progress dialog)
@@ -618,17 +678,105 @@ def main():
                     continue  # Return to menu
 
                 elif action == 'parameter_maps':
-                    # Set up for parameter mapping
-                    window_size = menu_result['window_size']
-                    args.window_size_x = window_size[0]
-                    args.window_size_y = window_size[1]
-                    args.window_size_z = window_size[2]
-                    args.create_parameter_maps = True
-                    args.skip_roi_analysis = True  # We handle ROI separately now
-                    break  # Proceed with parameter mapping (exit menu loop)
+                    # Show parameter map options dialog (T014)
+                    print("Opening parameter map options...")
+
+                    options = show_parameter_map_options(
+                        max_z=registered_4d.shape[2] - 1,
+                        current_z=roi_state.get('z_slice', 4) if roi_state else 4,
+                        existing_roi=roi_state.get('roi_mask') if roi_state else None,
+                        existing_injection_idx=roi_state.get('injection_idx') if roi_state else None,
+                        default_window_size=menu_result.get('window_size', (15, 15, 3))
+                    )
+
+                    if options is None:
+                        print("Parameter mapping cancelled.")
+                        continue
+
+                    # Determine ROI mask to use
+                    param_roi_mask = None
+                    if options['roi_only']:
+                        if options['reuse_roi'] and roi_state is not None:
+                            param_roi_mask = roi_state['roi_mask']
+                            print(f"Reusing existing ROI ({np.sum(param_roi_mask)} pixels)")
+                        elif options['redraw_roi']:
+                            # Draw new ROI for parameter mapping
+                            z_for_roi = options['z_slice'] if options['single_slice'] else registered_4d.shape[2] // 2
+                            print(f"Drawing new ROI on slice {z_for_roi}...")
+                            param_roi_mask = select_manual_contour_roi_qt(registered_4d, z_for_roi)
+                            if not np.any(param_roi_mask):
+                                print("No ROI was drawn. Returning to menu.")
+                                continue
+
+                    # Determine injection time
+                    injection_idx = None
+                    if options['reuse_injection'] and roi_state is not None:
+                        injection_idx = roi_state['injection_idx']
+                        print(f"Reusing injection time index: {injection_idx}")
+                    elif options['select_injection']:
+                        # Need to get representative curve
+                        if param_roi_mask is not None:
+                            # Use ROI mean signal (compute_roi_timeseries imported at top of file)
+                            rep_signal = compute_roi_timeseries(registered_4d, param_roi_mask)
+                        elif roi_state is not None and roi_state.get('roi_signal') is not None:
+                            rep_signal = roi_state['roi_signal']
+                        else:
+                            # Use center region
+                            cx, cy = registered_4d.shape[0] // 2, registered_4d.shape[1] // 2
+                            cz = options['z_slice'] if options['single_slice'] else registered_4d.shape[2] // 2
+                            rep_signal = registered_4d[cx-5:cx+5, cy-5:cy+5, cz, :].mean(axis=(0, 1))
+
+                        print("Select injection time...")
+                        injection_idx = select_injection_time_qt(
+                            time_array, rep_signal, args.time_units, str(auto_registration_dir)
+                        )
+                        print(f"Selected injection time index: {injection_idx}")
+
+                    # Run parameter mapping with progress dialog
+                    print("Creating parameter maps...")
+                    progress_dialog = ParameterMappingProgressDialog(
+                        registered_4d=registered_4d,
+                        time_array=time_array,
+                        options=options,
+                        roi_mask=param_roi_mask,
+                        injection_idx=injection_idx,
+                        time_units=args.time_units
+                    )
+
+                    result = progress_dialog.exec()
+
+                    if result != 1 or progress_dialog.param_maps is None:
+                        print("Parameter mapping cancelled or failed.")
+                        continue
+
+                    param_maps = progress_dialog.param_maps
+
+                    # Add reference slice for visualization/overlay
+                    if options['single_slice']:
+                        param_maps['reference_slice'] = registered_4d[:, :, options['z_slice'], 0]
+                    else:
+                        # Store entire 3D reference for z-slice navigation
+                        param_maps['reference_slice'] = registered_4d[:, :, :, 0]
+
+                    # Show results viewer (T014)
+                    print("Displaying parameter map results...")
+                    show_parameter_map_results(
+                        param_maps=param_maps,
+                        spacing=spacing,
+                        roi_mask=param_roi_mask,
+                        output_dir=str(auto_registration_dir),
+                        source_dicom=args.dicom
+                    )
+
+                    # Save parameter maps
+                    param_map_dir = auto_registration_dir / "parameter_maps"
+                    save_parameter_maps(param_maps, spacing, str(param_map_dir), args.dicom)
+
+                    print("Returning to menu.")
+                    continue  # Return to menu
 
                 elif action == 'image_tools':
-                    # Launch Image Tools dialog (T002/T003)
+                    # Launch Image Tools dialog (T002/T003/T012/T013)
                     if roi_state is None:
                         print("Error: No ROI data. Draw ROI first.")
                         continue
@@ -642,7 +790,10 @@ def main():
                         roi_signal=roi_state['roi_signal'],
                         time_units=args.time_units,
                         output_dir=str(auto_registration_dir),
-                        initial_mode=mode
+                        initial_mode=mode,
+                        roi_mask=roi_state.get('roi_mask'),
+                        spacing=spacing,
+                        source_dicom=args.dicom
                     )
 
                     print("Returning to menu.")
