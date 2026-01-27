@@ -23,6 +23,13 @@ from .components import HeaderWidget, ButtonBar
 class DicomScanResultsDialog(QDialog):
     """Dialog to display DICOM scan results with ability to load selected series."""
 
+    # Color constants
+    COLOR_PROXYL_VALID = QColor(220, 240, 220)      # Light green for valid PROXYL
+    COLOR_PROXYL_SELECTED = QColor(100, 200, 100)   # Bright green for selected PROXYL
+    COLOR_T2_VALID = QColor(220, 220, 240)          # Light blue for valid T2
+    COLOR_T2_SELECTED = QColor(100, 150, 220)       # Bright blue for selected T2
+    COLOR_DEFAULT = QColor(255, 255, 255)           # White for other rows
+
     def __init__(self, scan_results: list, folder_path: str, parent=None):
         super().__init__(parent)
         self.scan_results = scan_results
@@ -33,11 +40,15 @@ class DicomScanResultsDialog(QDialog):
         self.proxyl_series = [s for s in scan_results if s.get('is_proxyl')]
         self.t2_series = [s for s in scan_results if s.get('is_t2')]
 
+        # Map sample_file paths to row indices for highlighting
+        self.path_to_row = {}
+
         self.setWindowTitle("DICOM Scan Results")
         self.setMinimumSize(900, 600)
         self.resize(1000, 700)
 
         self._setup_ui()
+        self._update_row_highlights()
 
     def _setup_ui(self):
         """Build the dialog UI."""
@@ -65,17 +76,19 @@ class DicomScanResultsDialog(QDialog):
         self.table.setRowCount(len(self.scan_results))
 
         for row, s in enumerate(self.scan_results):
-            # Determine row color based on type
-            row_color = None
+            # Store path to row mapping
+            sample_file = s.get('sample_file', '')
+            if sample_file:
+                self.path_to_row[sample_file] = row
+
+            # Determine type string
             type_str = ''
             if s.get('is_proxyl'):
                 type_str = 'PROXYL'
-                row_color = QColor(200, 230, 200)  # Light green
             elif s.get('is_t2'):
                 type_str = 'T2'
-                row_color = QColor(200, 200, 230)  # Light blue
 
-            # Create items and apply row color
+            # Create items (colors will be set by _update_row_highlights)
             items = [
                 QTableWidgetItem(str(s.get('series_number', ''))),
                 QTableWidgetItem(s.get('series_description', '')[:50]),
@@ -84,12 +97,10 @@ class DicomScanResultsDialog(QDialog):
                 QTableWidgetItem(str(s.get('num_frames', 0))),
                 QTableWidgetItem(type_str),
                 QTableWidgetItem(s.get('study_date', '')),
-                QTableWidgetItem(Path(s.get('sample_file', '')).name)
+                QTableWidgetItem(Path(sample_file).name if sample_file else '')
             ]
 
             for col, item in enumerate(items):
-                if row_color:
-                    item.setBackground(row_color)
                 self.table.setItem(row, col, item)
 
         # Resize columns
@@ -120,6 +131,7 @@ class DicomScanResultsDialog(QDialog):
             self.t1_combo.addItem(label, s.get('sample_file'))
         if self.proxyl_series:
             self.t1_combo.setCurrentIndex(1)  # Select first PROXYL
+        self.t1_combo.currentIndexChanged.connect(self._update_row_highlights)
         t1_layout.addWidget(self.t1_combo, stretch=1)
         load_layout.addLayout(t1_layout)
 
@@ -139,6 +151,7 @@ class DicomScanResultsDialog(QDialog):
             self.t2_combo.addItem(label, s.get('sample_file'))
         if self.t2_series:
             self.t2_combo.setCurrentIndex(1)  # Select first T2
+        self.t2_combo.currentIndexChanged.connect(self._update_row_highlights)
         t2_layout.addWidget(self.t2_combo, stretch=1)
         load_layout.addLayout(t2_layout)
 
@@ -193,6 +206,35 @@ class DicomScanResultsDialog(QDialog):
                 QMessageBox.information(self, "Saved", f"Scan results saved to:\n{filepath}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+
+    def _update_row_highlights(self):
+        """Update row colors based on type and selection status."""
+        # Get currently selected paths
+        t1_selected_path = self.t1_combo.currentData() if hasattr(self, 't1_combo') else None
+        t2_selected_path = self.t2_combo.currentData() if hasattr(self, 't2_combo') else None
+
+        for row, s in enumerate(self.scan_results):
+            sample_file = s.get('sample_file', '')
+            is_proxyl = s.get('is_proxyl', False)
+            is_t2 = s.get('is_t2', False)
+
+            # Determine color based on type and selection
+            if sample_file == t1_selected_path and t1_selected_path:
+                color = self.COLOR_PROXYL_SELECTED
+            elif sample_file == t2_selected_path and t2_selected_path:
+                color = self.COLOR_T2_SELECTED
+            elif is_proxyl:
+                color = self.COLOR_PROXYL_VALID
+            elif is_t2:
+                color = self.COLOR_T2_VALID
+            else:
+                color = self.COLOR_DEFAULT
+
+            # Apply color to all cells in the row
+            for col in range(self.table.columnCount()):
+                item = self.table.item(row, col)
+                if item:
+                    item.setBackground(color)
 
     def _load_selected(self):
         """Load the selected T1 and T2 series."""
