@@ -629,6 +629,338 @@ class RegistrationSplashWindow(QMainWindow):
         self.status_label.setText(text)
 
 
+class T2RegistrationWorker(QThread):
+    """Background worker for T2-T1 registration."""
+
+    finished = Signal(object, object)  # registered_t2, reg_info
+    error = Signal(str)
+
+    def __init__(self, t2_volume, t2_spacing, t1_reference, t1_spacing, parent=None):
+        super().__init__(parent)
+        self.t2_volume = t2_volume
+        self.t2_spacing = t2_spacing
+        self.t1_reference = t1_reference
+        self.t1_spacing = t1_spacing
+
+    def run(self):
+        """Run T2-T1 registration in background thread."""
+        try:
+            from ..registration import register_t2_to_t1
+            registered_t2, reg_info = register_t2_to_t1(
+                t2_volume=self.t2_volume,
+                t2_spacing=self.t2_spacing,
+                t1_reference=self.t1_reference,
+                t1_spacing=self.t1_spacing,
+                show_quality=False  # Don't show quality in worker thread
+            )
+            self.finished.emit(registered_t2, reg_info)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class T2RegistrationProgressDialog(QDialog):
+    """Simple progress dialog for T2-T1 registration."""
+
+    def __init__(self, t2_volume, t2_spacing, t1_reference, t1_spacing, parent=None):
+        super().__init__(parent)
+        self.t2_volume = t2_volume
+        self.t2_spacing = t2_spacing
+        self.t1_reference = t1_reference
+        self.t1_spacing = t1_spacing
+        self.registered_t2 = None
+        self.reg_info = None
+
+        self.setWindowTitle("ProxylFit - T2 Registration")
+        self.setMinimumSize(400, 150)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowCloseButtonHint)
+
+        self._setup_ui()
+        self._start_registration()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(20)
+        layout.setContentsMargins(30, 30, 30, 30)
+
+        # Title
+        title = QLabel("Registering T2 to T1...")
+        title.setFont(QFont("Arial", 14, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # Progress bar (indeterminate)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)  # Indeterminate mode
+        self.progress_bar.setTextVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        # Status
+        self.status_label = QLabel("Please wait...")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        self.setStyleSheet(PROXYLFIT_STYLE)
+
+    def _start_registration(self):
+        self.worker = T2RegistrationWorker(
+            self.t2_volume, self.t2_spacing,
+            self.t1_reference, self.t1_spacing,
+            parent=self
+        )
+        self.worker.finished.connect(self._on_finished)
+        self.worker.error.connect(self._on_error)
+        self.worker.start()
+
+    def _on_finished(self, registered_t2, reg_info):
+        self.registered_t2 = registered_t2
+        self.reg_info = reg_info
+        self.accept()
+
+    def _on_error(self, error_msg):
+        QMessageBox.critical(self, "Registration Error", f"T2 registration failed:\n{error_msg}")
+        self.reject()
+
+
+class T2RegistrationReviewDialog(QDialog):
+    """Qt-based T2-T1 registration quality review dialog."""
+
+    def __init__(self, t1_reference, t2_original, t2_registered, reg_info, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ProxylFit - T2 Registration Review")
+        self.setMinimumSize(1000, 700)
+
+        self.t1_reference = t1_reference
+        self.t2_original = t2_original
+        self.t2_registered = t2_registered
+        self.reg_info = reg_info
+
+        # State
+        self.z_slice = t1_reference.shape[2] // 2
+        self.max_z_slice = t1_reference.shape[2] - 1
+
+        self._setup_ui()
+        self._update_display()
+
+    def _setup_ui(self):
+        """Set up the dialog UI."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # Title
+        title = QLabel("T2 to T1 Registration Review")
+        title.setFont(QFont("Arial", 16, QFont.Bold))
+        layout.addWidget(title)
+
+        # Main content - images
+        content_layout = QHBoxLayout()
+
+        # Image canvas
+        self.fig = Figure(figsize=(12, 8), dpi=100)
+        self.fig.set_facecolor('#f5f5f5')
+        self.canvas = FigureCanvas(self.fig)
+
+        # Create subplots: 2x3 grid
+        self.ax_t1 = self.fig.add_subplot(231)
+        self.ax_t2_reg = self.fig.add_subplot(232)
+        self.ax_overlay = self.fig.add_subplot(233)
+        self.ax_diff = self.fig.add_subplot(234)
+        self.ax_t2_orig = self.fig.add_subplot(235)
+        self.ax_info = self.fig.add_subplot(236)
+
+        # Initialize with placeholder
+        placeholder = np.zeros((10, 10))
+        self.im_t1 = self.ax_t1.imshow(placeholder, cmap='gray', origin='lower')
+        self.im_t2_reg = self.ax_t2_reg.imshow(placeholder, cmap='gray', origin='lower')
+        self.im_overlay = self.ax_overlay.imshow(np.zeros((10, 10, 3)), origin='lower')
+        self.im_diff = self.ax_diff.imshow(placeholder, cmap='hot', origin='lower')
+        self.im_t2_orig = self.ax_t2_orig.imshow(placeholder, cmap='gray', origin='lower')
+
+        # Set titles
+        self.ax_t1.set_title('T1 Reference', fontsize=11, fontweight='bold')
+        self.ax_t1.axis('off')
+        self.ax_t2_reg.set_title('Registered T2', fontsize=11, fontweight='bold')
+        self.ax_t2_reg.axis('off')
+        self.ax_overlay.set_title('Overlay (T1=Red, T2=Green)', fontsize=11, fontweight='bold')
+        self.ax_overlay.axis('off')
+        self.ax_diff.set_title('|T1 - Registered T2|', fontsize=11, fontweight='bold')
+        self.ax_diff.axis('off')
+        self.ax_t2_orig.set_title('Original T2', fontsize=11, fontweight='bold')
+        self.ax_t2_orig.axis('off')
+
+        # Info panel
+        self.ax_info.axis('off')
+        self._draw_info_panel()
+
+        self.fig.tight_layout()
+        content_layout.addWidget(self.canvas, 1)
+
+        layout.addLayout(content_layout, 1)
+
+        # Controls row
+        controls_layout = QHBoxLayout()
+
+        # Accept button (left)
+        self.btn_accept = QPushButton("Accept")
+        self.btn_accept.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 20px; }"
+            "QPushButton:hover { background-color: #45a049; }"
+        )
+        self.btn_accept.clicked.connect(self.accept)
+        controls_layout.addWidget(self.btn_accept)
+
+        controls_layout.addStretch()
+
+        # Z-slice control
+        z_layout = QHBoxLayout()
+        z_layout.addWidget(QLabel("Z-slice:"))
+        self.z_spinbox = QSpinBox()
+        self.z_spinbox.setRange(0, self.max_z_slice)
+        self.z_spinbox.setValue(self.z_slice)
+        self.z_spinbox.valueChanged.connect(self._on_z_changed)
+        z_layout.addWidget(self.z_spinbox)
+        controls_layout.addLayout(z_layout)
+
+        controls_layout.addStretch()
+
+        layout.addLayout(controls_layout)
+
+        # Instructions
+        instructions = QLabel("Use ↑↓ arrow keys or spinbox to change z-slice")
+        instructions.setStyleSheet("color: #666666; font-style: italic;")
+        layout.addWidget(instructions)
+
+        self.setStyleSheet(PROXYLFIT_STYLE)
+
+    def _draw_info_panel(self):
+        """Draw the registration info on the info axis."""
+        self.ax_info.clear()
+        self.ax_info.axis('off')
+
+        tx, ty, tz = self.reg_info['translation_mm']
+        rx, ry, rz = self.reg_info['rotation_deg']
+
+        info_text = (
+            f"Registration Results\n"
+            f"{'─' * 25}\n\n"
+            f"Translation (mm):\n"
+            f"  X: {tx:+.2f}\n"
+            f"  Y: {ty:+.2f}\n"
+            f"  Z: {tz:+.2f}\n\n"
+            f"Rotation (deg):\n"
+            f"  X: {rx:+.2f}\n"
+            f"  Y: {ry:+.2f}\n"
+            f"  Z: {rz:+.2f}\n\n"
+            f"Mutual Info: {self.reg_info['mutual_information']:.2f}\n"
+            f"Time: {self.reg_info['registration_time']:.1f}s\n"
+            f"Resampled: {self.reg_info['resampled']}"
+        )
+
+        self.ax_info.text(0.1, 0.95, info_text, transform=self.ax_info.transAxes,
+                         fontsize=10, verticalalignment='top', fontfamily='monospace',
+                         bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+
+    def _update_display(self):
+        """Update the image display for current z-slice."""
+        z = self.z_slice
+
+        # T1 reference
+        t1_slice = self.t1_reference[:, :, z].T
+        self.im_t1.set_data(t1_slice)
+        self.im_t1.set_clim(vmin=t1_slice.min(), vmax=t1_slice.max())
+
+        # Registered T2
+        t2_reg_slice = self.t2_registered[:, :, z].T
+        self.im_t2_reg.set_data(t2_reg_slice)
+        self.im_t2_reg.set_clim(vmin=t2_reg_slice.min(), vmax=t2_reg_slice.max())
+
+        # Overlay (T1=red, T2=green)
+        t1_norm = (t1_slice - t1_slice.min()) / (t1_slice.max() - t1_slice.min() + 1e-8)
+        t2_norm = (t2_reg_slice - t2_reg_slice.min()) / (t2_reg_slice.max() - t2_reg_slice.min() + 1e-8)
+        overlay = np.zeros((*t1_norm.shape, 3))
+        overlay[:, :, 0] = t1_norm  # Red = T1
+        overlay[:, :, 1] = t2_norm  # Green = T2
+        self.im_overlay.set_data(overlay)
+
+        # Difference
+        diff_slice = np.abs(t1_slice.astype(float) - t2_reg_slice.astype(float))
+        self.im_diff.set_data(diff_slice)
+        self.im_diff.set_clim(vmin=0, vmax=diff_slice.max())
+
+        # Original T2 (may have different z-range)
+        if self.t2_original.shape[2] > z:
+            orig_z = z
+        else:
+            orig_z = self.t2_original.shape[2] // 2
+        t2_orig_slice = self.t2_original[:, :, orig_z].T
+        self.im_t2_orig.set_data(t2_orig_slice)
+        self.im_t2_orig.set_clim(vmin=t2_orig_slice.min(), vmax=t2_orig_slice.max())
+        self.ax_t2_orig.set_title(f'Original T2 (z={orig_z})', fontsize=11, fontweight='bold')
+
+        self.canvas.draw_idle()
+
+    def _on_z_changed(self, value):
+        """Handle z-slice spinbox change."""
+        self.z_slice = value
+        self._update_display()
+
+    def keyPressEvent(self, event):
+        """Handle keyboard navigation."""
+        if event.key() == Qt.Key_Up:
+            if self.z_slice < self.max_z_slice:
+                self.z_spinbox.setValue(self.z_slice + 1)
+        elif event.key() == Qt.Key_Down:
+            if self.z_slice > 0:
+                self.z_spinbox.setValue(self.z_slice - 1)
+        else:
+            super().keyPressEvent(event)
+
+
+def run_t2_registration_with_progress(t2_volume, t2_spacing, t1_reference, t1_spacing,
+                                       show_quality=True, parent=None):
+    """
+    Run T2-T1 registration with a progress dialog.
+
+    Parameters
+    ----------
+    t2_volume : np.ndarray
+        T2 volume to register
+    t2_spacing : tuple
+        T2 voxel spacing
+    t1_reference : np.ndarray
+        T1 reference volume
+    t1_spacing : tuple
+        T1 voxel spacing
+    show_quality : bool
+        Whether to show quality visualization after registration
+    parent : QWidget, optional
+        Parent widget
+
+    Returns
+    -------
+    tuple
+        (registered_t2, reg_info) on success, (None, None) on cancel/error
+    """
+    dialog = T2RegistrationProgressDialog(
+        t2_volume, t2_spacing, t1_reference, t1_spacing, parent
+    )
+    result = dialog.exec()
+
+    if result == QDialog.Accepted:
+        registered_t2 = dialog.registered_t2
+        reg_info = dialog.reg_info
+
+        # Show quality visualization using Qt dialog
+        if show_quality and registered_t2 is not None:
+            review_dialog = T2RegistrationReviewDialog(
+                t1_reference, t2_volume, registered_t2, reg_info, parent
+            )
+            review_dialog.exec()
+
+        return registered_t2, reg_info
+    return None, None
+
+
 def run_registration_with_progress(image_4d, spacing, output_dir, dicom_path, parent=None):
     """
     Run registration with a progress dialog.

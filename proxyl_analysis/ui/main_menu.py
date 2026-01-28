@@ -379,9 +379,9 @@ class MainMenuDialog(QDialog):
         # Buttons row
         btn_layout = QHBoxLayout()
 
-        scan_btn = QPushButton("Scan DICOM Folder...")
+        scan_btn = QPushButton("Load from DICOM Folder...")
         scan_btn.clicked.connect(self._scan_dicom_folder)
-        scan_btn.setToolTip("Scan a folder to identify PROXYL and T2 series")
+        scan_btn.setToolTip("Load T1/T2 series from a DICOM folder")
         btn_layout.addWidget(scan_btn)
 
         load_new_btn = QPushButton("Load T1 DICOM...")
@@ -724,9 +724,9 @@ class MainMenuDialog(QDialog):
         self.accept()
 
     def _scan_dicom_folder(self):
-        """Scan a DICOM folder and show metadata summary."""
+        """Scan a DICOM folder and show available series."""
         folder_path = QFileDialog.getExistingDirectory(
-            self, "Select DICOM Folder to Scan",
+            self, "Select DICOM Folder",
             str(Path.home())
         )
         if not folder_path:

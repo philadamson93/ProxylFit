@@ -783,6 +783,211 @@ def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[flo
     return registered_4d, spacing
 
 
+def save_registered_t2_as_dicom(
+    registered_t2: np.ndarray,
+    spacing: Tuple[float, float, float],
+    output_dir: str,
+    source_dicom: str = None
+) -> str:
+    """
+    Save registered T2 volume as DICOM slices.
+
+    Saves to registered/dicoms/T2/ with files named z{ZZ}.dcm.
+
+    Parameters
+    ----------
+    registered_t2 : np.ndarray
+        3D array with shape [x, y, z]
+    spacing : tuple
+        Voxel spacing (x, y, z) in mm
+    output_dir : str
+        Output directory (will create 'registered/dicoms/T2' subdirectory)
+    source_dicom : str, optional
+        Path to source DICOM to copy patient/study metadata from
+
+    Returns
+    -------
+    str
+        Path to the created DICOM series directory
+    """
+    import pydicom
+    from pydicom.dataset import FileDataset
+
+    # Create output directory
+    dicom_dir = get_dataset_path(output_dir, 'registered/dicoms/T2')
+
+    x_dim, y_dim, z_dim = registered_t2.shape
+
+    # Get metadata from source if available
+    source_metadata = {}
+    if source_dicom:
+        source_metadata = _copy_dicom_metadata(source_dicom)
+
+    # Generate UIDs
+    series_uid = _generate_uid()
+    study_uid = source_metadata.get('StudyInstanceUID', _generate_uid())
+
+    # Determine series number
+    original_series = source_metadata.get('OriginalSeriesNumber', 1)
+    series_number = original_series + 2000  # Offset for T2
+
+    # Save each 2D slice as a separate DICOM file
+    for z in range(z_dim):
+        # Get 2D slice [x, y] -> need [y, x] for DICOM
+        slice_2d = registered_t2[:, :, z]
+        slice_dicom = slice_2d.T  # Transpose to [y, x]
+
+        # Create file
+        filename = f"z{z:02d}.dcm"
+        filepath = dicom_dir / filename
+
+        # Create minimal DICOM dataset
+        file_meta = pydicom.dataset.FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = pydicom.uid.MRImageStorage
+        file_meta.MediaStorageSOPInstanceUID = _generate_uid()
+        file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+        ds = FileDataset(str(filepath), {}, file_meta=file_meta, preamble=b"\0" * 128)
+
+        # Patient/Study info from source
+        ds.PatientID = source_metadata.get('PatientID', 'ANONYMOUS')
+        ds.PatientName = source_metadata.get('PatientName', 'Anonymous')
+        ds.StudyInstanceUID = study_uid
+        ds.StudyDate = source_metadata.get('StudyDate', time.strftime('%Y%m%d'))
+        ds.StudyDescription = source_metadata.get('StudyDescription', 'DCE-MRI Study')
+
+        # Series info
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesNumber = series_number
+        ds.SeriesDescription = "Registered T2"
+
+        # Instance info
+        ds.SOPClassUID = pydicom.uid.MRImageStorage
+        ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+        ds.InstanceNumber = z + 1
+
+        # Slice position info
+        ds.SliceLocation = float(z * spacing[2])
+        ds.ImagePositionPatient = [0.0, 0.0, float(z * spacing[2])]
+        ds.InStackPositionNumber = z + 1
+
+        # Image info
+        ds.Modality = 'MR'
+        ds.ImageType = ['DERIVED', 'SECONDARY', 'REGISTERED']
+        ds.Rows = y_dim
+        ds.Columns = x_dim
+        ds.PixelSpacing = [float(spacing[1]), float(spacing[0])]  # [row, col]
+        ds.SliceThickness = float(spacing[2])
+        ds.SpacingBetweenSlices = float(spacing[2])
+
+        # Pixel data
+        ds.BitsAllocated = 16
+        ds.BitsStored = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 0  # Unsigned
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = 'MONOCHROME2'
+
+        # Scale data to uint16
+        slice_min = slice_dicom.min()
+        slice_max = slice_dicom.max()
+        if slice_max > slice_min:
+            scaled = ((slice_dicom - slice_min) / (slice_max - slice_min) * 65535).astype(np.uint16)
+        else:
+            scaled = np.zeros_like(slice_dicom, dtype=np.uint16)
+
+        ds.PixelData = scaled.tobytes()
+
+        # Rescale slope/intercept for reconstruction
+        ds.RescaleSlope = (slice_max - slice_min) / 65535 if slice_max > slice_min else 1.0
+        ds.RescaleIntercept = slice_min
+
+        # Save
+        ds.save_as(str(filepath))
+
+    # Save series info JSON
+    series_info = {
+        'format_version': '1.0',
+        'format_type': 't2_slices',
+        'file_pattern': 'z{z:02d}.dcm',
+        'n_slices': z_dim,
+        'shape': [x_dim, y_dim, z_dim],
+        'spacing': list(spacing),
+        'series_uid': series_uid,
+        'study_uid': study_uid,
+        'source_dicom': source_dicom,
+        'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'series_description': 'Registered T2'
+    }
+
+    with open(dicom_dir / 'series_info.json', 'w') as f:
+        json.dump(series_info, f, indent=2)
+
+    print(f"  Saved {z_dim} T2 DICOM slices to: {dicom_dir}")
+    return str(dicom_dir)
+
+
+def load_registered_t2(output_dir: str) -> Tuple[Optional[np.ndarray], Tuple[float, float, float]]:
+    """
+    Load previously saved registered T2 volume.
+
+    Loads from DICOM series in registered/dicoms/T2/ (z{ZZ}.dcm format)
+
+    Parameters
+    ----------
+    output_dir : str
+        Dataset directory containing saved registration data
+
+    Returns
+    -------
+    registered_t2 : np.ndarray or None
+        3D array with shape [x, y, z], or None if not found
+    spacing : tuple
+        Voxel spacing (x, y, z) in mm
+    """
+    import pydicom
+
+    t2_dir = Path(output_dir) / "registered" / "dicoms" / "T2"
+
+    # Check if T2 data exists
+    if not t2_dir.exists() or not (t2_dir / 'z00.dcm').exists():
+        return None, (1.0, 1.0, 1.0)
+
+    # Load series info
+    info_path = t2_dir / 'series_info.json'
+    if not info_path.exists():
+        return None, (1.0, 1.0, 1.0)
+
+    with open(info_path, 'r') as f:
+        series_info = json.load(f)
+
+    x_dim, y_dim, z_dim = series_info['shape']
+    spacing = tuple(series_info['spacing'])
+
+    # Initialize 3D array
+    registered_t2 = np.zeros((x_dim, y_dim, z_dim), dtype=np.float64)
+
+    # Load each 2D slice
+    for z in range(z_dim):
+        filepath = t2_dir / f'z{z:02d}.dcm'
+        if not filepath.exists():
+            print(f"  Warning: Missing T2 DICOM file: {filepath}")
+            return None, (1.0, 1.0, 1.0)
+
+        ds = pydicom.dcmread(str(filepath))
+
+        # Get pixel data [y, x] and apply rescale
+        pixel_data = ds.pixel_array.astype(np.float64)
+        if hasattr(ds, 'RescaleSlope') and hasattr(ds, 'RescaleIntercept'):
+            pixel_data = pixel_data * ds.RescaleSlope + ds.RescaleIntercept
+
+        # Transpose from [y, x] to [x, y] and store
+        registered_t2[:, :, z] = pixel_data.T
+
+    print(f"  Loaded registered T2 with shape: {registered_t2.shape}")
+    return registered_t2, spacing
+
+
 def save_derived_image_as_dicom(
     image: np.ndarray,
     output_path: str,

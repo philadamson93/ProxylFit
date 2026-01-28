@@ -16,7 +16,7 @@ from pathlib import Path
 # Add the parent directory to the path so we can import our package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from proxyl_analysis.io import load_dicom_series, load_t2_volume
+from proxyl_analysis.io import load_dicom_series, load_t2_volume, save_registered_t2_as_dicom, load_registered_t2
 from proxyl_analysis.registration import register_timeseries, load_registration_data, save_registration_data, register_t2_to_t1
 from proxyl_analysis.roi_selection import select_rectangle_roi, select_segmentation_roi, select_manual_contour_roi, compute_roi_timeseries, print_roi_mode_info, get_available_roi_modes
 from proxyl_analysis.model import fit_proxyl_kinetics, plot_fit_results, print_fit_summary, calculate_derived_parameters, select_injection_time
@@ -31,6 +31,7 @@ from proxyl_analysis.ui import (
     init_qt_app,
     show_main_menu,
     run_registration_with_progress,
+    run_t2_registration_with_progress,
     show_registration_review_qt,
     show_image_tools_dialog,
     show_parameter_map_options,
@@ -408,6 +409,9 @@ def main():
     print()
     
     try:
+        # Initialize loaded_t2 for potential session resumption
+        loaded_t2 = None
+
         # Step 1: Load DICOM data (or registered data)
         if args.load_registration:
             print("Step 1: Loading previously saved registration data...")
@@ -419,7 +423,12 @@ def main():
                 # Show registration quality summary
                 num_timepoints = len(reg_metrics) - 1
                 print(f"  Registration completed for {num_timepoints} timepoints")
-                
+
+                # Try to load previously saved registered T2
+                loaded_t2, _ = load_registered_t2(args.load_registration)
+                if loaded_t2 is not None:
+                    print(f"  Loaded registered T2 with shape: {loaded_t2.shape}")
+
                 # Also load original data for visualization if needed
                 if not (args.no_registration_window or args.no_plot):
                     print("  Loading original DICOM for comparison...")
@@ -513,7 +522,26 @@ def main():
 
             # ROI state preserved across menu returns
             roi_state = None
-            registered_t2 = None
+            registered_t2 = loaded_t2  # Use previously loaded T2 if available
+
+            # If T2 was specified via args (e.g., from scan dialog) but not yet loaded, load it now
+            if registered_t2 is None and args.t2:
+                print(f"Loading T2 from: {args.t2}")
+                try:
+                    t2_volume, t2_spacing = load_t2_volume(args.t2)
+                    print(f"  T2 volume shape: {t2_volume.shape}")
+                    t1_reference = registered_4d[:, :, :, 0]
+                    # Run T2 registration with progress dialog
+                    registered_t2, reg_info = run_t2_registration_with_progress(
+                        t2_volume, t2_spacing, t1_reference, spacing
+                    )
+                    if registered_t2 is not None:
+                        print(f"  T2-T1 registration complete")
+                        # Save registered T2 for session resumption
+                        save_registered_t2_as_dicom(registered_t2, spacing, str(auto_registration_dir))
+                except Exception as e:
+                    print(f"  Error loading T2: {e}")
+                    registered_t2 = None
 
             # Menu loop - keep showing menu until user exits
             while True:
@@ -554,28 +582,29 @@ def main():
 
                     if t1_path:
                         print(f"\nSelected T1 (PROXYL): {t1_path}")
-                        print("Please restart the application with:")
-                        print(f"  python -m proxyl_analysis --dicom \"{t1_path}\"")
                         if t2_path:
-                            print(f"\nSelected T2: {t2_path}")
-                            print("After loading, use 'Load T2 Volume...' to load the T2.")
+                            print(f"Selected T2: {t2_path}")
+                            print("\nPlease restart the application with:")
+                            print(f"  python -m proxyl_analysis --dicom \"{t1_path}\" --t2 \"{t2_path}\"")
+                        else:
+                            print("\nPlease restart the application with:")
+                            print(f"  python -m proxyl_analysis --dicom \"{t1_path}\"")
                         sys.exit(0)
                     elif t2_path:
                         # Only T2 selected, load it into current session
                         print(f"Loading T2 from scan: {t2_path}")
                         try:
-                            from proxyl_analysis.io import load_t2_volume
                             t2_volume, t2_spacing = load_t2_volume(t2_path)
                             print(f"  T2 volume shape: {t2_volume.shape}")
                             t1_reference = registered_4d[:, :, :, 0]
-                            registered_t2, reg_info = register_t2_to_t1(
-                                t2_volume=t2_volume,
-                                t2_spacing=t2_spacing,
-                                t1_reference=t1_reference,
-                                t1_spacing=spacing,
-                                show_quality=True
+                            # Run T2 registration with progress dialog
+                            registered_t2, reg_info = run_t2_registration_with_progress(
+                                t2_volume, t2_spacing, t1_reference, spacing
                             )
-                            print(f"  T2-T1 registration complete")
+                            if registered_t2 is not None:
+                                print(f"  T2-T1 registration complete")
+                                # Save registered T2 for session resumption
+                                save_registered_t2_as_dicom(registered_t2, spacing, str(auto_registration_dir))
                         except Exception as e:
                             print(f"  Error loading T2: {e}")
                             registered_t2 = None
@@ -585,18 +614,17 @@ def main():
                     # Load and register T2
                     print(f"Loading T2 from: {menu_result['t2_path']}")
                     try:
-                        from proxyl_analysis.io import load_t2_volume
                         t2_volume, t2_spacing = load_t2_volume(menu_result['t2_path'])
                         print(f"  T2 volume shape: {t2_volume.shape}")
                         t1_reference = registered_4d[:, :, :, 0]
-                        registered_t2, reg_info = register_t2_to_t1(
-                            t2_volume=t2_volume,
-                            t2_spacing=t2_spacing,
-                            t1_reference=t1_reference,
-                            t1_spacing=spacing,
-                            show_quality=True
+                        # Run T2 registration with progress dialog
+                        registered_t2, reg_info = run_t2_registration_with_progress(
+                            t2_volume, t2_spacing, t1_reference, spacing
                         )
-                        print(f"  T2-T1 registration complete")
+                        if registered_t2 is not None:
+                            print(f"  T2-T1 registration complete")
+                            # Save registered T2 for session resumption
+                            save_registered_t2_as_dicom(registered_t2, spacing, str(auto_registration_dir))
                     except Exception as e:
                         print(f"  Error loading T2: {e}")
                         registered_t2 = None
@@ -981,6 +1009,8 @@ def main():
                 print(f"  T2-T1 registration complete")
                 print(f"  Registered T2 shape: {registered_t2.shape}")
                 print(f"  Using registered T2 for ROI selection (better tumor definition)")
+                # Save registered T2 for session resumption
+                save_registered_t2_as_dicom(registered_t2, spacing, str(auto_registration_dir))
                 print()
             except FileNotFoundError:
                 print(f"  Error: T2 file not found: {args.t2}")

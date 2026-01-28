@@ -24,7 +24,11 @@ from .registration import (
     RegistrationProgressDialog,
     RegistrationReviewDialog,
     RegistrationSplashWindow,
+    T2RegistrationWorker,
+    T2RegistrationProgressDialog,
+    T2RegistrationReviewDialog,
     run_registration_with_progress,
+    run_t2_registration_with_progress,
     show_registration_review_qt
 )
 
@@ -62,6 +66,16 @@ from .main_menu import (
     show_main_menu
 )
 
+# Parameter map options (T014)
+from .parameter_map_options import (
+    ParameterMapOptionsDialog,
+    ParameterMapResultsDialog,
+    ParameterMappingProgressDialog,
+    ParameterMappingWorker,
+    show_parameter_map_options,
+    show_parameter_map_results
+)
+
 __all__ = [
     # Styles and initialization
     'PROXYLFIT_STYLE',
@@ -81,7 +95,11 @@ __all__ = [
     'RegistrationProgressDialog',
     'RegistrationReviewDialog',
     'RegistrationSplashWindow',
+    'T2RegistrationWorker',
+    'T2RegistrationProgressDialog',
+    'T2RegistrationReviewDialog',
     'run_registration_with_progress',
+    'run_t2_registration_with_progress',
     'show_registration_review_qt',
 
     # ROI
@@ -107,4 +125,12 @@ __all__ = [
     # Main menu
     'MainMenuDialog',
     'show_main_menu',
+
+    # Parameter map options (T014)
+    'ParameterMapOptionsDialog',
+    'ParameterMapResultsDialog',
+    'ParameterMappingProgressDialog',
+    'ParameterMappingWorker',
+    'show_parameter_map_options',
+    'show_parameter_map_results',
 ]

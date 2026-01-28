@@ -1,7 +1,7 @@
 # ProxylFit Implementation Plan
 
 **Created**: 2025-01-15
-**Updated**: 2025-01-21
+**Updated**: 2025-01-28
 **Status**: In Progress
 
 ## Overview
@@ -14,6 +14,7 @@ This document tracks the implementation of the main workflow menu (T006) and rel
 - **T006 Phase 1**: Main Menu with decoupled ROI workflow - complete
 - **T002**: Averaged Images - complete
 - **T003**: Difference Images - complete
+- **T001 Enhancements**: T2 Registration UI improvements - complete
 
 ## Implementation Order
 
@@ -55,6 +56,17 @@ This document tracks the implementation of the main workflow menu (T006) and rel
 - Z-slice slider for preview navigation
 - NPZ export with metadata
 - RdBu_r diverging colormap for difference images
+
+### T001 Enhancements: T2 Registration UI (January 2025)
+- **"Load from DICOM Folder" button** - Renamed from "Scan DICOM Folder", scans and auto-detects PROXYL/T2 series
+- **T2 selection in scan dialog** - Can select both T1 and T2 together for loading
+- **T2 registration progress dialog** - Shows indeterminate progress while registering T2 to T1
+- **Qt-based T2 Registration Review Dialog** - Replaces matplotlib version:
+  - 2x3 grid: T1 Reference, Registered T2, Overlay, Difference, Original T2, Info
+  - Z-slice navigation (spinbox + arrow keys)
+  - Accept button in bottom-left
+- **T2 session persistence** - Registered T2 saved as DICOM to `registered/dicoms/T2/`, auto-loaded on session resume
+- **Files**: `io.py` (save/load T2), `ui/registration.py` (progress + review dialogs), `run_analysis.py` (integration)
 
 ## T005: Pixel-Level Maps (Next)
 

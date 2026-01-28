@@ -2,6 +2,29 @@
 
 All notable changes to ProxylFit are documented here.
 
+## [1.2.0] - January 2025
+
+### Added
+- **T2 Registration UI Enhancements**
+  - "Load from DICOM Folder" button - auto-detects PROXYL and T2 series
+  - T2 registration progress dialog with indeterminate progress bar
+  - Qt-based T2 Registration Review Dialog (replaces matplotlib version)
+    - 2x3 grid showing T1, registered T2, overlay, difference, original T2, and info
+    - Z-slice navigation via spinbox and arrow keys
+    - Accept button positioned at bottom-left
+  - T2 session persistence - registered T2 saved as DICOM and auto-loaded on resume
+
+### Changed
+- Renamed "Scan DICOM Folder" to "Load from DICOM Folder"
+- T2 visualization now uses Qt dialog for consistency with rest of app
+
+### Files Modified
+- `proxyl_analysis/io.py` - Added `save_registered_t2_as_dicom()`, `load_registered_t2()`
+- `proxyl_analysis/ui/registration.py` - Added `T2RegistrationProgressDialog`, `T2RegistrationReviewDialog`, `run_t2_registration_with_progress()`
+- `proxyl_analysis/run_analysis.py` - T2 loading and session resume integration
+
+---
+
 ## [1.1.0] - January 2025
 
 ### Added

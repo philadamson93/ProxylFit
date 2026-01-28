@@ -179,12 +179,16 @@ def register_timeseries(image_4d: np.ndarray, spacing: Tuple[float, float, float
     return registered_4d, metrics
 
 
-def save_registration_data(registered_4d: np.ndarray, metrics: List[RegistrationMetrics], 
-                          spacing: Tuple[float, float, float], output_dir: str, 
+def save_registration_data(registered_4d: np.ndarray, metrics: List[RegistrationMetrics],
+                          spacing: Tuple[float, float, float], output_dir: str,
                           dicom_path: Optional[str] = None) -> None:
     """
     Save registered 4D data and metrics to disk.
-    
+
+    Saves data as:
+    - DICOM series in registered/dicoms/ (2D slice format: z{ZZ}_t{TTT}.dcm)
+    - JSON metrics in registered/
+
     Parameters
     ----------
     registered_4d : np.ndarray
@@ -194,22 +198,26 @@ def save_registration_data(registered_4d: np.ndarray, metrics: List[Registration
     spacing : tuple of float
         Voxel spacing
     output_dir : str
-        Output directory
+        Dataset directory (will save to registered/ subdirectory)
+    dicom_path : str, optional
+        Path to source DICOM for metadata copying
     """
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-    
-    # Save registered 4D data
-    reg_data_file = output_path / "registered_4d_data.npz"
-    np.savez_compressed(
-        reg_data_file,
-        registered_4d=registered_4d,
-        spacing=np.array(spacing)
+    from .io import (get_dataset_path, save_registered_as_dicom_series,
+                     update_manifest_analysis)
+
+    # Use new directory structure: output_dir/registered/
+    registered_path = get_dataset_path(output_dir, 'registered')
+
+    # Save as DICOM series (2D slices)
+    print("  Saving registered data as DICOM series...")
+    save_registered_as_dicom_series(
+        registered_4d, spacing, output_dir,
+        series_description="Registered T1 DCE",
+        source_dicom=dicom_path
     )
-    print(f"  Registered 4D data saved to: {reg_data_file}")
-    
+
     # Save metrics as JSON
-    metrics_file = output_path / "registration_metrics.json"
+    metrics_file = registered_path / "registration_metrics.json"
     metrics_dict = {
         'metadata': {
             'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -230,21 +238,31 @@ def save_registration_data(registered_4d: np.ndarray, metrics: List[Registration
             'best_translation_timepoint': min(metrics[1:], key=lambda m: np.linalg.norm(m.translation)).timepoint
         }
     }
-    
+
     with open(metrics_file, 'w') as f:
         json.dump(metrics_dict, f, indent=2)
     print(f"  Registration metrics saved to: {metrics_file}")
+
+    # Update dataset manifest
+    update_manifest_analysis(output_dir, 'registration', {
+        'format': 'dicom_2d_slices',
+        'n_timepoints': registered_4d.shape[3],
+        'shape': list(registered_4d.shape),
+        'spacing': list(spacing)
+    })
 
 
 def load_registration_data(output_dir: str) -> Tuple[np.ndarray, Tuple[float, float, float], List[RegistrationMetrics]]:
     """
     Load previously saved registration data.
-    
+
+    Loads from DICOM series in registered/dicoms/ (2D slice format: z{ZZ}_t{TTT}.dcm)
+
     Parameters
     ----------
     output_dir : str
-        Directory containing saved registration data
-        
+        Directory containing saved registration data (dataset directory)
+
     Returns
     -------
     registered_4d : np.ndarray
@@ -253,33 +271,46 @@ def load_registration_data(output_dir: str) -> Tuple[np.ndarray, Tuple[float, fl
         Voxel spacing
     metrics : List[RegistrationMetrics]
         Registration quality metrics
+
+    Raises
+    ------
+    FileNotFoundError
+        If no valid DICOM series is found
     """
+    from .io import load_registered_dicom_series
+
     output_path = Path(output_dir)
-    
-    # Load registered 4D data
-    reg_data_file = output_path / "registered_4d_data.npz"
-    if not reg_data_file.exists():
-        raise FileNotFoundError(f"Registered data file not found: {reg_data_file}")
-    
-    data = np.load(reg_data_file)
-    registered_4d = data['registered_4d']
-    spacing = tuple(data['spacing'])
-    
+    dicom_dir = output_path / "registered" / "dicoms"
+
+    # Load from DICOM series (only supported format)
+    if not dicom_dir.exists():
+        raise FileNotFoundError(
+            f"No registered data found in: {output_dir}\n"
+            f"Expected DICOM series at: {dicom_dir}\n"
+            "Please re-run registration to generate DICOM output."
+        )
+
+    registered_4d, spacing = load_registered_dicom_series(str(dicom_dir))
+    print("  Loaded from DICOM series")
+
     # Load metrics
-    metrics_file = output_path / "registration_metrics.json"
+    metrics_file = output_path / "registered" / "registration_metrics.json"
     if not metrics_file.exists():
-        raise FileNotFoundError(f"Metrics file not found: {metrics_file}")
-    
+        raise FileNotFoundError(
+            f"Metrics file not found: {metrics_file}\n"
+            "Please re-run registration."
+        )
+
     with open(metrics_file, 'r') as f:
         metrics_data = json.load(f)
-    
+
     metrics = []
     for m_dict in metrics_data['metrics']:
         metrics.append(RegistrationMetrics(**m_dict))
-    
+
     print(f"Loaded registered 4D data with shape: {registered_4d.shape}")
     print(f"Registration data contains {len(metrics)} timepoints")
-    
+
     return registered_4d, spacing, metrics
 
 
@@ -1088,8 +1119,8 @@ def _visualize_t2_t1_registration(t1_volume: np.ndarray, t2_original: np.ndarray
 
     plt.tight_layout()
 
-    # Add accept button
-    ax_btn = plt.axes([0.45, 0.02, 0.1, 0.04])
+    # Add accept button (bottom-left)
+    ax_btn = plt.axes([0.05, 0.02, 0.1, 0.04])
     btn = Button(ax_btn, 'Accept')
     btn.label.set_fontsize(10)
 

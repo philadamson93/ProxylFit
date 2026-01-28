@@ -1,8 +1,9 @@
 # T001: T2 to T1 Registration
 
-**Status**: implemented
+**Status**: complete
 **Priority**: high
 **Created**: 2025-01-08
+**Updated**: 2025-01-28
 
 ## Description
 
@@ -66,4 +67,26 @@ python run_analysis.py --dicom t1_data.dcm --t2 t2_data.dcm --z 4 --roi-mode con
 - [x] Visual verification of registration quality
 - [x] ROI selection works on registered T2
 - [x] ROI mask in T1 coordinates for analysis
-- [ ] Documentation updated
+- [x] Documentation updated
+
+## Implementation Details (January 2025)
+
+### UI Enhancements
+- **"Load from DICOM Folder" button** - Scans folder, auto-detects PROXYL and T2 series, allows loading both together
+- **Progress dialog during T2 registration** - Shows "Registering T2 to T1..." with indeterminate progress bar
+- **Qt-based T2 Registration Review Dialog** - Consistent with T1 review dialog:
+  - 2x3 grid: T1 Reference, Registered T2, Overlay (T1=Red/T2=Green), Difference, Original T2, Info panel
+  - Z-slice navigation via spinbox and arrow keys
+  - Accept button in bottom-left
+  - ProxylFit styling
+
+### Session Persistence
+- Registered T2 saved as DICOM series to `output/{dataset}/registered/dicoms/T2/`
+- T2 automatically loaded when resuming a session
+- Files: `z00.dcm`, `z01.dcm`, ..., `series_info.json`
+
+### Key Files
+- `proxyl_analysis/registration.py` - `register_t2_to_t1()`, `_visualize_t2_t1_registration()` (batch mode)
+- `proxyl_analysis/ui/registration.py` - `T2RegistrationProgressDialog`, `T2RegistrationReviewDialog`, `run_t2_registration_with_progress()`
+- `proxyl_analysis/io.py` - `save_registered_t2_as_dicom()`, `load_registered_t2()`
+- `proxyl_analysis/run_analysis.py` - Integration in menu loop

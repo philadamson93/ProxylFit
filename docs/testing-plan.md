@@ -241,12 +241,27 @@ def test_registration_quality_unchanged():
 - [ ] Exit button closes application
 - [ ] App can launch without --dicom argument
 
+**T2 Registration UI tests (January 2025):**
+- [ ] "Load from DICOM Folder" button opens folder dialog
+- [ ] Scan dialog shows detected PROXYL and T2 series in dropdowns
+- [ ] Can select both T1 and T2 from scan dialog
+- [ ] T2 registration shows progress dialog during registration
+- [ ] T2 Registration Review dialog opens after registration completes
+- [ ] Review dialog shows 6-panel grid (T1, registered T2, overlay, diff, original T2, info)
+- [ ] Z-slice navigation works (spinbox and arrow keys)
+- [ ] Accept button is at bottom-left of review dialog
+- [ ] T2 Data status shows "Loaded" after registration completes
+- [ ] T2 is persisted: close app, reopen with same session → T2 auto-loads
+- [ ] Saved T2 files exist in `registered/dicoms/T2/` folder
+
 **Test scenarios:**
 1. Fresh launch (no args) → load T1 from menu → complete ROI analysis
 2. Launch with --dicom → verify menu appears after registration
 3. Load T1 → Load T2 → verify T2 becomes default ROI source
 4. Load experiment A → do partial work → load experiment B → verify state reset
 5. Load previous session from saved registration folder
+6. Fresh launch → "Load from DICOM Folder" → select both T1 and T2 → verify both load and register
+7. After T2 registration, close and reopen session → verify T2 auto-loads
 
 ### Checkpoint 2: After T002 (Averaged Images)
 
