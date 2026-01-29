@@ -26,6 +26,9 @@ proxyl_analysis/output/
 *.json
 *.log
 
+# But keep documentation screenshots
+!docs/screenshot/*.png
+
 # OS / editor files
 .DS_Store
 Thumbs.db
