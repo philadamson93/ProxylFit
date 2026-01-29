@@ -127,12 +127,15 @@ The kinetic model will fit data starting from this point.
 
 Back in the main menu, click **"Run Kinetic Fit"**.
 
-The results window shows:
-- Fitted curve overlaid on your data
-- Residuals plot
-- Parameter table with uncertainties (kb, kd, knt, etc.)
+![Kinetic Fit Results](screenshot/Kinetic_Fit.png)
 
-Results are saved to `output/{dataset_name}/kinetic_results.txt`.
+The results window shows:
+- **Main plot**: Your data (blue) with the fitted model (red)
+- **Residuals plot**: Difference between data and fit (should be randomly scattered around zero)
+- **Fitted Parameters**: kb (buildup), kd (decay), knt (non-tracer), A0 (baseline), A1 (amplitude), t0 (onset time)
+- **Fit Quality**: R² (closer to 1 is better) and RMSE
+
+Click **"Save Plot"** to export the figure. Results are also saved to `output/{dataset_name}/kinetic_results.txt`.
 
 ---
 
