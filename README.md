@@ -4,24 +4,34 @@ Analysis software for time-resolved PROXYL MRI data. Performs image registration
 
 ## Installation
 
+See the full [Installation Guide](docs/installation.md) for details.
+
 ```bash
+# Install uv (if you don't have it)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Get the code
 git clone https://github.com/philadamson93/ProxylFit.git
 cd ProxylFit
-pip install -r requirements.txt
+
+# Create environment and install dependencies
+uv venv --python 3.10
+uv pip install -r requirements.txt
 ```
 
 ## Running ProxylFit
 
 ```bash
-python -m proxyl_analysis
+cd ProxylFit
+uv run python -m proxyl_analysis
 ```
 
-This opens the main menu where you can load data, draw ROIs, run analyses, and export results.
+No need to "activate" anything - `uv run` handles the virtual environment automatically.
 
 ## Documentation
 
 - **[Tutorial](docs/tutorial.md)** - Step-by-step guide with screenshots
-- **[Installation Guide](docs/installation.md)** - Detailed setup and troubleshooting
+- **[Installation Guide](docs/installation.md)** - Detailed setup instructions
 
 ## Workflow
 
@@ -54,11 +64,3 @@ Results are saved to `output/{dataset_name}/`:
 - `kinetic_results.txt` - Fitted parameters
 - `parameter_maps/` - Spatial parameter distributions
 - `roi_timeseries.csv` - Time series data
-
-## Requirements
-
-- Python 3.8+
-- numpy, scipy, matplotlib
-- SimpleITK
-- PySide6
-- pydicom

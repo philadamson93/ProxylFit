@@ -4,7 +4,7 @@
 
 ```bash
 cd ProxylFit
-python -m proxyl_analysis
+uv run python -m proxyl_analysis
 ```
 
 This opens the main menu. From here you can load data, draw ROIs, run analyses, and export results.
