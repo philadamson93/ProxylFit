@@ -738,10 +738,10 @@ def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[flo
     series_path = Path(series_dir)
 
     # Check for new 2D slice format
-    if not (series_path / 'z00_t00.dcm').exists():
+    if not (series_path / 'z00_t000.dcm').exists():
         raise FileNotFoundError(
             f"No valid DICOM series found in {series_path}.\n"
-            "Expected format: z00_t00.dcm, z00_t01.dcm, ...\n"
+            "Expected format: z00_t000.dcm, z00_t001.dcm, ...\n"
             "Please re-run registration to generate updated DICOM output."
         )
 

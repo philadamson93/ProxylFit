@@ -339,8 +339,8 @@ def main():
         """Check if registration data exists in directory (2D DICOM slice format)."""
         p = Path(dir_path)
         dicom_dir = p / "registered" / "dicoms"
-        # Check for 2D slice format: z00_t00.dcm
-        if dicom_dir.exists() and (dicom_dir / "z00_t00.dcm").exists():
+        # Check for 2D slice format: z00_t000.dcm (3 digits for time index)
+        if dicom_dir.exists() and (dicom_dir / "z00_t000.dcm").exists():
             return p / "registered" / "registration_metrics.json"
         return None
 

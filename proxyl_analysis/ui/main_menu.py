@@ -690,12 +690,12 @@ class MainMenuDialog(QDialog):
         p = Path(folder_path)
         dicom_dir = p / "registered" / "dicoms"
 
-        # Check for 2D slice format: z00_t00.dcm
-        if not (dicom_dir.exists() and (dicom_dir / "z00_t00.dcm").exists()):
+        # Check for 2D slice format: z00_t000.dcm
+        if not (dicom_dir.exists() and (dicom_dir / "z00_t000.dcm").exists()):
             QMessageBox.warning(
                 self, "Invalid Session",
                 f"No registration data found in:\n{folder_path}\n\n"
-                "Expected: registered/dicoms/z00_t00.dcm, z00_t01.dcm, ...\n"
+                "Expected: registered/dicoms/z00_t000.dcm, z00_t001.dcm, ...\n"
                 "If you have old data, please re-run registration."
             )
             return
