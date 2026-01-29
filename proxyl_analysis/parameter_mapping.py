@@ -578,41 +578,6 @@ def save_parameter_maps(param_maps: Dict[str, np.ndarray],
     print(f"Parameter maps saved to: {maps_file}")
     print(f"Metadata saved to: {metadata_file}")
 
-    # Also save parameter maps as NIfTI volumes if nibabel is available
-    try:
-        import nibabel as nib
-        affine = np.array([
-            [spacing[0], 0, 0, 0],
-            [0, spacing[1], 0, 0],
-            [0, 0, spacing[2], 0],
-            [0, 0, 0, 1]
-        ], dtype=float)
-        
-        nifti_maps = {
-            'kb_map': param_maps.get('kb_map'),
-            'kd_map': param_maps.get('kd_map'),
-            'knt_map': param_maps.get('knt_map'),
-            'r_squared_map': param_maps.get('r_squared_map'),
-            'a1_amplitude_map': param_maps.get('a1_amplitude_map'),
-            'a2_amplitude_map': param_maps.get('a2_amplitude_map'),
-            'baseline_map': param_maps.get('baseline_map'),
-            't0_map': param_maps.get('t0_map'),
-            'tmax_map': param_maps.get('tmax_map'),
-            'fit_mask': param_maps.get('mask')
-        }
-        
-        for name, arr in nifti_maps.items():
-            if arr is None:
-                continue
-            # Ensure array is 3D (x, y, z)
-            data_3d = arr if arr.ndim == 3 else np.atleast_3d(arr)
-            img = nib.Nifti1Image(data_3d.astype(np.float32), affine)
-            out_path = output_path / f"{name}.nii.gz"
-            nib.save(img, out_path)
-            print(f"NIfTI saved: {out_path}")
-    except ImportError:
-        print("nibabel not installed; skipping NIfTI export. To enable, install 'nibabel'.")
-
 
 def load_parameter_maps(output_dir: str) -> Tuple[Dict[str, np.ndarray], Tuple[float, float, float]]:
     """

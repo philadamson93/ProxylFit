@@ -658,13 +658,9 @@ class ParameterMapResultsDialog(QDialog):
         export_dicom_btn.clicked.connect(lambda: self._export('dicom'))
         export_layout.addWidget(export_dicom_btn)
 
-        export_npz_btn = QPushButton("Save as NPZ")
-        export_npz_btn.clicked.connect(lambda: self._export('npz'))
-        export_layout.addWidget(export_npz_btn)
-
-        export_nifti_btn = QPushButton("Save as NIfTI")
-        export_nifti_btn.clicked.connect(lambda: self._export('nifti'))
-        export_layout.addWidget(export_nifti_btn)
+        export_png_btn = QPushButton("Save as PNG")
+        export_png_btn.clicked.connect(lambda: self._export('png'))
+        export_layout.addWidget(export_png_btn)
 
         export_csv_btn = QPushButton("Export Metrics (CSV)")
         export_csv_btn.clicked.connect(self._export_metrics)
@@ -883,10 +879,60 @@ class ParameterMapResultsDialog(QDialog):
 
         self.info_label.setText('\n'.join(lines))
 
+    def _show_map_selection_dialog(self, format_type: str):
+        """Show dialog to select which parameter maps to export."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QCheckBox, QDialogButtonBox, QLabel
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Select Maps to Export ({format_type.upper()})")
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("Select parameter maps to export:"))
+
+        # Map display names
+        map_names = {
+            'kb_map': 'kb (buildup rate)',
+            'kd_map': 'kd (decay rate)',
+            'knt_map': 'knt (non-tracer rate)',
+            'r_squared_map': 'R² (fit quality)',
+            'a1_amplitude_map': 'A1 (amplitude)',
+            'a2_amplitude_map': 'A2 (non-tracer amplitude)'
+        }
+
+        checkboxes = {}
+        for key, name in map_names.items():
+            if self.param_maps.get(key) is not None:
+                cb = QCheckBox(name)
+                cb.setChecked(key == self.current_map)  # Pre-select current map
+                checkboxes[key] = cb
+                layout.addWidget(cb)
+
+        if format_type == 'png':
+            layout.addWidget(QLabel(""))  # Spacer
+            self._include_roi_cb = QCheckBox("Include ROI overlay")
+            self._include_roi_cb.setChecked(self.show_roi_cb.isChecked())
+            layout.addWidget(self._include_roi_cb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() == QDialog.Accepted:
+            selected = [key for key, cb in checkboxes.items() if cb.isChecked()]
+            include_roi = self._include_roi_cb.isChecked() if format_type == 'png' else False
+            return selected, include_roi
+        return None, False
+
     def _export(self, format_type: str):
         """Export parameter maps."""
         from ..io import get_dataset_path
         output_path = get_dataset_path(self.output_dir, 'parameter_maps')
+
+        # Show map selection dialog
+        selected_maps, include_roi = self._show_map_selection_dialog(format_type)
+        if not selected_maps:
+            return
 
         if format_type == 'dicom':
             from ..io import save_parameter_map_as_dicom
@@ -900,7 +946,7 @@ class ParameterMapResultsDialog(QDialog):
                 metadata = self.param_maps.get('metadata', {})
                 total_files = 0
 
-                for key in ['kb_map', 'kd_map', 'knt_map', 'r_squared_map']:
+                for key in selected_maps:
                     data = self.param_maps.get(key)
                     if data is not None:
                         saved = save_parameter_map_as_dicom(
@@ -914,39 +960,48 @@ class ParameterMapResultsDialog(QDialog):
                     f"Saved {total_files} DICOM files to:\n{folder}"
                 )
 
-        elif format_type == 'npz':
-            filepath, _ = QFileDialog.getSaveFileName(
-                self, "Export Parameter Maps",
-                str(output_path / "parameter_maps.npz"),
-                "NumPy Files (*.npz)"
+        elif format_type == 'png':
+            folder = QFileDialog.getExistingDirectory(
+                self, "Select Export Folder",
+                str(output_path)
             )
-            if filepath:
-                np.savez_compressed(filepath, **self.param_maps)
-                QMessageBox.information(self, "Exported", f"Saved to:\n{filepath}")
+            if folder:
+                folder = Path(folder)
+                saved_files = []
 
-        elif format_type == 'nifti':
-            try:
-                import nibabel as nib
+                # Save current display settings
+                original_map = self.current_map
+                original_roi = self.show_roi_cb.isChecked()
 
-                folder = QFileDialog.getExistingDirectory(
-                    self, "Select Export Folder",
-                    str(output_path)
+                # Set ROI display
+                self.show_roi_cb.setChecked(include_roi)
+
+                for key in selected_maps:
+                    # Update display to this map
+                    self.current_map = key
+                    self._update_display()
+
+                    # Generate filename
+                    map_name = key.replace('_map', '')
+                    filename = f"{map_name}_z{self.current_z:02d}"
+                    if include_roi:
+                        filename += "_with_roi"
+                    filename += ".png"
+
+                    filepath = folder / filename
+                    self.figure.savefig(str(filepath), dpi=150, bbox_inches='tight',
+                                       facecolor='white', edgecolor='none')
+                    saved_files.append(str(filepath))
+
+                # Restore original settings
+                self.current_map = original_map
+                self.show_roi_cb.setChecked(original_roi)
+                self._update_display()
+
+                QMessageBox.information(
+                    self, "Exported",
+                    f"Saved {len(saved_files)} PNG files to:\n{folder}"
                 )
-                if folder:
-                    folder = Path(folder)
-                    affine = np.diag([self.spacing[0], self.spacing[1], self.spacing[2], 1.0])
-
-                    for key in ['kb_map', 'kd_map', 'knt_map', 'r_squared_map']:
-                        data = self.param_maps.get(key)
-                        if data is not None:
-                            img = nib.Nifti1Image(data.astype(np.float32), affine)
-                            nib.save(img, folder / f"{key}.nii.gz")
-
-                    QMessageBox.information(self, "Exported", f"NIfTI files saved to:\n{folder}")
-
-            except ImportError:
-                QMessageBox.warning(self, "Missing Package",
-                                   "NIfTI export requires nibabel. Install with: pip install nibabel")
 
     def _export_metrics(self):
         """Export metrics to CSV."""

@@ -690,7 +690,7 @@ class ImageToolsDialog(QDialog):
         filename, selected_filter = QFileDialog.getSaveFileName(
             self, "Save Derived Image",
             str(output_path / base_filename),
-            "DICOM Files (*.dcm);;NumPy Files (*.npz);;NIfTI Files (*.nii.gz)"
+            "DICOM Files (*.dcm);;PNG Image (*.png)"
         )
 
         if not filename:
@@ -717,25 +717,39 @@ class ImageToolsDialog(QDialog):
                 msg = f"Saved {len(saved_files)} DICOM slices to:\n{Path(saved_files[0]).parent}"
             QMessageBox.information(self, "Saved", msg)
             return
-        elif filepath.suffix == '.gz' or str(filepath).endswith('.nii.gz'):
-            # NIfTI export
-            try:
-                import nibabel as nib
-                affine = np.diag([self.spacing[0], self.spacing[1], self.spacing[2], 1.0])
-                nifti_img = nib.Nifti1Image(self.preview_image, affine)
-                nib.save(nifti_img, str(filepath))
-            except ImportError:
-                QMessageBox.warning(self, "Missing Package",
-                                   "NIfTI export requires nibabel. Install with: pip install nibabel")
-                return
-        else:
-            # Default: NPZ format
-            np.savez(filepath, image=self.preview_image, **operation_params)
+        elif filepath.suffix == '.png':
+            # PNG export - current z-slice with optional ROI
+            # Ask about ROI overlay
+            include_roi = False
+            if self.roi_mask is not None:
+                from PySide6.QtWidgets import QMessageBox as QMB
+                reply = QMB.question(
+                    self, "Include ROI?",
+                    "Include ROI contour overlay in the PNG?",
+                    QMB.Yes | QMB.No,
+                    QMB.Yes if self.show_roi_overlay else QMB.No
+                )
+                include_roi = (reply == QMB.Yes)
 
-        QMessageBox.information(
-            self, "Saved",
-            f"Image saved to:\n{filepath}"
-        )
+            # Save current ROI state and set for export
+            original_roi = self.show_roi_overlay
+            self.show_roi_overlay = include_roi
+            self.roi_checkbox.setChecked(include_roi)
+            self._update_preview_display()
+
+            # Save the figure
+            self.preview_fig.savefig(str(filepath), dpi=150, bbox_inches='tight',
+                                     facecolor='white', edgecolor='none')
+
+            # Restore ROI state
+            self.show_roi_overlay = original_roi
+            self.roi_checkbox.setChecked(original_roi)
+            self._update_preview_display()
+
+            QMessageBox.information(self, "Saved", f"PNG saved to:\n{filepath}")
+            return
+
+        QMessageBox.warning(self, "Unknown Format", f"Unknown file format: {filepath.suffix}")
 
     def _on_roi_toggle(self, checked: bool):
         """Handle ROI overlay checkbox toggle."""

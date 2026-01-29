@@ -334,7 +334,7 @@ def create_dataset_directory(output_base: str, dataset_name: str) -> Path:
 
     # Create main directory and subdirectories
     subdirs = ['registered', 'registered/dicoms', 'roi_analysis',
-               'parameter_maps', 'parameter_maps/nifti', 'derived_images']
+               'parameter_maps', 'derived_images']
 
     for subdir in subdirs:
         (dataset_dir / subdir).mkdir(parents=True, exist_ok=True)
