@@ -36,6 +36,33 @@ Your registered data and T2 (if any) will be restored automatically.
 
 ---
 
+## Main Menu
+
+After loading and registering your data, you'll see the main menu:
+
+![Main Menu](screenshot/Main_Menu.png)
+
+The menu is organized into sections:
+
+**Experiment** - Load new data or resume a previous session. Shows the current dataset and output folder.
+
+**Data Status** - Shows T1 dimensions, registration status, and T2 status. Use "Load T2 Volume" to add a T2 image for better ROI visualization.
+
+**ROI Analysis** - Draw regions of interest and run kinetic fitting:
+- **ROI Source**: Choose T1 or T2 as the background image for drawing
+- **ROI Method**: Rectangle (quick), Manual Contour (recommended), or Segment (AI-assisted)
+- **Z-slice**: Which slice to draw on
+- **Draw ROI**: Opens the drawing dialog
+- **Run Kinetic Fit**: Fits the kinetic model to your ROI (enabled after drawing ROI and selecting injection time)
+
+**Parameter Maps** - Generate spatial maps of kinetic parameters (kb, kd, etc.) across the image.
+
+**Image Tools** - Create averaged or difference images from time ranges. Requires ROI and injection time to be set first.
+
+**Export** - Save registered data, registration metrics, or time series as CSV.
+
+---
+
 ## Registration
 
 After loading, registration runs automatically. The progress dialog shows real-time metrics:
