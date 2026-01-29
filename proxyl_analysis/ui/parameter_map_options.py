@@ -170,15 +170,31 @@ class ParameterMappingProgressDialog(QDialog):
 
     def _on_cancel(self):
         """Handle cancel button."""
-        if hasattr(self, 'worker'):
-            self.worker.cancel()
+        self._cleanup_worker()
         self.reject()
+
+    def _cleanup_worker(self):
+        """Stop and wait for worker thread to finish."""
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.worker.cancel()
+            self.status_label.setText("Cancelling... please wait")
+            self.cancel_btn.setEnabled(False)
+            # Disconnect signals to prevent callbacks after dialog closes
+            try:
+                self.worker.progress.disconnect()
+                self.worker.finished.disconnect()
+                self.worker.error.disconnect()
+            except RuntimeError:
+                pass  # Already disconnected
+            # Wait for thread to finish (with timeout to prevent infinite hang)
+            if not self.worker.wait(10000):  # 10 second timeout
+                # Force terminate if still running (last resort)
+                self.worker.terminate()
+                self.worker.wait(1000)
 
     def closeEvent(self, event):
         """Handle dialog close."""
-        if hasattr(self, 'worker') and self.worker.isRunning():
-            self.worker.cancel()
-            self.worker.wait(1000)
+        self._cleanup_worker()
         super().closeEvent(event)
 
 
