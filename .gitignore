@@ -3,11 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Test and debug scripts
-tests/
-test/
-test_*.py
-*_test.py
+# Debug scripts (keep tests/ folder)
 debug_*.py
 
 # Outputs and generated data
