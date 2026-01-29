@@ -581,15 +581,96 @@ def main():
                     t2_path = menu_result.get('t2_path')
 
                     if t1_path:
-                        print(f"\nSelected T1 (PROXYL): {t1_path}")
+                        # Load new T1 exam (and optionally T2)
+                        print(f"\n{'='*60}")
+                        print("LOADING NEW EXPERIMENT")
+                        print(f"{'='*60}")
+                        print(f"Selected T1 (PROXYL): {t1_path}")
                         if t2_path:
                             print(f"Selected T2: {t2_path}")
-                            print("\nPlease restart the application with:")
-                            print(f"  python -m proxyl_analysis --dicom \"{t1_path}\" --t2 \"{t2_path}\"")
-                        else:
-                            print("\nPlease restart the application with:")
-                            print(f"  python -m proxyl_analysis --dicom \"{t1_path}\"")
-                        sys.exit(0)
+
+                        # Step 1: Load new DICOM
+                        print("\nStep 1: Loading DICOM data...")
+                        try:
+                            new_image_4d, new_spacing = load_dicom_series(t1_path)
+                            print(f"  Loaded 4D image with shape: {new_image_4d.shape} [x, y, z, t]")
+                            print(f"  Voxel spacing: {new_spacing}")
+                        except Exception as e:
+                            print(f"  Error loading DICOM: {e}")
+                            continue
+
+                        # Step 2: Register
+                        print("\nStep 2: Performing rigid registration...")
+                        new_dicom_name = Path(t1_path).stem
+                        from proxyl_analysis.io import create_dataset_directory, save_dataset_manifest
+                        new_auto_registration_dir = create_dataset_directory(str(output_dir), new_dicom_name)
+
+                        # Initialize manifest
+                        manifest = {
+                            "dataset_name": new_dicom_name,
+                            "created_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                            "source": {
+                                "dicom_path": str(t1_path),
+                                "dicom_filename": Path(t1_path).name,
+                                "shape": list(new_image_4d.shape),
+                                "spacing": list(new_spacing)
+                            },
+                            "analysis": {
+                                "registration": {"completed": False},
+                                "roi_analysis": {"completed": False},
+                                "parameter_maps": {"completed": False},
+                                "derived_images": {"averaged_images": [], "difference_images": []}
+                            }
+                        }
+                        save_dataset_manifest(str(new_auto_registration_dir), manifest)
+
+                        # Run registration with progress dialog
+                        new_registered_4d, new_reg_metrics = run_registration_with_progress(
+                            new_image_4d, new_spacing,
+                            output_dir=str(new_auto_registration_dir),
+                            dicom_path=t1_path
+                        )
+                        if new_registered_4d is None:
+                            print("Registration cancelled.")
+                            continue
+
+                        # Show registration review
+                        show_registration_review_qt(new_image_4d, new_registered_4d, new_reg_metrics,
+                                                   output_dir=str(new_auto_registration_dir))
+
+                        # Update state variables
+                        args.dicom = t1_path
+                        registered_4d = new_registered_4d
+                        spacing = new_spacing
+                        auto_registration_dir = new_auto_registration_dir
+                        time_array = create_time_array(registered_4d.shape[3], args.time_units)
+
+                        # Reset ROI state
+                        roi_state = None
+                        registered_t2 = None
+
+                        # Step 3: Load T2 if selected
+                        if t2_path:
+                            print("\nStep 3: Loading and registering T2...")
+                            try:
+                                t2_volume, t2_spacing = load_t2_volume(t2_path)
+                                print(f"  T2 volume shape: {t2_volume.shape}")
+                                t1_reference = registered_4d[:, :, :, 0]
+                                registered_t2, reg_info = run_t2_registration_with_progress(
+                                    t2_volume, t2_spacing, t1_reference, spacing
+                                )
+                                if registered_t2 is not None:
+                                    print(f"  T2-T1 registration complete")
+                                    save_registered_t2_as_dicom(registered_t2, spacing, str(auto_registration_dir))
+                            except Exception as e:
+                                print(f"  Error loading T2: {e}")
+                                registered_t2 = None
+
+                        print(f"\n{'='*60}")
+                        print("New experiment loaded successfully!")
+                        print(f"{'='*60}\n")
+                        continue  # Return to menu with new data
+
                     elif t2_path:
                         # Only T2 selected, load it into current session
                         print(f"Loading T2 from scan: {t2_path}")
