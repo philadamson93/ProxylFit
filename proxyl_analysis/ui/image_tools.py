@@ -183,7 +183,7 @@ class ImageToolsDialog(QDialog):
         self.canvas.mpl_connect('button_press_event', self._on_plot_click)
 
         # Region A controls
-        self.region_a_group = QGroupBox("Region A (Blue)")
+        self.region_a_group = QGroupBox("Region A")
         region_a_layout = QHBoxLayout(self.region_a_group)
 
         region_a_layout.addWidget(QLabel("Start:"))
@@ -218,7 +218,7 @@ class ImageToolsDialog(QDialog):
         left_layout.addWidget(self.region_a_group)
 
         # Region B controls (only visible in difference mode)
-        self.region_b_group = QGroupBox("Region B (Red)")
+        self.region_b_group = QGroupBox("Region B")
         region_b_layout = QHBoxLayout(self.region_b_group)
 
         region_b_layout.addWidget(QLabel("Start:"))
@@ -379,9 +379,9 @@ class ImageToolsDialog(QDialog):
                 "Or edit the values directly in the spinboxes."
             )
         else:
-            self.region_a_group.setTitle("Region A (Blue) - subtracted from B")
+            self.region_a_group.setTitle("Region A")
             self.instructions_label.setText(
-                "Select two regions. Result = mean(Region B) - mean(Region A). "
+                "Result = mean(Region B) − mean(Region A). "
                 "Click 'Select on Plot' for each region, then click twice on the curve."
             )
 
@@ -620,11 +620,8 @@ class ImageToolsDialog(QDialog):
             im = self.preview_ax.imshow(slice_data, cmap='gray', aspect='equal', origin='lower')
             self.preview_ax.set_title(f'Averaged Image (z={self.current_z})')
         else:
-            # Diverging colormap centered at 0
-            vmax = np.max(np.abs(slice_data))
-            vmin = -vmax
-            im = self.preview_ax.imshow(slice_data, cmap='RdBu_r', aspect='equal',
-                                        vmin=vmin, vmax=vmax, origin='lower')
+            im = self.preview_ax.imshow(slice_data, cmap='gray', aspect='equal',
+                                        origin='lower')
             self.preview_ax.set_title(f'Difference B-A (z={self.current_z})')
 
         # Add ROI contour overlay (T013)
@@ -672,7 +669,7 @@ class ImageToolsDialog(QDialog):
             a_end = max(self.region_a_start, self.region_a_end)
             b_start = min(self.region_b_start, self.region_b_end)
             b_end = max(self.region_b_start, self.region_b_end)
-            base_filename = f"diff_t{a_start}-t{a_end}_minus_t{b_start}-t{b_end}"
+            base_filename = f"diff_t{b_start}-t{b_end}_minus_t{a_start}-t{a_end}"
             operation_params = {
                 'region_a_start': a_start,
                 'region_a_end': a_end,
@@ -886,7 +883,7 @@ class ImageToolsDialog(QDialog):
             a_end = max(self.region_a_start, self.region_a_end)
             b_start = min(self.region_b_start, self.region_b_end)
             b_end = max(self.region_b_start, self.region_b_end)
-            base_filename = f"diff_t{a_start}-t{a_end}_minus_t{b_start}-t{b_end}_metrics.csv"
+            base_filename = f"diff_t{b_start}-t{b_end}_minus_t{a_start}-t{a_end}_metrics.csv"
 
         filepath, _ = QFileDialog.getSaveFileName(
             self, "Export Metrics",

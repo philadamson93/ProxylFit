@@ -1305,7 +1305,20 @@ def save_parameter_map_as_dicom(
 
         # Store metadata in ImageComments
         if metadata:
-            ds.ImageComments = json.dumps(metadata)
+            def _convert_numpy(obj):
+                """Convert numpy types to native Python for JSON serialization."""
+                if isinstance(obj, dict):
+                    return {k: _convert_numpy(v) for k, v in obj.items()}
+                elif isinstance(obj, (list, tuple)):
+                    return [_convert_numpy(v) for v in obj]
+                elif isinstance(obj, (np.integer,)):
+                    return int(obj)
+                elif isinstance(obj, (np.floating,)):
+                    return float(obj)
+                elif isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return obj
+            ds.ImageComments = json.dumps(_convert_numpy(metadata))
         ds.DerivationDescription = f"Parameter map: {map_name}"
 
         # Pixel data - handle NaN and negative values

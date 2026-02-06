@@ -54,3 +54,43 @@ Every time you want to run ProxylFit:
 cd ProxylFit
 uv run python -m proxyl_analysis
 ```
+
+---
+
+## Troubleshooting
+
+### Qt platform plugin error (macOS)
+
+If you see an error like:
+```
+qt.qpa.plugin: Could not find the Qt platform plugin "cocoa"
+```
+
+**Cause:** Conda is interfering with the uv environment.
+
+**Fix:** Deactivate conda before running:
+
+```bash
+conda deactivate
+cd ProxylFit
+uv run python -m proxyl_analysis
+```
+
+Or check if conda is active:
+```bash
+echo $CONDA_PREFIX
+```
+
+If it shows a path, conda is active and needs to be deactivated.
+
+### Alternative: Run in fully isolated mode
+
+If conda continues to interfere, create a fresh environment:
+
+```bash
+cd ProxylFit
+rm -rf .venv
+uv venv --python 3.10
+uv pip install -r requirements.txt
+uv run python -m proxyl_analysis
+```

@@ -2,6 +2,8 @@
 Fit results dialog for ProxylFit.
 """
 
+import csv
+from pathlib import Path
 from typing import Optional, Dict
 
 import numpy as np
@@ -71,7 +73,9 @@ class FitResultsDialog(QDialog):
             ("knt (non-tracer)", f"{self.fit_results['knt']:.4f} ± {self.fit_results['knt_error']:.4f}"),
             ("A0 (baseline)", f"{self.fit_results['A0']:.3f} ± {self.fit_results['A0_error']:.3f}"),
             ("A1 (amplitude)", f"{self.fit_results['A1']:.3f} ± {self.fit_results['A1_error']:.3f}"),
+            ("A2 (non-tracer)", f"{self.fit_results['A2']:.3f} ± {self.fit_results['A2_error']:.3f}"),
             ("t0 (onset)", f"{self.fit_results['t0']:.2f} ± {self.fit_results['t0_error']:.2f}"),
+            ("tmax (NTE onset)", f"{self.fit_results['tmax']:.2f} ± {self.fit_results['tmax_error']:.2f}"),
         ]
 
         for i, (name, value) in enumerate(params):
@@ -79,6 +83,28 @@ class FitResultsDialog(QDialog):
             params_grid.addWidget(QLabel(value), i, 1)
 
         params_layout.addWidget(params_group)
+
+        # Derived parameters
+        derived_group = QGroupBox("Derived Parameters")
+        derived_grid = QGridLayout(derived_group)
+
+        A0 = self.fit_results['A0']
+        A1 = self.fit_results['A1']
+        A2 = self.fit_results['A2']
+
+        if A0 != 0:
+            self.pct_enhancement = (A1 / A0) * 100
+            self.pct_nte = (A2 / A0) * 100
+        else:
+            self.pct_enhancement = float('nan')
+            self.pct_nte = float('nan')
+
+        derived_grid.addWidget(QLabel("%Enhancement (A1/A0):"), 0, 0)
+        derived_grid.addWidget(QLabel(f"{self.pct_enhancement:.1f}%"), 0, 1)
+        derived_grid.addWidget(QLabel("%NTE (A2/A0):"), 1, 0)
+        derived_grid.addWidget(QLabel(f"{self.pct_nte:.1f}%"), 1, 1)
+
+        params_layout.addWidget(derived_group)
 
         # Fit quality
         quality_group = QGroupBox("Fit Quality")
@@ -95,6 +121,7 @@ class FitResultsDialog(QDialog):
         # Button bar
         button_bar = ButtonBar()
         button_bar.add_button("save", "Save Plot", self._save_plot, "export")
+        button_bar.add_button("save_table", "Save Results Table", self._save_results_table, "export")
         button_bar.add_stretch()
         button_bar.add_button("close", "Close", self.accept, "default")
         layout.addWidget(button_bar)
@@ -127,6 +154,43 @@ class FitResultsDialog(QDialog):
 
         self.canvas.fig.tight_layout()
         self.canvas.draw()
+
+    def _save_results_table(self):
+        """Save fit results as a CSV table."""
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Results Table", "kinetic_fit_results.csv",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+
+        if not save_path:
+            return
+
+        r = self.fit_results
+        time_units = r.get('time_units', 'minutes')
+
+        rows = [
+            ('A0', 'baseline signal', r['A0'], r['A0_error'], ''),
+            ('A1', 'tracer amplitude', r['A1'], r['A1_error'], ''),
+            ('A2', 'non-tracer amplitude', r['A2'], r['A2_error'], ''),
+            ('kb', 'buildup rate', r['kb'], r['kb_error'], f'1/{time_units}'),
+            ('kd', 'decay rate', r['kd'], r['kd_error'], f'1/{time_units}'),
+            ('knt', 'non-tracer rate', r['knt'], r['knt_error'], f'1/{time_units}'),
+            ('t0', 'tracer onset', r['t0'], r['t0_error'], time_units),
+            ('tmax', 'NTE onset', r['tmax'], r['tmax_error'], time_units),
+            ('%Enhancement', 'A1/A0 * 100', self.pct_enhancement, '', '%'),
+            ('%NTE', 'A2/A0 * 100', self.pct_nte, '', '%'),
+            ('R_squared', 'goodness of fit', r['r_squared'], '', ''),
+            ('RMSE', 'root mean square error', r['rmse'], '', ''),
+        ]
+
+        with open(save_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['parameter', 'description', 'value', 'error', 'units'])
+            for row in rows:
+                writer.writerow(row)
+
+        QMessageBox.information(self, "Save Complete",
+                              f"Results table saved to:\n{save_path}")
 
     def _save_plot(self):
         """Save the plot to file."""

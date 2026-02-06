@@ -137,4 +137,5 @@ def init_qt_app() -> QApplication:
     app.setApplicationName("ProxylFit")
     app.setStyle("Fusion")
     app.setStyleSheet(PROXYLFIT_STYLE)
+    app.setQuitOnLastWindowClosed(False)
     return app

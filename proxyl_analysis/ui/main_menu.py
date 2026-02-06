@@ -691,21 +691,45 @@ class MainMenuDialog(QDialog):
         dicom_dir = p / "registered" / "dicoms"
 
         # Check for 2D slice format: z00_t000.dcm
-        if not (dicom_dir.exists() and (dicom_dir / "z00_t000.dcm").exists()):
-            QMessageBox.warning(
-                self, "Invalid Session",
-                f"No registration data found in:\n{folder_path}\n\n"
-                "Expected: registered/dicoms/z00_t000.dcm, z00_t001.dcm, ...\n"
-                "If you have old data, please re-run registration."
-            )
+        if dicom_dir.exists() and (dicom_dir / "z00_t000.dcm").exists():
+            # Valid session found
+            self.result = {
+                'action': 'load_previous',
+                'session_path': folder_path
+            }
+            self.accept()
             return
 
-        # Store result for caller to handle
-        self.result = {
-            'action': 'load_previous',
-            'session_path': folder_path
-        }
-        self.accept()
+        # Not found — try to give helpful diagnostics
+        hints = []
+
+        # Check if user selected the parent of a valid session
+        for child in p.iterdir():
+            if child.is_dir():
+                candidate = child / "registered" / "dicoms" / "z00_t000.dcm"
+                if candidate.exists():
+                    hints.append(f"  • {child.name}/")
+
+        # Check if the selected folder itself contains "registered" but wrong structure
+        if (p / "registered").exists() and not dicom_dir.exists():
+            hints.append("  • Found 'registered/' folder but no 'dicoms/' subfolder inside it.")
+        elif dicom_dir.exists():
+            dcm_files = list(dicom_dir.glob("*.dcm"))
+            if dcm_files:
+                hints.append(f"  • Found {len(dcm_files)} DICOM files in registered/dicoms/ "
+                           "but missing z00_t000.dcm (may be incompatible format).")
+
+        msg = f"No valid session found in:\n{folder_path}\n\n"
+        msg += "A valid session folder should contain:\n"
+        msg += "  registered/dicoms/z00_t000.dcm\n\n"
+
+        if hints:
+            msg += "Possible issues:\n" + "\n".join(hints) + "\n\n"
+
+        msg += "Tip: Select the output folder that was created when you\n"
+        msg += "originally ran registration (e.g., 'output_MyExperiment/')."
+
+        QMessageBox.warning(self, "Invalid Session", msg)
 
     def _load_t2_volume(self):
         """Open file dialog and load T2 volume."""

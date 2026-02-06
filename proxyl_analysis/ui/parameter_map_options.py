@@ -910,7 +910,7 @@ class ParameterMapResultsDialog(QDialog):
         if format_type == 'png':
             layout.addWidget(QLabel(""))  # Spacer
             self._include_roi_cb = QCheckBox("Include ROI overlay")
-            self._include_roi_cb.setChecked(self.show_roi_cb.isChecked())
+            self._include_roi_cb.setChecked(self.roi_checkbox.isChecked())
             layout.addWidget(self._include_roi_cb)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -971,10 +971,10 @@ class ParameterMapResultsDialog(QDialog):
 
                 # Save current display settings
                 original_map = self.current_map
-                original_roi = self.show_roi_cb.isChecked()
+                original_roi = self.roi_checkbox.isChecked()
 
                 # Set ROI display
-                self.show_roi_cb.setChecked(include_roi)
+                self.roi_checkbox.setChecked(include_roi)
 
                 for key in selected_maps:
                     # Update display to this map
@@ -995,7 +995,7 @@ class ParameterMapResultsDialog(QDialog):
 
                 # Restore original settings
                 self.current_map = original_map
-                self.show_roi_cb.setChecked(original_roi)
+                self.roi_checkbox.setChecked(original_roi)
                 self._update_display()
 
                 QMessageBox.information(
