@@ -1,6 +1,6 @@
 # T008: UI Bug Fixes for Image Viewers
 
-**Status**: complete
+**Status**: completed
 **Priority**: high
 **Created**: 2025-01-22
 

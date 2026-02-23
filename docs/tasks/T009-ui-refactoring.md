@@ -1,6 +1,6 @@
 # T009: Refactor ui.py into Modular Package
 
-**Status**: complete
+**Status**: completed
 **Priority**: low
 **Created**: 2025-01-22
 

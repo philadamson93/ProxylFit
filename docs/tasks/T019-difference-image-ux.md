@@ -2,7 +2,7 @@ Reference: docs/claude_ops.md
 
 # T019: Difference Image UX Improvements
 
-**Status**: planned
+**Status**: completed
 **Priority**: medium
 **Created**: 2026-02-06
 **Source**: User feedback items #3, #4, #4.1

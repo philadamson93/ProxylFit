@@ -1,6 +1,6 @@
 # T002: Interactive Averaged Image Generation
 
-**Status**: complete
+**Status**: completed
 **Priority**: medium
 **Created**: 2025-01-08
 **Updated**: 2025-01-21

@@ -1,6 +1,6 @@
 # T013: ROI Contour Metrics for Difference/Averaged Images
 
-**Status**: planned
+**Status**: completed
 **Priority**: medium
 **Created**: 2025-01-22
 

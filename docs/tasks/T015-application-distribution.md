@@ -1,6 +1,6 @@
 # T015: Application Distribution for Non-Technical Users
 
-**Status**: planning
+**Status**: planned
 **Priority**: high
 **Created**: 2025-01-22
 

@@ -2,7 +2,7 @@ Reference: docs/claude_ops.md
 
 # T021: Improve Session Loading UX
 
-**Status**: planned
+**Status**: completed
 **Priority**: low
 **Created**: 2026-02-06
 **Source**: User feedback item #2

@@ -1,6 +1,6 @@
 # T012: Export Averaged/Difference Images as DICOM
 
-**Status**: planned
+**Status**: completed
 **Priority**: medium
 **Created**: 2025-01-22
 

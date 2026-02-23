@@ -2,7 +2,7 @@ Reference: docs/claude_ops.md
 
 # T020: Fit Results Table Export with Derived Parameters
 
-**Status**: planned
+**Status**: completed
 **Priority**: medium
 **Created**: 2026-02-06
 **Source**: User feedback items #5, #5.1

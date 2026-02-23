@@ -2,7 +2,7 @@ Reference: docs/claude_ops.md
 
 # T017: Fix Parameter Map Close Exits Python
 
-**Status**: planned
+**Status**: completed
 **Priority**: critical
 **Created**: 2026-02-06
 **Source**: User feedback item #9

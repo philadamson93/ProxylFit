@@ -1,6 +1,6 @@
 # T003: Interactive Difference Images
 
-**Status**: complete
+**Status**: completed
 **Priority**: medium
 **Created**: 2025-01-08
 **Updated**: 2025-01-21

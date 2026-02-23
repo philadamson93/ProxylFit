@@ -1,6 +1,6 @@
 # T010: Export Registered Data as DICOM Series
 
-## Status: Planned
+## Status: Completed
 
 ## Overview
 

@@ -2,7 +2,7 @@ Reference: docs/claude_ops.md
 
 # T016: Fix Parameter Map Export Crashes
 
-**Status**: planned
+**Status**: completed
 **Priority**: critical
 **Created**: 2026-02-06
 **Source**: User feedback items #10.1, #10.2

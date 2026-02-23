@@ -1,6 +1,6 @@
 # T001: T2 to T1 Registration
 
-**Status**: complete
+**Status**: completed
 **Priority**: high
 **Created**: 2025-01-08
 **Updated**: 2025-01-28

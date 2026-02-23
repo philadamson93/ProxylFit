@@ -1,6 +1,6 @@
 # T014: Parameter Map ROI and Single-Slice Options
 
-**Status**: planned
+**Status**: completed
 **Priority**: medium
 **Created**: 2025-01-22
 
