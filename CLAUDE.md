@@ -42,3 +42,14 @@ Analysis software for time-resolved PROXYL MRI data. Performs image registration
 ```bash
 uv run python -m proxyl_analysis
 ```
+
+## Testing & Verification
+
+This is a **live development machine** — run code, launch the GUI, and verify visually. See `docs/claude_ops.md` Verification section for full details.
+
+```bash
+uv run pytest tests/ -v              # Unit tests
+screencapture -x /tmp/screenshot.png  # OS-level screenshot
+```
+
+**Available tools**: `pytest-qt`/`qtbot` (headless GUI tests), `QTest` (widget interaction), `QWidget.grab()` (widget screenshots), Peekaboo MCP (`see`/`click`/`type` for live app automation).

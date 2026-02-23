@@ -378,10 +378,7 @@ def pytest_configure(config):
 
 ## Known Testing Limitations
 
-1. **UI Tests**: Qt dialogs are difficult to automate. Manual testing required for:
-   - Visual appearance
-   - Mouse interactions (click-drag)
-   - Keyboard shortcuts
+1. **UI Tests**: Qt dialogs can be automated using `pytest-qt` (headless via `qtbot`) and Peekaboo MCP (live app interaction). See `docs/claude_ops.md` Verification section for the full toolchain. Some visual nuances (e.g., pixel-perfect rendering, drag feel) may still benefit from manual review.
 
 2. **Real DICOM Data**: Tests may need real data for full validation. Consider:
    - Synthetic data for unit tests
