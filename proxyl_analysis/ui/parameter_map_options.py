@@ -868,7 +868,7 @@ class ParameterMapResultsDialog(QDialog):
         lines = []
         if 'kernel_type' in metadata:
             lines.append(f"Kernel: {metadata['kernel_type']}")
-        if 'window_x' in metadata:
+        if all(k in metadata for k in ('window_x', 'window_y', 'window_z')):
             lines.append(f"Window: {metadata['window_x']}x{metadata['window_y']}x{metadata['window_z']}")
         if 'success_rate' in metadata:
             lines.append(f"Success rate: {metadata['success_rate']:.1f}%")

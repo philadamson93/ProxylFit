@@ -113,10 +113,15 @@ def scan_dicom_folder(folder_path: str, recursive: bool = True) -> List[Dict]:
 
         # Detect PROXYL and T2 series
         desc_lower = info['series_description'].lower()
-        info['is_proxyl'] = 'proxyl' in desc_lower or (
-            'flash' in desc_lower and info['num_frames'] > 100
+        info['is_proxyl'] = (
+            'proxyl' in desc_lower
+            or ('flash' in desc_lower and info['num_frames'] > 100)
+            or 'registered t1' in desc_lower
         )
-        info['is_t2'] = 't2' in desc_lower and 'turbo' in desc_lower
+        info['is_t2'] = (
+            ('t2' in desc_lower and 'turbo' in desc_lower)
+            or 'registered t2' in desc_lower
+        )
 
         # Remove files list for cleaner output (keep sample_file)
         info['num_files'] = len(info['files'])

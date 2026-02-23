@@ -70,6 +70,20 @@ def create_time_array(num_timepoints: int, time_units: str = 'minutes') -> np.nd
     return time_array
 
 
+def _detect_registered_session(dicom_path):
+    """Check if a DICOM file path is inside a registered output directory.
+
+    Returns the session root directory path if detected, None otherwise.
+    """
+    p = Path(dicom_path)
+    for parent in p.parents:
+        if parent.name == 'dicoms' and parent.parent.name == 'registered':
+            session_root = parent.parent.parent
+            if (session_root / "registered" / "dicoms" / "z00_t000.dcm").exists():
+                return str(session_root)
+    return None
+
+
 def main():
     """Main analysis pipeline."""
 
@@ -291,7 +305,22 @@ def main():
         elif result.get('action') == 'load_from_scan':
             # User selected T1 (and optionally T2) from DICOM scan
             if result.get('t1_path'):
-                args.dicom = result['t1_path']
+                # Check if this is already-registered data
+                session_path = _detect_registered_session(result['t1_path'])
+                if session_path:
+                    # Treat as loading a previous session
+                    args.load_registration = session_path
+                    # Try to find original DICOM path from metadata
+                    metrics_file = Path(session_path) / "registered" / "registration_metrics.json"
+                    if metrics_file.exists():
+                        with open(metrics_file, 'r') as f:
+                            metadata = json.load(f).get('metadata', {})
+                            args.dicom = metadata.get('dicom_path', result['t1_path'])
+                    else:
+                        args.dicom = result['t1_path']
+                    print(f"Detected registered output — loading session from: {session_path}")
+                else:
+                    args.dicom = result['t1_path']
                 # Store T2 path for later loading after registration
                 if result.get('t2_path'):
                     args.t2 = result['t2_path']
@@ -331,6 +360,12 @@ def main():
     else:
         # New dataset - use new structure
         auto_registration_dir = dataset_dir
+
+    # Override when loading registered data from scan
+    if args.load_registration:
+        reg_path = Path(args.load_registration)
+        if (reg_path / "registered" / "dicoms" / "z00_t000.dcm").exists():
+            auto_registration_dir = reg_path
 
     # Check if we should automatically load registration data
     auto_load = False
@@ -581,6 +616,46 @@ def main():
                     t2_path = menu_result.get('t2_path')
 
                     if t1_path:
+                        # Check if this is already-registered data
+                        session_path = _detect_registered_session(t1_path)
+                        if session_path:
+                            print(f"\n{'='*60}")
+                            print("LOADING REGISTERED SESSION")
+                            print(f"{'='*60}")
+                            print(f"Detected registered output: {session_path}")
+                            try:
+                                registered_4d, spacing, reg_metrics = load_registration_data(session_path)
+                                print(f"  Loaded registered 4D: {registered_4d.shape}")
+                                print(f"  Voxel spacing: {spacing}")
+
+                                # Try to get original DICOM path from metadata
+                                metrics_file = Path(session_path) / "registered" / "registration_metrics.json"
+                                if metrics_file.exists():
+                                    with open(metrics_file, 'r') as f:
+                                        metadata = json.load(f).get('metadata', {})
+                                        args.dicom = metadata.get('dicom_path', t1_path)
+                                else:
+                                    args.dicom = t1_path
+
+                                auto_registration_dir = Path(session_path)
+                                time_array = create_time_array(registered_4d.shape[3], args.time_units)
+                                roi_state = None
+
+                                # Load T2 if available in session
+                                loaded_t2, _ = load_registered_t2(session_path)
+                                registered_t2 = loaded_t2
+                                if registered_t2 is not None:
+                                    print(f"  Loaded registered T2: {registered_t2.shape}")
+
+                                print(f"\nRegistered session loaded successfully!")
+                                print(f"{'='*60}\n")
+                                continue
+                            except Exception as e:
+                                print(f"  Error loading registered data: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                continue
+
                         # Load new T1 exam (and optionally T2)
                         print(f"\n{'='*60}")
                         print("LOADING NEW EXPERIMENT")
