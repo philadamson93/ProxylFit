@@ -239,8 +239,17 @@ def save_registration_data(registered_4d: np.ndarray, metrics: List[Registration
         }
     }
 
+    def _json_safe(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
     with open(metrics_file, 'w') as f:
-        json.dump(metrics_dict, f, indent=2)
+        json.dump(metrics_dict, f, indent=2, default=_json_safe)
     print(f"  Registration metrics saved to: {metrics_file}")
 
     # Update dataset manifest

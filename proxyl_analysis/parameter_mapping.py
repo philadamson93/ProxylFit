@@ -580,8 +580,18 @@ def save_parameter_maps(param_maps: Dict[str, np.ndarray],
         'output_shape': param_maps['kb_map'].shape
     })
     
+    # Convert numpy types to native Python for JSON serialization
+    def _json_safe(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
     with open(metadata_file, 'w') as f:
-        json.dump(metadata, f, indent=2)
+        json.dump(metadata, f, indent=2, default=_json_safe)
     
     print(f"Parameter maps saved to: {maps_file}")
     print(f"Metadata saved to: {metadata_file}")
@@ -614,12 +624,22 @@ def load_parameter_maps(output_dir: str) -> Tuple[Dict[str, np.ndarray], Tuple[f
     param_maps = {
         'kb_map': data['kb_map'],
         'kd_map': data['kd_map'],
+        'knt_map': data['knt_map'],
         'r_squared_map': data['r_squared_map'],
-        'amplitude_map': data['amplitude_map'],
+        'a1_amplitude_map': data['a1_amplitude_map'],
+        'a2_amplitude_map': data['a2_amplitude_map'],
         'baseline_map': data['baseline_map'],
-        'mask': data['mask']
+        't0_map': data['t0_map'],
+        'tmax_map': data['tmax_map'],
+        'mask': data['mask'],
     }
     spacing = tuple(data['spacing'])
+
+    # Optionally load ROI mask if present
+    if 'roi_mask' in data and data['roi_mask'] is not None:
+        loaded_roi = data['roi_mask']
+        if loaded_roi.shape != ():  # np.savez stores None as 0-d array
+            param_maps['roi_mask'] = loaded_roi
     
     # Load metadata if available
     metadata_file = output_path / "parameter_maps_metadata.json"
