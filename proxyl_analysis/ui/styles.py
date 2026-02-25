@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
 
 
 PROXYLFIT_STYLE = """
@@ -138,4 +139,7 @@ def init_qt_app() -> QApplication:
     app.setStyle("Fusion")
     app.setStyleSheet(PROXYLFIT_STYLE)
     app.setQuitOnLastWindowClosed(False)
+    logo_path = get_logo_path()
+    if logo_path:
+        app.setWindowIcon(QIcon(str(logo_path)))
     return app
