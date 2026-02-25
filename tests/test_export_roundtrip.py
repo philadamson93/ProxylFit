@@ -761,3 +761,415 @@ class TestRegisteredDicomSeriesRoundtrip:
         assert info['n_slices'] == 3
         assert info['n_timepoints'] == 5
         assert info['format_version'] == '2.0'
+
+
+# ===========================================================================
+# 9. Parameter Map NPZ round-trip (save_parameter_maps / load_parameter_maps)
+# ===========================================================================
+
+class TestParameterMapNpzRoundtrip:
+    """Tests save_parameter_maps() → load_parameter_maps() via NPZ + JSON."""
+
+    EXPECTED_MAP_KEYS = {
+        'kb_map', 'kd_map', 'knt_map', 'r_squared_map',
+        'a1_amplitude_map', 'a2_amplitude_map', 'baseline_map',
+        't0_map', 'tmax_map', 'mask',
+    }
+
+    def test_npz_all_maps_preserved(self, temp_dir, sample_param_maps_full, sample_spacing):
+        """All 9 map arrays + mask roundtrip with np.testing.assert_array_equal."""
+        from proxyl_analysis.parameter_mapping import save_parameter_maps, load_parameter_maps
+
+        out_dir = str(Path(temp_dir) / "param_maps")
+        save_parameter_maps(sample_param_maps_full, sample_spacing, out_dir)
+        loaded, loaded_spacing = load_parameter_maps(out_dir)
+
+        for key in self.EXPECTED_MAP_KEYS:
+            np.testing.assert_array_equal(
+                loaded[key], sample_param_maps_full[key],
+                err_msg=f"Map '{key}' not preserved through save/load"
+            )
+
+        assert loaded_spacing == pytest.approx(sample_spacing)
+
+    def test_json_metadata_with_numpy_types(self, temp_dir, sample_param_maps_full, sample_spacing):
+        """JSON metadata values must be native Python types, not numpy."""
+        from proxyl_analysis.parameter_mapping import save_parameter_maps
+
+        out_dir = str(Path(temp_dir) / "param_maps")
+        save_parameter_maps(sample_param_maps_full, sample_spacing, out_dir)
+
+        meta_path = Path(out_dir) / "parameter_maps_metadata.json"
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+
+        # json.load() returns native types; verify they parse without error
+        assert isinstance(metadata['window_x'], int)
+        assert isinstance(metadata['success_rate'], float)
+        assert isinstance(metadata['total_positions'], int)
+        assert isinstance(metadata['spacing'], list)
+
+    def test_json_metadata_all_fields_present(self, temp_dir, sample_param_maps_full, sample_spacing):
+        """All expected metadata keys must be present."""
+        from proxyl_analysis.parameter_mapping import save_parameter_maps
+
+        out_dir = str(Path(temp_dir) / "param_maps")
+        save_parameter_maps(sample_param_maps_full, sample_spacing, out_dir)
+
+        meta_path = Path(out_dir) / "parameter_maps_metadata.json"
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+
+        # Keys from param_maps['metadata'] + keys added by save_parameter_maps
+        expected_keys = {
+            'window_size', 'window_x', 'window_y', 'window_z',
+            'z_slice', 'time_units', 'signal_threshold',
+            'success_rate', 'processing_time', 'total_positions',
+            'successful_fits', 'kernel_type', 'injection_time_index',
+            'created_at', 'dicom_path', 'dicom_filename',
+            'spacing', 'output_shape',
+        }
+        assert expected_keys.issubset(set(metadata.keys())), (
+            f"Missing keys: {expected_keys - set(metadata.keys())}"
+        )
+
+    def test_roi_mask_preserved_in_npz(self, temp_dir, sample_param_maps_full, sample_spacing):
+        """ROI mask saved and loadable from NPZ."""
+        from proxyl_analysis.parameter_mapping import save_parameter_maps, load_parameter_maps
+
+        out_dir = str(Path(temp_dir) / "param_maps")
+        save_parameter_maps(sample_param_maps_full, sample_spacing, out_dir)
+        loaded, _ = load_parameter_maps(out_dir)
+
+        assert 'roi_mask' in loaded
+        np.testing.assert_array_equal(loaded['roi_mask'], sample_param_maps_full['roi_mask'])
+
+    def test_save_load_key_consistency(self, temp_dir, sample_param_maps_full, sample_spacing):
+        """Loaded dict keys match expected set."""
+        from proxyl_analysis.parameter_mapping import save_parameter_maps, load_parameter_maps
+
+        out_dir = str(Path(temp_dir) / "param_maps")
+        save_parameter_maps(sample_param_maps_full, sample_spacing, out_dir)
+        loaded, _ = load_parameter_maps(out_dir)
+
+        # Must have all map keys + metadata + roi_mask
+        expected = self.EXPECTED_MAP_KEYS | {'metadata', 'roi_mask'}
+        assert set(loaded.keys()) == expected
+
+    def test_load_nonexistent_raises_error(self, temp_dir):
+        """FileNotFoundError on missing dir."""
+        from proxyl_analysis.parameter_mapping import load_parameter_maps
+
+        with pytest.raises(FileNotFoundError):
+            load_parameter_maps(str(Path(temp_dir) / "nonexistent"))
+
+
+# ===========================================================================
+# 10. Registration Data JSON round-trip
+# ===========================================================================
+
+class TestRegistrationDataJsonRoundtrip:
+    """Tests save_registration_data() → load_registration_data()."""
+
+    def test_registration_metrics_json_serialization(
+        self, temp_dir, sample_4d, sample_spacing, sample_registration_metrics
+    ):
+        """JSON file loads without TypeError; summary values are native Python types."""
+        from proxyl_analysis.registration import save_registration_data
+
+        save_registration_data(
+            sample_4d, sample_registration_metrics, sample_spacing,
+            str(temp_dir), dicom_path=None
+        )
+
+        metrics_file = Path(temp_dir) / "registered" / "registration_metrics.json"
+        assert metrics_file.exists()
+
+        with open(metrics_file, 'r') as f:
+            data = json.load(f)
+
+        # Verify summary has native types
+        summary = data['summary']
+        assert isinstance(summary['mean_mi'], (int, float))
+        assert isinstance(summary['std_mi'], (int, float))
+        assert isinstance(summary['mean_translation'], (int, float))
+        assert isinstance(summary['mean_registration_time'], (int, float))
+
+    def test_registration_full_roundtrip(
+        self, temp_dir, sample_4d, sample_spacing, sample_registration_metrics
+    ):
+        """4D array shape, spacing, metrics list preserved through save/load."""
+        from proxyl_analysis.registration import save_registration_data, load_registration_data
+
+        save_registration_data(
+            sample_4d, sample_registration_metrics, sample_spacing,
+            str(temp_dir), dicom_path=None
+        )
+
+        loaded_4d, loaded_spacing, loaded_metrics = load_registration_data(str(temp_dir))
+
+        assert loaded_4d.shape == sample_4d.shape
+        assert loaded_spacing == pytest.approx(sample_spacing, rel=0.01)
+        assert len(loaded_metrics) == len(sample_registration_metrics)
+
+        # Check metrics fields roundtrip
+        for orig, loaded in zip(sample_registration_metrics, loaded_metrics):
+            assert loaded.timepoint == orig.timepoint
+            assert loaded.ncc == pytest.approx(orig.ncc, rel=0.01)
+            assert loaded.mutual_info == pytest.approx(orig.mutual_info, rel=0.01)
+
+    def test_registration_json_numpy_types_in_summary(
+        self, temp_dir, sample_4d, sample_spacing, sample_registration_metrics
+    ):
+        """Every value in summary dict is int/float/str, not numpy."""
+        from proxyl_analysis.registration import save_registration_data
+
+        save_registration_data(
+            sample_4d, sample_registration_metrics, sample_spacing,
+            str(temp_dir), dicom_path=None
+        )
+
+        metrics_file = Path(temp_dir) / "registered" / "registration_metrics.json"
+        with open(metrics_file, 'r') as f:
+            data = json.load(f)
+
+        for key, value in data['summary'].items():
+            assert isinstance(value, (int, float, str)), (
+                f"summary['{key}'] is {type(value).__name__}, expected int/float/str"
+            )
+
+
+# ===========================================================================
+# 11. Dataset Manifest round-trip
+# ===========================================================================
+
+class TestDatasetManifestRoundtrip:
+    """Tests save_dataset_manifest() / load_dataset_manifest() / update_manifest_analysis()."""
+
+    def test_manifest_roundtrip(self, temp_dir):
+        """Save and reload preserves all fields."""
+        from proxyl_analysis.io import save_dataset_manifest, load_dataset_manifest
+
+        manifest = {
+            'dataset_name': 'test_dataset',
+            'created_at': '2025-01-01 00:00:00',
+            'updated_at': None,
+            'source': {'dicom_path': '/path/to/dicom'},
+            'analysis': {
+                'registration': {'completed': False},
+                'roi_analysis': {'completed': False},
+                'parameter_maps': {'completed': False},
+                'derived_images': {'averaged_images': [], 'difference_images': []},
+            },
+            'files': {'some_file': 'path.dcm'},
+        }
+
+        save_dataset_manifest(str(temp_dir), manifest)
+        loaded = load_dataset_manifest(str(temp_dir))
+
+        assert loaded['dataset_name'] == 'test_dataset'
+        assert loaded['source']['dicom_path'] == '/path/to/dicom'
+        assert loaded['files']['some_file'] == 'path.dcm'
+        assert loaded['updated_at'] is not None  # save_dataset_manifest sets this
+
+    def test_update_manifest_analysis(self, temp_dir):
+        """Analysis section updated with completion flag and timestamp."""
+        from proxyl_analysis.io import (
+            save_dataset_manifest, load_dataset_manifest, update_manifest_analysis
+        )
+
+        manifest = load_dataset_manifest(str(temp_dir))  # gets default
+        save_dataset_manifest(str(temp_dir), manifest)
+
+        update_manifest_analysis(str(temp_dir), 'registration', {
+            'format': 'dicom_2d_slices',
+            'n_timepoints': 20,
+        })
+
+        loaded = load_dataset_manifest(str(temp_dir))
+        reg = loaded['analysis']['registration']
+        assert reg['completed'] is True
+        assert 'timestamp' in reg
+        assert reg['format'] == 'dicom_2d_slices'
+        assert reg['n_timepoints'] == 20
+
+    def test_empty_dir_returns_default_manifest(self, temp_dir):
+        """Default structure returned when no manifest exists."""
+        from proxyl_analysis.io import load_dataset_manifest
+
+        manifest = load_dataset_manifest(str(temp_dir))
+        assert 'dataset_name' in manifest
+        assert 'analysis' in manifest
+        assert manifest['analysis']['registration']['completed'] is False
+
+
+# ===========================================================================
+# 12. Registered T2 DICOM round-trip
+# ===========================================================================
+
+class TestRegisteredT2Roundtrip:
+    """Tests save_registered_t2_as_dicom() → load_registered_t2()."""
+
+    def test_t2_volume_roundtrip(self, temp_dir, sample_t2_volume, sample_spacing):
+        """Shape, spacing, and pixel values preserved (within uint16 quantization)."""
+        from proxyl_analysis.io import save_registered_t2_as_dicom, load_registered_t2
+
+        save_registered_t2_as_dicom(sample_t2_volume, sample_spacing, str(temp_dir))
+        loaded_t2, loaded_spacing = load_registered_t2(str(temp_dir))
+
+        assert loaded_t2 is not None
+        assert loaded_t2.shape == sample_t2_volume.shape
+        assert loaded_spacing == pytest.approx(sample_spacing, rel=0.01)
+
+        # Check pixel values within quantization tolerance
+        for z in range(sample_t2_volume.shape[2]):
+            orig_slice = sample_t2_volume[:, :, z]
+            load_slice = loaded_t2[:, :, z]
+            value_range = orig_slice.max() - orig_slice.min()
+            if value_range > 0:
+                atol = value_range / 65535 * 2
+                np.testing.assert_allclose(
+                    load_slice, orig_slice, atol=atol,
+                    err_msg=f"T2 slice z={z} values don't match"
+                )
+
+    def test_t2_dicom_file_naming(self, temp_dir, sample_t2_volume, sample_spacing):
+        """Correct z{ZZ}.dcm files and series_info.json created."""
+        from proxyl_analysis.io import save_registered_t2_as_dicom
+
+        save_registered_t2_as_dicom(sample_t2_volume, sample_spacing, str(temp_dir))
+
+        t2_dir = Path(temp_dir) / "registered" / "dicoms" / "T2"
+        assert t2_dir.exists()
+
+        dcm_files = sorted(t2_dir.glob("z*.dcm"))
+        expected_names = ["z00.dcm", "z01.dcm", "z02.dcm"]
+        assert [f.name for f in dcm_files] == expected_names
+        assert (t2_dir / "series_info.json").exists()
+
+    def test_t2_series_info_json(self, temp_dir, sample_t2_volume, sample_spacing):
+        """JSON metadata has shape, spacing, n_slices."""
+        from proxyl_analysis.io import save_registered_t2_as_dicom
+
+        save_registered_t2_as_dicom(sample_t2_volume, sample_spacing, str(temp_dir))
+
+        info_path = Path(temp_dir) / "registered" / "dicoms" / "T2" / "series_info.json"
+        with open(info_path) as f:
+            info = json.load(f)
+
+        assert info['shape'] == list(sample_t2_volume.shape)
+        assert info['spacing'] == pytest.approx(list(sample_spacing))
+        assert info['n_slices'] == sample_t2_volume.shape[2]
+
+    def test_load_missing_t2_returns_none(self, temp_dir):
+        """Returns (None, default_spacing) when no T2 exists."""
+        from proxyl_analysis.io import load_registered_t2
+
+        t2, spacing = load_registered_t2(str(temp_dir))
+        assert t2 is None
+        assert spacing == (1.0, 1.0, 1.0)
+
+
+# ===========================================================================
+# 13. Numpy JSON serialization cross-cutting tests
+# ===========================================================================
+
+class TestNumpyJsonSerialization:
+    """Cross-cutting tests for numpy type handling in all JSON paths."""
+
+    def test_json_safe_handles_all_numpy_types(self):
+        """int32, int64, float32, float64, bool_, ndarray all serialize."""
+        # Use the _json_safe pattern from parameter_mapping.py
+        def _json_safe(obj):
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, (np.bool_,)):
+                return bool(obj)
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+        test_data = {
+            'int32': np.int32(42),
+            'int64': np.int64(100),
+            'float32': np.float32(3.14),
+            'float64': np.float64(2.718),
+            'bool': np.bool_(True),
+            'array': np.array([1, 2, 3]),
+            'string': 'hello',
+            'native_int': 7,
+        }
+
+        # Should not raise
+        result = json.dumps(test_data, default=_json_safe)
+        parsed = json.loads(result)
+
+        assert parsed['int32'] == 42
+        assert parsed['int64'] == 100
+        assert parsed['float32'] == pytest.approx(3.14, rel=1e-5)
+        assert parsed['float64'] == pytest.approx(2.718)
+        assert parsed['bool'] is True
+        assert parsed['array'] == [1, 2, 3]
+
+    def test_ndarray_requires_json_handler(self):
+        """np.ndarray (e.g. from registered_4d.shape stored as np.array) fails without encoder."""
+        # numpy 2.x scalars are natively JSON-serializable, but ndarray is not
+        arr = np.array([0.137, 0.137, 0.75])
+
+        with pytest.raises(TypeError, match="not JSON serializable"):
+            json.dumps({'spacing': arr})
+
+        # The _json_safe handler fixes this
+        def _json_safe(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+        result = json.loads(json.dumps({'spacing': arr}, default=_json_safe))
+        assert result['spacing'] == pytest.approx([0.137, 0.137, 0.75])
+
+    def test_metadata_with_none_values(self, temp_dir, sample_spacing):
+        """None values roundtrip as null/None."""
+        from proxyl_analysis.parameter_mapping import save_parameter_maps, load_parameter_maps
+
+        shape = (4, 4, 1)
+        param_maps = {
+            'kb_map': np.zeros(shape),
+            'kd_map': np.zeros(shape),
+            'knt_map': np.zeros(shape),
+            'r_squared_map': np.zeros(shape),
+            'a1_amplitude_map': np.zeros(shape),
+            'a2_amplitude_map': np.zeros(shape),
+            'baseline_map': np.zeros(shape),
+            't0_map': np.zeros(shape),
+            'tmax_map': np.zeros(shape),
+            'mask': np.ones(shape, dtype=bool),
+            'metadata': {
+                'window_size': 5,
+                'window_x': 5,
+                'window_y': 5,
+                'window_z': 1,
+                'z_slice': None,
+                'time_units': 'minutes',
+                'signal_threshold': 100.0,
+                'success_rate': 0.0,
+                'processing_time': 0.1,
+                'total_positions': 16,
+                'successful_fits': 0,
+                'kernel_type': 'sliding_window',
+                'injection_time_index': None,
+            },
+        }
+
+        out_dir = str(Path(temp_dir) / "param_maps_none")
+        save_parameter_maps(param_maps, sample_spacing, out_dir)
+
+        meta_path = Path(out_dir) / "parameter_maps_metadata.json"
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+
+        assert metadata['z_slice'] is None
+        assert metadata['injection_time_index'] is None
+        assert metadata['dicom_path'] is None

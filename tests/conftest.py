@@ -128,6 +128,92 @@ def real_session_path():
     pytest.skip("No real session data available")
 
 
+@pytest.fixture
+def sample_param_maps_full():
+    """Full parameter maps dict matching exact output of create_parameter_maps().
+
+    Includes ALL map keys, numpy-typed metadata values (np.int64, np.float64),
+    and an roi_mask — exercises JSON serialization edge cases.
+    """
+    np.random.seed(42)
+    shape = (16, 16, 3)
+    mask = np.random.random(shape) > 0.3
+
+    return {
+        'kb_map': np.random.random(shape).astype(np.float64) * 0.5 * mask,
+        'kd_map': np.random.random(shape).astype(np.float64) * 0.1 * mask,
+        'knt_map': np.random.random(shape).astype(np.float64) * 0.02 * mask,
+        'r_squared_map': (np.random.uniform(0.5, 1.0, shape) * mask).astype(np.float64),
+        'a1_amplitude_map': np.random.random(shape).astype(np.float64) * 3000 * mask,
+        'a2_amplitude_map': (np.random.random(shape).astype(np.float64) - 0.5) * 500 * mask,
+        'baseline_map': np.random.random(shape).astype(np.float64) * 5000 + 3000,
+        't0_map': np.random.random(shape).astype(np.float64) * 10 * mask,
+        'tmax_map': np.random.random(shape).astype(np.float64) * 40 * mask,
+        'mask': mask,
+        'roi_mask': np.random.random((16, 16)) > 0.4,
+        'metadata': {
+            'window_size': np.int64(5),
+            'window_x': np.int64(5),
+            'window_y': np.int64(5),
+            'window_z': np.int64(1),
+            'z_slice': np.int64(4),
+            'time_units': 'minutes',
+            'signal_threshold': np.float64(523.7),
+            'success_rate': np.float64(78.2),
+            'processing_time': np.float64(12.34),
+            'total_positions': np.int64(768),
+            'successful_fits': np.int64(600),
+            'kernel_type': 'sliding_window',
+            'injection_time_index': np.int64(3),
+        },
+    }
+
+
+@pytest.fixture
+def sample_registration_metrics():
+    """List of 3 RegistrationMetrics (reference + 2 moving timepoints).
+
+    Values are realistic and include numpy scalars as produced by np.mean() etc.
+    """
+    from proxyl_analysis.registration import RegistrationMetrics
+
+    return [
+        RegistrationMetrics(
+            timepoint=0,
+            ncc=1.0,
+            mutual_info=1.5,
+            mean_squared_error=0.0,
+            translation=(0.0, 0.0, 0.0),
+            rotation=(0.0, 0.0, 0.0),
+            optimizer_iterations=0,
+            optimizer_metric_value=0.0,
+            registration_time=0.0,
+        ),
+        RegistrationMetrics(
+            timepoint=1,
+            ncc=0.98,
+            mutual_info=1.42,
+            mean_squared_error=12.5,
+            translation=(0.12, -0.05, 0.03),
+            rotation=(0.001, -0.002, 0.0005),
+            optimizer_iterations=25,
+            optimizer_metric_value=-1.38,
+            registration_time=2.1,
+        ),
+        RegistrationMetrics(
+            timepoint=2,
+            ncc=0.97,
+            mutual_info=1.39,
+            mean_squared_error=18.3,
+            translation=(0.25, -0.10, 0.08),
+            rotation=(0.002, -0.003, 0.001),
+            optimizer_iterations=30,
+            optimizer_metric_value=-1.35,
+            registration_time=2.4,
+        ),
+    ]
+
+
 @pytest.fixture(scope="session")
 def real_session_data():
     """Session-scoped fixture: loads real session 35354296 data once.
