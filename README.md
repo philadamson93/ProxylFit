@@ -1,4 +1,6 @@
-# ProxylFit
+<p align="center">
+  <img src="proxylfit.png" alt="ProxylFit" width="400">
+</p>
 
 Analysis software for time-resolved PROXYL MRI data. Performs image registration, ROI-based kinetic modeling, and parameter mapping.
 
