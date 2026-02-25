@@ -133,24 +133,32 @@ def create_parameter_maps(registered_4d: np.ndarray,
     
     current_position = 0
     start_time = time.time()
-    
+    cancelled = False
+
     # Process each voxel position
     for z in range(z_start, z_end):
+        if cancelled:
+            break
         z_idx = z if z_slice is None else 0  # Index for output arrays
-        
+
         for x in range(x_size):
+            if cancelled:
+                break
             for y in range(y_size):
                 # Check if pixel is in ROI (if ROI mask is provided)
                 if roi_mask is not None and not roi_mask[x, y]:
                     continue
-                    
+
                 current_position += 1
-                
-                # Progress reporting
-                if progress_callback and current_position % 100 == 0:
+
+                # Progress reporting (callback returns False to request cancellation)
+                if progress_callback:
                     progress_pct = 100.0 * current_position / total_positions
-                    progress_callback(progress_pct, current_position, total_positions)
-                
+                    if progress_callback(progress_pct, current_position, total_positions) is False:
+                        print("Parameter mapping cancelled by user.")
+                        cancelled = True
+                        break
+
                 # Extract signal using specified kernel type
                 if kernel_type == 'sliding_window':
                     window_signal = _extract_sliding_window_signal(

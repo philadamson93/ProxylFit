@@ -70,8 +70,11 @@ class ParameterMappingWorker(QThread):
                 self.error.emit(str(e))
 
     def _emit_progress(self, progress_pct, current, total):
-        """Emit progress signal."""
+        """Emit progress signal. Returns False to request cancellation."""
+        if self._is_cancelled:
+            return False
         self.progress.emit(progress_pct, current, total)
+        return True
 
     def cancel(self):
         """Request cancellation."""
