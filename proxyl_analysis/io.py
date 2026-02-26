@@ -118,6 +118,48 @@ def _extract_robust_spacing(filepath: str) -> Tuple[float, float, float]:
         return (1.0, 1.0, 1.0)
 
 
+def extract_temporal_resolution(filepath: str) -> Optional[float]:
+    """
+    Extract temporal resolution (seconds per timepoint) from DICOM metadata.
+
+    Computes: AcquisitionDuration / (NumberOfFrames / 9)
+    where 9 is the number of z-slices per timepoint.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to source DICOM file
+
+    Returns
+    -------
+    float or None
+        Seconds per timepoint, or None if required tags are missing
+    """
+    try:
+        import pydicom
+        ds = pydicom.dcmread(filepath, force=True)
+
+        # AcquisitionDuration: tag (0018, 9073)
+        acq_duration = None
+        if hasattr(ds, 'AcquisitionDuration'):
+            acq_duration = float(ds.AcquisitionDuration)
+
+        # NumberOfFrames: tag (0028, 0008)
+        n_frames = None
+        if hasattr(ds, 'NumberOfFrames'):
+            n_frames = int(ds.NumberOfFrames)
+
+        if acq_duration is not None and n_frames is not None and n_frames > 0:
+            z_slices = 9
+            n_timepoints = n_frames / z_slices
+            if n_timepoints > 0:
+                return acq_duration / n_timepoints
+    except Exception:
+        pass
+
+    return None
+
+
 def load_dicom_series(filepath: str, override_spacing: Tuple[float, float, float] = None) -> Tuple[np.ndarray, Tuple[float, float, float]]:
     """
     Load a single multi-frame DICOM file and reshape to 4D tensor.

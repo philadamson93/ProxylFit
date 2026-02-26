@@ -16,7 +16,7 @@ from pathlib import Path
 # Add the parent directory to the path so we can import our package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from proxyl_analysis.io import load_dicom_series, load_t2_volume, save_registered_t2_as_dicom, load_registered_t2
+from proxyl_analysis.io import load_dicom_series, load_t2_volume, save_registered_t2_as_dicom, load_registered_t2, extract_temporal_resolution
 from proxyl_analysis.registration import register_timeseries, load_registration_data, save_registration_data, register_t2_to_t1
 from proxyl_analysis.roi_selection import select_rectangle_roi, select_segmentation_roi, select_manual_contour_roi, compute_roi_timeseries, print_roi_mode_info, get_available_roi_modes
 from proxyl_analysis.model import fit_proxyl_kinetics, plot_fit_results, print_fit_summary, calculate_derived_parameters, select_injection_time
@@ -40,33 +40,35 @@ from proxyl_analysis.ui import (
 )
 
 
-def create_time_array(num_timepoints: int, time_units: str = 'minutes') -> np.ndarray:
+def create_time_array(num_timepoints: int, time_units: str = 'minutes',
+                      temporal_resolution_s: float = None) -> np.ndarray:
     """
     Create time array for the analysis.
-    Each timestep is 70 seconds.
-    
+
     Parameters
     ----------
     num_timepoints : int
         Number of time points
     time_units : str
         Units for time ('minutes' or 'seconds')
-        
+    temporal_resolution_s : float, optional
+        Seconds per timepoint. If None, defaults to 33.0 seconds.
+
     Returns
     -------
     np.ndarray
         Time array
     """
+    interval_s = temporal_resolution_s if temporal_resolution_s is not None else 33.0
+
     if time_units == 'minutes':
-        # 70-second intervals converted to minutes
-        time_array = np.arange(num_timepoints, dtype=float) * (70.0 / 60.0)
+        time_array = np.arange(num_timepoints, dtype=float) * (interval_s / 60.0)
     elif time_units == 'seconds':
-        # 70-second intervals
-        time_array = np.arange(num_timepoints, dtype=float) * 70.0
+        time_array = np.arange(num_timepoints, dtype=float) * interval_s
     else:
         # Default: just use timepoint indices
         time_array = np.arange(num_timepoints, dtype=float)
-    
+
     return time_array
 
 
@@ -447,6 +449,11 @@ def main():
         # Initialize loaded_t2 for potential session resumption
         loaded_t2 = None
 
+        # Extract temporal resolution from source DICOM (if available)
+        temporal_res = None
+        if args.dicom:
+            temporal_res = extract_temporal_resolution(args.dicom)
+
         # Step 1: Load DICOM data (or registered data)
         if args.load_registration:
             print("Step 1: Loading previously saved registration data...")
@@ -553,7 +560,7 @@ def main():
         # Show main menu (if not in batch mode)
         if not args.batch:
             # Create time array for menu
-            time_array = create_time_array(registered_4d.shape[3], args.time_units)
+            time_array = create_time_array(registered_4d.shape[3], args.time_units, temporal_resolution_s=temporal_res)
 
             # ROI state preserved across menu returns
             roi_state = None
@@ -638,7 +645,8 @@ def main():
                                     args.dicom = t1_path
 
                                 auto_registration_dir = Path(session_path)
-                                time_array = create_time_array(registered_4d.shape[3], args.time_units)
+                                temporal_res = extract_temporal_resolution(args.dicom) if args.dicom else None
+                                time_array = create_time_array(registered_4d.shape[3], args.time_units, temporal_resolution_s=temporal_res)
                                 roi_state = None
 
                                 # Load T2 if available in session
@@ -715,10 +723,11 @@ def main():
 
                         # Update state variables
                         args.dicom = t1_path
+                        temporal_res = extract_temporal_resolution(args.dicom) if args.dicom else None
                         registered_4d = new_registered_4d
                         spacing = new_spacing
                         auto_registration_dir = new_auto_registration_dir
-                        time_array = create_time_array(registered_4d.shape[3], args.time_units)
+                        time_array = create_time_array(registered_4d.shape[3], args.time_units, temporal_resolution_s=temporal_res)
 
                         # Reset ROI state
                         roi_state = None
@@ -1058,7 +1067,7 @@ def main():
             print("Step 3: Enhanced parameter mapping workflow...")
             
             # Create time array for the workflow
-            time_array = create_time_array(registered_4d.shape[3], args.time_units)
+            time_array = create_time_array(registered_4d.shape[3], args.time_units, temporal_resolution_s=temporal_res)
             
             # Run enhanced workflow with command-line parameters
             # Determine window dimensions for enhanced workflow
@@ -1116,7 +1125,7 @@ def main():
                 print(f"  Processing all {registered_4d.shape[2]} slices")
             
             # Create time array for parameter fitting
-            time_array = create_time_array(registered_4d.shape[3], args.time_units)
+            time_array = create_time_array(registered_4d.shape[3], args.time_units, temporal_resolution_s=temporal_res)
             
             # Create parameter maps
             param_maps = create_parameter_maps(
@@ -1243,7 +1252,7 @@ def main():
             signal_timeseries = compute_roi_timeseries(registered_4d, roi_mask)
             
             # Create time array
-            time_array = create_time_array(len(signal_timeseries), args.time_units)
+            time_array = create_time_array(len(signal_timeseries), args.time_units, temporal_resolution_s=temporal_res)
             
             print(f"  Extracted {len(signal_timeseries)} time points")
             print(f"  Signal range: {np.min(signal_timeseries):.2f} to {np.max(signal_timeseries):.2f}")
