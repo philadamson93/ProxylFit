@@ -5,7 +5,8 @@ Tracking document for feedback items from Ralph's initial review.
 ## Summary
 
 - **7 bug fixes**: All resolved and tested
-- **3 feature requests**: Open (Items 6-8)
+- **1 feature addition**: Item 7 (pixel readout)
+- **2 feature requests**: Open (Items 6, 8)
 - **1 non-issue**: Operator error (Item 2)
 
 ## Bug Fixes (Complete)
@@ -94,15 +95,26 @@ Operator error — user was selecting the wrong folder. No code change needed. S
 
 ---
 
+## Feature Additions (Complete)
+
+### Item 7 — Read Pixel Values from Parameter Maps
+
+**Problem:** Users could see spatial patterns in parameter maps but had no way to inspect specific voxel values.
+
+**Fix:** Added mouse hover readout to `ParameterMapResultsDialog` in `proxyl_analysis/ui/parameter_map_options.py`:
+- Connected `motion_notify_event` to the matplotlib canvas
+- Added monospace `pixel_label` between canvas and z-slider
+- Shows `Pixel (x, y): kb = 0.4523` on hover; `Pixel: —` when outside image or over NaN pixel
+
+**Tests:** `TestPixelValueReadout` in `tests/test_user_feedback_fixes.py` (4 tests)
+
+---
+
 ## Feature Requests (Open)
 
 ### Item 6 — Parameter Map Improvements
 
 Requested improvements to parameter map visualization. Details TBD.
-
-### Item 7 — Read Pixel Values from Parameter Maps
-
-Ability to hover/click on parameter maps and read individual pixel values. Details TBD.
 
 ### Item 8 — Image Decimation (32×32 / 16×16)
 

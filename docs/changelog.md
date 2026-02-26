@@ -2,6 +2,16 @@
 
 All notable changes to ProxylFit are documented here.
 
+## [1.2.1] - February 2025
+
+### Added
+- **Pixel value readout on parameter maps** — hover over any voxel to see coordinates and value in real time
+
+### Fixed
+- Guard against matplotlib returning `None` coordinates at canvas edges
+
+---
+
 ## [1.2.0] - January 2025
 
 ### Added
