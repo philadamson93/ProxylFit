@@ -1,5 +1,5 @@
 """
-Tests for user feedback fixes (Plans A, C, D).
+Tests for user feedback fixes.
 
 Validates:
 - A1: show_roi_cb → roi_checkbox fix in parameter map export
@@ -9,6 +9,8 @@ Validates:
 - C2: Grayscale colormap for difference images
 - C3: Fit results table export with %Enhancement and %NTE
 - D1: Session loading error messages
+- Item 1: Time axis — temporal resolution from DICOM metadata
+- Item 7: Pixel value readout on parameter maps (hover)
 """
 
 import csv
@@ -461,3 +463,102 @@ class TestTimeAxis:
         arr_sec = create_time_array(10, time_units='seconds', temporal_resolution_s=33.408)
         arr_min = create_time_array(10, time_units='minutes', temporal_resolution_s=33.408)
         np.testing.assert_allclose(arr_min, arr_sec / 60.0)
+
+
+# ===========================================================================
+# Item 7: Pixel value readout on parameter maps
+# ===========================================================================
+
+class TestPixelValueReadout:
+    """Item 7: Hover over parameter maps to read pixel values."""
+
+    @pytest.fixture
+    def results_dialog(self):
+        """Create a ParameterMapResultsDialog with known synthetic data."""
+        from proxyl_analysis.ui.parameter_map_options import ParameterMapResultsDialog
+        from proxyl_analysis.ui.styles import init_qt_app
+
+        app = init_qt_app()
+
+        # 10x10x3 maps with known values
+        kb_map = np.full((10, 10, 3), np.nan)
+        kb_map[5, 7, 1] = 0.4523
+        kb_map[3, 2, 1] = 1.2345
+
+        mask = np.zeros((10, 10, 3), dtype=bool)
+        mask[5, 7, 1] = True
+        mask[3, 2, 1] = True
+
+        param_maps = {
+            'kb_map': kb_map,
+            'kd_map': np.full((10, 10, 3), np.nan),
+            'knt_map': np.full((10, 10, 3), np.nan),
+            'r_squared_map': np.full((10, 10, 3), np.nan),
+            'a1_amplitude_map': np.full((10, 10, 3), np.nan),
+            'a2_amplitude_map': np.full((10, 10, 3), np.nan),
+            'mask': mask,
+        }
+
+        dialog = ParameterMapResultsDialog(
+            param_maps=param_maps,
+            spacing=(1.0, 1.0, 2.0),
+        )
+        # Navigate to z=1 where we placed known values
+        dialog.z_slider.setValue(1)
+
+        yield dialog
+        dialog.close()
+
+    def test_pixel_label_exists(self, results_dialog):
+        """ParameterMapResultsDialog should have a pixel_label QLabel."""
+        from PySide6.QtWidgets import QLabel
+
+        assert hasattr(results_dialog, 'pixel_label')
+        assert isinstance(results_dialog.pixel_label, QLabel)
+
+    def test_hover_updates_label(self, results_dialog):
+        """Simulating a motion event over a known pixel updates the label."""
+        # Create a mock event at pixel (5, 7) — where kb = 0.4523
+        event = MagicMock()
+        event.inaxes = results_dialog.ax
+        event.xdata = 5.0
+        event.ydata = 7.0
+
+        results_dialog._on_pixel_hover(event)
+
+        text = results_dialog.pixel_label.text()
+        assert "(5, 7)" in text
+        assert "0.4523" in text
+        assert "kb" in text
+
+    def test_hover_outside_shows_dash(self, results_dialog):
+        """Motion event outside axes resets label to 'Pixel: —'."""
+        # First hover over a valid pixel to change the label from its default
+        valid_event = MagicMock()
+        valid_event.inaxes = results_dialog.ax
+        valid_event.xdata = 5.0
+        valid_event.ydata = 7.0
+        results_dialog._on_pixel_hover(valid_event)
+        assert "0.4523" in results_dialog.pixel_label.text()
+
+        # Now hover outside — label should reset
+        event = MagicMock()
+        event.inaxes = None  # Outside any axes
+
+        results_dialog._on_pixel_hover(event)
+
+        assert results_dialog.pixel_label.text() == "Pixel: \u2014"
+
+    def test_hover_nan_pixel_shows_dash(self, results_dialog):
+        """Hovering over a NaN (unfitted) pixel shows '—' for the value."""
+        # Pixel (0, 0) at z=1 is NaN in our test data
+        event = MagicMock()
+        event.inaxes = results_dialog.ax
+        event.xdata = 0.0
+        event.ydata = 0.0
+
+        results_dialog._on_pixel_hover(event)
+
+        text = results_dialog.pixel_label.text()
+        assert "(0, 0)" in text
+        assert "\u2014" in text

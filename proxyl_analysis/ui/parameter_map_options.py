@@ -572,6 +572,14 @@ class ParameterMapResultsDialog(QDialog):
         self.ax = self.figure.add_subplot(111)
         left_layout.addWidget(self.canvas)
 
+        # Connect mouse hover for pixel readout
+        self.canvas.mpl_connect('motion_notify_event', self._on_pixel_hover)
+
+        # Pixel value readout label
+        self.pixel_label = QLabel("Pixel: \u2014")
+        self.pixel_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        left_layout.addWidget(self.pixel_label)
+
         # Z-slice slider
         z_layout = QHBoxLayout()
         z_layout.addWidget(QLabel("Z-slice:"))
@@ -713,6 +721,48 @@ class ParameterMapResultsDialog(QDialog):
         self.overlay_opacity = value / 100.0
         self.opacity_label.setText(f"{value}%")
         self._update_display()
+
+    def _on_pixel_hover(self, event):
+        """Handle mouse hover over parameter map canvas."""
+        if event.inaxes != self.ax:
+            self.pixel_label.setText("Pixel: \u2014")
+            return
+
+        map_data = self.param_maps.get(self.current_map)
+        if map_data is None:
+            self.pixel_label.setText("Pixel: \u2014")
+            return
+
+        # matplotlib can return None for xdata/ydata at axes edges
+        if event.xdata is None or event.ydata is None:
+            self.pixel_label.setText("Pixel: \u2014")
+            return
+
+        # Canvas xdata/ydata map to array indices after .T and origin='lower'
+        # Display: map_data[:, :, z].T with origin='lower'
+        # So event.xdata → x-index, event.ydata → y-index in the original array
+        xi = int(round(event.xdata))
+        yi = int(round(event.ydata))
+
+        # Bounds check
+        if xi < 0 or yi < 0 or xi >= map_data.shape[0] or yi >= map_data.shape[1]:
+            self.pixel_label.setText("Pixel: \u2014")
+            return
+
+        # Look up value
+        if map_data.ndim == 3 and self.current_z < map_data.shape[2]:
+            value = map_data[xi, yi, self.current_z]
+        elif map_data.ndim == 3:
+            value = map_data[xi, yi, 0]
+        else:
+            value = map_data[xi, yi]
+
+        # Format
+        map_short = self.current_map.replace('_map', '')
+        if np.isnan(value):
+            self.pixel_label.setText(f"Pixel ({xi}, {yi}): {map_short} = \u2014")
+        else:
+            self.pixel_label.setText(f"Pixel ({xi}, {yi}): {map_short} = {value:.4f}")
 
     def _update_display(self):
         """Update the parameter map display."""
