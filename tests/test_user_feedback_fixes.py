@@ -397,3 +397,67 @@ class TestD1_SessionLoadingFeedback:
                 mock_warn.assert_called_once()
 
         dialog.close()
+
+
+# ===========================================================================
+# Item 1: Time axis — temporal resolution from DICOM metadata
+# ===========================================================================
+
+class TestTimeAxis:
+    """Item 1: Time axis should use ~33s intervals (not 70s)."""
+
+    def test_extract_temporal_resolution_from_real_dicom(self):
+        """extract_temporal_resolution returns ~33.4s on a real source DICOM."""
+        import json
+
+        # Find source DICOM path from a real session's registration metadata
+        candidates = [
+            Path(__file__).parent.parent / "output" / "35354296",
+            Path(__file__).parent.parent / "output" / "35354281",
+            Path(__file__).parent.parent / "output" / "35354333",
+        ]
+        dicom_path = None
+        for session in candidates:
+            metrics_file = session / "registered" / "registration_metrics.json"
+            if metrics_file.exists():
+                with open(metrics_file) as f:
+                    meta = json.load(f).get("metadata", {})
+                src = meta.get("dicom_path")
+                if src and Path(src).exists():
+                    dicom_path = src
+                    break
+
+        if dicom_path is None:
+            pytest.skip("No real source DICOM available")
+
+        from proxyl_analysis.io import extract_temporal_resolution
+
+        result = extract_temporal_resolution(dicom_path)
+        assert result is not None, "Failed to extract temporal resolution"
+        assert result == pytest.approx(33.408, abs=0.1), (
+            f"Expected ~33.4s per timepoint, got {result}"
+        )
+
+    def test_create_time_array_default_is_33s(self):
+        """Default interval should be 33.0s, not 70s."""
+        from proxyl_analysis.run_analysis import create_time_array
+
+        arr = create_time_array(10, time_units='seconds')
+        expected = np.arange(10, dtype=float) * 33.0
+        np.testing.assert_allclose(arr, expected)
+
+    def test_create_time_array_with_custom_resolution(self):
+        """Custom temporal_resolution_s parameter should be used."""
+        from proxyl_analysis.run_analysis import create_time_array
+
+        arr = create_time_array(5, time_units='seconds', temporal_resolution_s=45.0)
+        expected = np.arange(5, dtype=float) * 45.0
+        np.testing.assert_allclose(arr, expected)
+
+    def test_create_time_array_minutes_conversion(self):
+        """Minutes array should equal seconds array / 60."""
+        from proxyl_analysis.run_analysis import create_time_array
+
+        arr_sec = create_time_array(10, time_units='seconds', temporal_resolution_s=33.408)
+        arr_min = create_time_array(10, time_units='minutes', temporal_resolution_s=33.408)
+        np.testing.assert_allclose(arr_min, arr_sec / 60.0)
