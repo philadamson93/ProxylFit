@@ -2,6 +2,15 @@
 
 All notable changes to ProxylFit are documented here.
 
+## [1.2.2] - February 2025
+
+### Added
+- **Stride-based downsampling for parameter maps** — configurable stride parameter trades spatial resolution for speed; stride=N fits every Nth pixel and fills NxN blocks with nearest-neighbor values; output maps remain full-size for DICOM overlay compatibility
+- New "Stride" SpinBox in Parameter Map Options dialog
+- New `--stride` CLI argument for batch mode
+
+---
+
 ## [1.2.1] - February 2025
 
 ### Added

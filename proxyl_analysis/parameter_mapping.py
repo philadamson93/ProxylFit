@@ -26,7 +26,8 @@ def create_parameter_maps(registered_4d: np.ndarray,
                          progress_callback: Optional[callable] = None,
                          roi_mask: Optional[np.ndarray] = None,
                          kernel_type: str = 'sliding_window',
-                         injection_time_index: Optional[int] = None) -> Dict[str, np.ndarray]:
+                         injection_time_index: Optional[int] = None,
+                         stride: int = 1) -> Dict[str, np.ndarray]:
     """
     Create spatial parameter maps using sliding window or convolution approach.
     
@@ -56,7 +57,11 @@ def create_parameter_maps(registered_4d: np.ndarray,
     injection_time_index : int, optional
         Index in time_array where injection occurred. If provided, only data
         from this point onwards will be used for fitting.
-        
+    stride : int
+        Step size for spatial iteration. stride=1 fits every pixel (full resolution).
+        stride=N fits every Nth pixel and fills surrounding NxN blocks with the
+        fitted value (nearest-neighbor fill). Output maps remain full-size.
+
     Returns
     -------
     dict
@@ -117,14 +122,14 @@ def create_parameter_maps(registered_4d: np.ndarray,
     # Calculate total positions for progress tracking
     total_positions = 0
     for z in range(z_start, z_end):
-        for x in range(x_size):
-            for y in range(y_size):
+        for x in range(0, x_size, stride):
+            for y in range(0, y_size, stride):
                 # Check if pixel is in ROI (if ROI mask is provided)
                 if roi_mask is not None and not roi_mask[x, y]:
                     continue
                 total_positions += 1
     
-    print(f"Creating parameter maps using {window_x}x{window_y}x{window_z} {kernel_type} kernel...")
+    print(f"Creating parameter maps using {window_x}x{window_y}x{window_z} {kernel_type} kernel (stride={stride})...")
     if roi_mask is not None:
         print(f"Processing within ROI on {'single slice' if z_slice is not None else 'all slices'}: {total_positions} positions")
     else:
@@ -141,10 +146,10 @@ def create_parameter_maps(registered_4d: np.ndarray,
             break
         z_idx = z if z_slice is None else 0  # Index for output arrays
 
-        for x in range(x_size):
+        for x in range(0, x_size, stride):
             if cancelled:
                 break
-            for y in range(y_size):
+            for y in range(0, y_size, stride):
                 # Check if pixel is in ROI (if ROI mask is provided)
                 if roi_mask is not None and not roi_mask[x, y]:
                     continue
@@ -191,16 +196,19 @@ def create_parameter_maps(registered_4d: np.ndarray,
                     
                     # Check fit quality (require reasonable R-squared)
                     if fit_results['r_squared'] > 0.1:  # Minimum R² threshold
-                        kb_map[x, y, z_idx] = kb
-                        kd_map[x, y, z_idx] = kd
-                        knt_map[x, y, z_idx] = knt
-                        r_squared_map[x, y, z_idx] = fit_results['r_squared']
-                        a1_amplitude_map[x, y, z_idx] = fit_results['A1']
-                        a2_amplitude_map[x, y, z_idx] = fit_results['A2']
-                        baseline_map[x, y, z_idx] = fit_results['A0']
-                        t0_map[x, y, z_idx] = fit_results['t0']
-                        tmax_map[x, y, z_idx] = fit_results['tmax']
-                        fit_mask[x, y, z_idx] = True
+                        # Fill stride×stride block (nearest-neighbor fill)
+                        x_end_blk = min(x + stride, x_size)
+                        y_end_blk = min(y + stride, y_size)
+                        kb_map[x:x_end_blk, y:y_end_blk, z_idx] = kb
+                        kd_map[x:x_end_blk, y:y_end_blk, z_idx] = kd
+                        knt_map[x:x_end_blk, y:y_end_blk, z_idx] = knt
+                        r_squared_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['r_squared']
+                        a1_amplitude_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['A1']
+                        a2_amplitude_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['A2']
+                        baseline_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['A0']
+                        t0_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['t0']
+                        tmax_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['tmax']
+                        fit_mask[x:x_end_blk, y:y_end_blk, z_idx] = True
                         # Per-voxel success log
                         try:
                             print(f"Fit success at (x={x}, y={y}, z={z_idx}): "
@@ -244,7 +252,8 @@ def create_parameter_maps(registered_4d: np.ndarray,
             'total_positions': total_positions,
             'successful_fits': successful_fits,
             'kernel_type': kernel_type,
-            'injection_time_index': injection_time_index
+            'injection_time_index': injection_time_index,
+            'stride': stride
         }
     }
     

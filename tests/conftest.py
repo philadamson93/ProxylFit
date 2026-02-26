@@ -165,6 +165,7 @@ def sample_param_maps_full():
             'successful_fits': np.int64(600),
             'kernel_type': 'sliding_window',
             'injection_time_index': np.int64(3),
+            'stride': np.int64(1),
         },
     }
 

@@ -11,6 +11,7 @@ Validates:
 - D1: Session loading error messages
 - Item 1: Time axis — temporal resolution from DICOM metadata
 - Item 7: Pixel value readout on parameter maps (hover)
+- Item 8: Stride-based downsampling for parameter maps
 """
 
 import csv
@@ -562,3 +563,429 @@ class TestPixelValueReadout:
         text = results_dialog.pixel_label.text()
         assert "(0, 0)" in text
         assert "\u2014" in text
+
+
+# ===========================================================================
+# Item 8: Stride-based downsampling for parameter maps
+# ===========================================================================
+
+class TestParameterMapStride:
+    """Item 8: Stride parameter for coarser-resolution parameter mapping."""
+
+    @pytest.fixture
+    def synthetic_4d(self):
+        """Create small synthetic 4D data with a clear signal."""
+        np.random.seed(42)
+        # 10x10x1x20 — small enough to fit quickly
+        data = np.random.uniform(500, 1000, (10, 10, 1, 20)).astype(np.float64)
+        # Add a strong ramp so signal passes threshold checks
+        for t in range(20):
+            data[:, :, :, t] += t * 100
+        return data
+
+    @pytest.fixture
+    def time_array(self):
+        return np.linspace(0, 10, 20)
+
+    def test_stride_output_same_shape(self, synthetic_4d, time_array):
+        """stride=2 on 10×10 input still produces 10×10 output maps."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        result = create_parameter_maps(
+            synthetic_4d, time_array,
+            window_size=1, z_slice=0, stride=2
+        )
+        assert result['kb_map'].shape == (10, 10, 1)
+        assert result['mask'].shape == (10, 10, 1)
+
+    def test_stride_fills_blocks(self, synthetic_4d, time_array):
+        """Fitted value at strided position fills surrounding stride×stride block."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        result = create_parameter_maps(
+            synthetic_4d, time_array,
+            window_size=1, z_slice=0, stride=2
+        )
+        kb = result['kb_map'][:, :, 0]
+        mask = result['mask'][:, :, 0]
+
+        # For every fitted 2×2 block, all values within should be identical
+        for x in range(0, 10, 2):
+            for y in range(0, 10, 2):
+                block = kb[x:x+2, y:y+2]
+                if mask[x, y]:
+                    # All values in block should equal the corner value
+                    assert np.all(block == block[0, 0]), (
+                        f"Block at ({x},{y}) not filled uniformly: {block}"
+                    )
+
+    def test_stride_1_unchanged(self, synthetic_4d, time_array):
+        """stride=1 produces identical results to default behavior."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        result_default = create_parameter_maps(
+            synthetic_4d, time_array,
+            window_size=1, z_slice=0
+        )
+        result_stride1 = create_parameter_maps(
+            synthetic_4d, time_array,
+            window_size=1, z_slice=0, stride=1
+        )
+        np.testing.assert_array_equal(result_default['kb_map'], result_stride1['kb_map'])
+        np.testing.assert_array_equal(result_default['mask'], result_stride1['mask'])
+
+    def test_stride_in_options_dialog(self):
+        """Dialog result dict includes 'stride' key."""
+        src = Path(__file__).parent.parent / "proxyl_analysis" / "ui" / "parameter_map_options.py"
+        text = src.read_text()
+        assert "'stride'" in text, "Expected 'stride' key in options dialog result"
+        assert "stride_spin" in text, "Expected stride_spin widget in dialog"
+
+    def test_stride_metadata_recorded(self, synthetic_4d, time_array):
+        """Output metadata contains stride value."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        result = create_parameter_maps(
+            synthetic_4d, time_array,
+            window_size=1, z_slice=0, stride=4
+        )
+        assert 'stride' in result['metadata']
+        assert result['metadata']['stride'] == 4
+
+    def test_stride_reduces_total_positions(self, synthetic_4d, time_array):
+        """stride=2 on 10×10 should report ~25 positions, not 100."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        positions_log = []
+
+        def capture_progress(pct, current, total):
+            if not positions_log or positions_log[-1] != total:
+                positions_log.append(total)
+            return True
+
+        create_parameter_maps(
+            synthetic_4d, time_array,
+            window_size=1, z_slice=0, stride=1,
+            progress_callback=capture_progress
+        )
+        total_stride1 = positions_log[-1]
+
+        positions_log.clear()
+        create_parameter_maps(
+            synthetic_4d, time_array,
+            window_size=1, z_slice=0, stride=2,
+            progress_callback=capture_progress
+        )
+        total_stride2 = positions_log[-1]
+
+        # stride=2 should have ~4x fewer positions
+        assert total_stride1 == 100  # 10×10
+        assert total_stride2 == 25   # 5×5
+
+    def test_stride_non_divisible(self):
+        """stride=3 on 10×10 handles partial edge blocks correctly."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        np.random.seed(99)
+        data = np.random.uniform(500, 1000, (10, 10, 1, 20)).astype(np.float64)
+        for t in range(20):
+            data[:, :, :, t] += t * 100
+        time = np.linspace(0, 10, 20)
+
+        result = create_parameter_maps(
+            data, time, window_size=1, z_slice=0, stride=3
+        )
+        kb = result['kb_map'][:, :, 0]
+        mask = result['mask'][:, :, 0]
+
+        # Output shape unchanged
+        assert result['kb_map'].shape == (10, 10, 1)
+
+        # Check that partial edge block at x=9 is handled (block 9:10 is 1 wide)
+        if mask[9, 0]:
+            assert not np.isnan(kb[9, 0])
+
+        # Check block at x=6 fills 6:9 (3 wide)
+        if mask[6, 0]:
+            block = kb[6:9, 0:3]
+            assert np.all(block == block[0, 0])
+
+    def test_stride_larger_than_image(self):
+        """stride > image dimension processes a single position per slice."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        np.random.seed(77)
+        data = np.random.uniform(500, 1000, (6, 6, 1, 20)).astype(np.float64)
+        for t in range(20):
+            data[:, :, :, t] += t * 100
+        time = np.linspace(0, 10, 20)
+
+        result = create_parameter_maps(
+            data, time, window_size=1, z_slice=0, stride=20
+        )
+        # Should still produce full-size output
+        assert result['kb_map'].shape == (6, 6, 1)
+        # Only one position fitted (0,0), so if successful, entire map filled
+        assert result['metadata']['total_positions'] == 1
+
+    def test_stride_non_square_image(self):
+        """stride works correctly on non-square images (e.g. 12×8)."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        np.random.seed(55)
+        data = np.random.uniform(500, 1000, (12, 8, 1, 20)).astype(np.float64)
+        for t in range(20):
+            data[:, :, :, t] += t * 100
+        time = np.linspace(0, 10, 20)
+
+        result = create_parameter_maps(
+            data, time, window_size=1, z_slice=0, stride=4
+        )
+        assert result['kb_map'].shape == (12, 8, 1)
+        # 12/4=3 positions in x, 8/4=2 positions in y → 6 total
+        assert result['metadata']['total_positions'] == 6
+
+    def test_stride_with_roi_mask(self):
+        """stride correctly interacts with ROI mask."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        np.random.seed(33)
+        data = np.random.uniform(500, 1000, (10, 10, 1, 20)).astype(np.float64)
+        for t in range(20):
+            data[:, :, :, t] += t * 100
+        time = np.linspace(0, 10, 20)
+
+        # ROI mask covers only top-left 6×6 region
+        roi_mask = np.zeros((10, 10), dtype=bool)
+        roi_mask[:6, :6] = True
+
+        result = create_parameter_maps(
+            data, time, window_size=1, z_slice=0,
+            stride=2, roi_mask=roi_mask
+        )
+        # Output shape stays full-size
+        assert result['kb_map'].shape == (10, 10, 1)
+        # stride=2 on ROI: positions (0,0),(0,2),(0,4),(2,0),(2,2),(2,4),(4,0),(4,2),(4,4) = 9
+        assert result['metadata']['total_positions'] == 9
+
+
+# ===========================================================================
+# Item 8 (continued): Stride worker and integration tests
+# ===========================================================================
+
+class TestParameterMapStrideWorker:
+    """Item 8: Verify ParameterMappingWorker passes stride correctly."""
+
+    def test_worker_passes_stride_to_create_parameter_maps(self):
+        """Worker forwards stride from options dict to create_parameter_maps()."""
+        from proxyl_analysis.ui.parameter_map_options import ParameterMappingWorker
+
+        np.random.seed(42)
+        data = np.random.uniform(500, 1000, (6, 6, 1, 10)).astype(np.float64)
+        for t in range(10):
+            data[:, :, :, t] += t * 100
+        time = np.linspace(0, 5, 10)
+
+        options = {
+            'window_size': (1, 1, 1),
+            'z_slice': 0,
+            'kernel_type': 'sliding_window',
+            'stride': 3,
+        }
+
+        captured_kwargs = {}
+
+        def mock_create(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            # Return a minimal valid result
+            shape = (6, 6, 1)
+            return {
+                'kb_map': np.zeros(shape),
+                'kd_map': np.zeros(shape),
+                'knt_map': np.zeros(shape),
+                'r_squared_map': np.zeros(shape),
+                'a1_amplitude_map': np.zeros(shape),
+                'a2_amplitude_map': np.zeros(shape),
+                'baseline_map': np.zeros(shape),
+                't0_map': np.zeros(shape),
+                'tmax_map': np.zeros(shape),
+                'mask': np.zeros(shape, dtype=bool),
+                'metadata': {'stride': 3},
+            }
+
+        with patch('proxyl_analysis.parameter_mapping.create_parameter_maps', mock_create):
+            worker = ParameterMappingWorker(data, time, options)
+            worker.run()
+
+        assert captured_kwargs.get('stride') == 3
+
+    def test_worker_defaults_stride_to_1(self):
+        """Worker defaults stride to 1 when not in options dict."""
+        from proxyl_analysis.ui.parameter_map_options import ParameterMappingWorker
+
+        np.random.seed(42)
+        data = np.random.uniform(500, 1000, (4, 4, 1, 10)).astype(np.float64)
+        for t in range(10):
+            data[:, :, :, t] += t * 100
+        time = np.linspace(0, 5, 10)
+
+        # Options WITHOUT stride key
+        options = {
+            'window_size': (1, 1, 1),
+            'z_slice': 0,
+            'kernel_type': 'sliding_window',
+        }
+
+        captured_kwargs = {}
+
+        def mock_create(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            shape = (4, 4, 1)
+            return {
+                'kb_map': np.zeros(shape),
+                'kd_map': np.zeros(shape),
+                'knt_map': np.zeros(shape),
+                'r_squared_map': np.zeros(shape),
+                'a1_amplitude_map': np.zeros(shape),
+                'a2_amplitude_map': np.zeros(shape),
+                'baseline_map': np.zeros(shape),
+                't0_map': np.zeros(shape),
+                'tmax_map': np.zeros(shape),
+                'mask': np.zeros(shape, dtype=bool),
+                'metadata': {'stride': 1},
+            }
+
+        with patch('proxyl_analysis.parameter_mapping.create_parameter_maps', mock_create):
+            worker = ParameterMappingWorker(data, time, options)
+            worker.run()
+
+        assert captured_kwargs.get('stride') == 1
+
+
+class TestParameterMapStrideIntegration:
+    """Item 8: Integration tests for stride save/load roundtrip."""
+
+    @pytest.fixture
+    def stride_param_maps(self):
+        """Create parameter maps with stride=4 via actual create_parameter_maps."""
+        from proxyl_analysis.parameter_mapping import create_parameter_maps
+
+        np.random.seed(42)
+        data = np.random.uniform(500, 1000, (10, 10, 1, 20)).astype(np.float64)
+        for t in range(20):
+            data[:, :, :, t] += t * 100
+        time = np.linspace(0, 10, 20)
+
+        roi_mask = np.ones((10, 10), dtype=bool)
+
+        result = create_parameter_maps(
+            data, time, window_size=1, z_slice=0, stride=4,
+            roi_mask=roi_mask
+        )
+        return result
+
+    def test_stride_npz_roundtrip(self, temp_dir, stride_param_maps):
+        """Stride metadata survives NPZ save → load cycle."""
+        from proxyl_analysis.parameter_mapping import save_parameter_maps, load_parameter_maps
+
+        out_dir = str(Path(temp_dir) / "stride_maps")
+        save_parameter_maps(stride_param_maps, (1.0, 1.0, 2.0), out_dir)
+        loaded, _ = load_parameter_maps(out_dir)
+
+        assert 'metadata' in loaded
+        assert loaded['metadata']['stride'] == 4
+
+    def test_stride_json_metadata_roundtrip(self, temp_dir, stride_param_maps):
+        """Stride value is in JSON metadata file and is a native int."""
+        from proxyl_analysis.parameter_mapping import save_parameter_maps
+
+        out_dir = str(Path(temp_dir) / "stride_maps")
+        save_parameter_maps(stride_param_maps, (1.0, 1.0, 2.0), out_dir)
+
+        meta_path = Path(out_dir) / "parameter_maps_metadata.json"
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+
+        assert 'stride' in metadata
+        assert metadata['stride'] == 4
+        assert isinstance(metadata['stride'], int)
+
+    def test_stride_dicom_export_metadata(self, temp_dir, stride_param_maps):
+        """Stride value survives DICOM export in ImageComments JSON."""
+        from proxyl_analysis.io import save_parameter_map_as_dicom
+        import pydicom
+
+        saved = save_parameter_map_as_dicom(
+            stride_param_maps['kb_map'], 'kb_map', temp_dir,
+            (1.0, 1.0, 2.0),
+            source_dicom=None,
+            metadata=stride_param_maps['metadata']
+        )
+        assert len(saved) >= 1
+
+        ds = pydicom.dcmread(saved[0])
+        parsed = json.loads(ds.ImageComments)
+        assert parsed['stride'] == 4
+
+    def test_stride_map_values_preserved_through_save_load(self, temp_dir, stride_param_maps):
+        """Map values (including block-filled patterns) survive save/load."""
+        from proxyl_analysis.parameter_mapping import save_parameter_maps, load_parameter_maps
+
+        out_dir = str(Path(temp_dir) / "stride_maps")
+        save_parameter_maps(stride_param_maps, (1.0, 1.0, 2.0), out_dir)
+        loaded, _ = load_parameter_maps(out_dir)
+
+        np.testing.assert_array_equal(
+            loaded['kb_map'], stride_param_maps['kb_map'],
+            err_msg="kb_map not preserved through save/load with stride"
+        )
+        np.testing.assert_array_equal(
+            loaded['mask'], stride_param_maps['mask'],
+            err_msg="mask not preserved through save/load with stride"
+        )
+
+    def test_stride_with_roi_roundtrip(self, temp_dir):
+        """Stride + ROI mask combined roundtrip."""
+        from proxyl_analysis.parameter_mapping import (
+            create_parameter_maps, save_parameter_maps, load_parameter_maps
+        )
+
+        np.random.seed(42)
+        data = np.random.uniform(500, 1000, (10, 10, 1, 20)).astype(np.float64)
+        for t in range(20):
+            data[:, :, :, t] += t * 100
+        time = np.linspace(0, 10, 20)
+
+        roi_mask = np.zeros((10, 10), dtype=bool)
+        roi_mask[2:8, 2:8] = True
+
+        result = create_parameter_maps(
+            data, time, window_size=1, z_slice=0,
+            stride=2, roi_mask=roi_mask
+        )
+
+        out_dir = str(Path(temp_dir) / "stride_roi_maps")
+        save_parameter_maps(result, (1.0, 1.0, 2.0), out_dir)
+        loaded, _ = load_parameter_maps(out_dir)
+
+        assert loaded['metadata']['stride'] == 2
+        assert 'roi_mask' in loaded
+        np.testing.assert_array_equal(loaded['roi_mask'], roi_mask)
+        np.testing.assert_array_equal(loaded['kb_map'], result['kb_map'])
+
+
+class TestParameterMapStrideCLI:
+    """Item 8: CLI --stride argument is defined and wired correctly."""
+
+    def test_stride_argument_in_source(self):
+        """run_analysis.py defines --stride argument with default=1."""
+        src = Path(__file__).parent.parent / "proxyl_analysis" / "run_analysis.py"
+        text = src.read_text()
+        assert "'--stride'" in text
+        assert "default=1" in text.split("'--stride'")[1].split("add_argument")[0]
+
+    def test_stride_passed_to_create_parameter_maps_call(self):
+        """Batch mode passes stride=args.stride to create_parameter_maps()."""
+        src = Path(__file__).parent.parent / "proxyl_analysis" / "run_analysis.py"
+        text = src.read_text()
+        assert "stride=args.stride" in text

@@ -826,6 +826,7 @@ class TestParameterMapNpzRoundtrip:
             'z_slice', 'time_units', 'signal_threshold',
             'success_rate', 'processing_time', 'total_positions',
             'successful_fits', 'kernel_type', 'injection_time_index',
+            'stride',
             'created_at', 'dicom_path', 'dicom_filename',
             'spacing', 'output_shape',
         }

@@ -1458,6 +1458,68 @@ class TestParameterMapOptionsDialog:
 
         assert dialog.result['kernel_type'] == 'gaussian'
 
+    def test_stride_spinbox_default(self, qt_app):
+        """Stride SpinBox defaults to 1 (full resolution)."""
+        from proxyl_analysis.ui.parameter_map_options import ParameterMapOptionsDialog
+
+        dialog = ParameterMapOptionsDialog(max_z=8, current_z=4)
+        dialog._on_run()
+
+        assert dialog.result['stride'] == 1
+        dialog.close()
+
+    def test_stride_spinbox_custom_value(self, qt_app):
+        """Setting stride SpinBox to 4 produces stride=4 in result dict."""
+        from proxyl_analysis.ui.parameter_map_options import ParameterMapOptionsDialog
+
+        dialog = ParameterMapOptionsDialog(max_z=8, current_z=4)
+
+        dialog.stride_spin.setValue(4)
+        dialog._on_run()
+
+        assert dialog.result['stride'] == 4
+        dialog.close()
+
+    def test_stride_spinbox_boundary_values(self, qt_app):
+        """Stride SpinBox respects range 1-32."""
+        from proxyl_analysis.ui.parameter_map_options import ParameterMapOptionsDialog
+
+        dialog = ParameterMapOptionsDialog(max_z=8, current_z=4)
+
+        # Minimum
+        dialog.stride_spin.setValue(1)
+        assert dialog.stride_spin.value() == 1
+
+        # Maximum
+        dialog.stride_spin.setValue(32)
+        assert dialog.stride_spin.value() == 32
+
+        # Beyond max clamps
+        dialog.stride_spin.setValue(64)
+        assert dialog.stride_spin.value() == 32
+
+        # Below min clamps
+        dialog.stride_spin.setValue(0)
+        assert dialog.stride_spin.value() == 1
+
+        dialog.close()
+
+    def test_stride_help_text_present(self, qt_app):
+        """Stride section includes explanatory help text."""
+        from proxyl_analysis.ui.parameter_map_options import ParameterMapOptionsDialog
+
+        dialog = ParameterMapOptionsDialog(max_z=8, current_z=4)
+
+        # Find label containing help text
+        from PySide6.QtWidgets import QLabel
+        labels = dialog.findChildren(QLabel)
+        help_texts = [l.text() for l in labels if 'full resolution' in l.text()]
+
+        assert len(help_texts) >= 1, "Expected help text with 'full resolution'"
+        assert 'faster' in help_texts[0].lower() or 'coarser' in help_texts[0].lower()
+
+        dialog.close()
+
 
 # ============================================================================
 # 17. Parameter Map Results Metrics Tests

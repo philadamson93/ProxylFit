@@ -60,7 +60,8 @@ class ParameterMappingWorker(QThread):
                 progress_callback=self._emit_progress,
                 roi_mask=self.roi_mask,
                 kernel_type=self.options['kernel_type'],
-                injection_time_index=self.injection_idx
+                injection_time_index=self.injection_idx,
+                stride=self.options.get('stride', 1)
             )
 
             if not self._is_cancelled:
@@ -390,6 +391,23 @@ class ParameterMapOptionsDialog(QDialog):
 
         layout.addLayout(size_layout)
 
+        # Stride (downsampling step)
+        stride_layout = QHBoxLayout()
+        stride_layout.addWidget(QLabel("Stride:"))
+
+        self.stride_spin = QSpinBox()
+        self.stride_spin.setRange(1, 32)
+        self.stride_spin.setValue(1)
+        self.stride_spin.setSingleStep(1)
+        stride_layout.addWidget(self.stride_spin)
+
+        stride_info = QLabel("(1 = full resolution, higher = faster/coarser)")
+        stride_info.setStyleSheet("color: #666; font-size: 11px;")
+        stride_layout.addWidget(stride_info)
+        stride_layout.addStretch()
+
+        layout.addLayout(stride_layout)
+
         parent_layout.addWidget(group)
 
     def _create_injection_section(self, parent_layout):
@@ -469,6 +487,9 @@ class ParameterMapOptionsDialog(QDialog):
                 self.window_y_spin.value(),
                 self.window_z_spin.value()
             ),
+
+            # Stride (downsampling)
+            'stride': self.stride_spin.value(),
 
             # Injection time
             'reuse_injection': self.reuse_injection_radio.isChecked(),

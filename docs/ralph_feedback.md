@@ -5,8 +5,8 @@ Tracking document for feedback items from Ralph's initial review.
 ## Summary
 
 - **7 bug fixes**: All resolved and tested
-- **1 feature addition**: Item 7 (pixel readout)
-- **2 feature requests**: Open (Items 6, 8)
+- **2 feature additions**: Item 7 (pixel readout), Item 8 (stride-based downsampling)
+- **1 feature request**: Open (Item 6)
 - **1 non-issue**: Operator error (Item 2)
 
 ## Bug Fixes (Complete)
@@ -110,12 +110,27 @@ Operator error — user was selecting the wrong folder. No code change needed. S
 
 ---
 
+## Feature Additions (Complete) — continued
+
+### Item 8 — Stride-based Downsampling for Parameter Maps
+
+**Problem:** Parameter mapping at full resolution is very slow for large images. Users wanted support for coarser-resolution mapping (e.g., 32×32 or 16×16 effective grids).
+
+**Fix:** Added a `stride` parameter to `create_parameter_maps()` and the UI dialog:
+- `stride=1` fits every pixel (full resolution, default — no change to existing behavior)
+- `stride=N` fits every Nth pixel and fills NxN blocks with nearest-neighbor values
+- Output maps remain full-size for DICOM overlay compatibility
+- UI: new "Stride" SpinBox in the Kernel Configuration section of the Parameter Map Options dialog
+- CLI: new `--stride` argument for batch mode
+
+**Files modified:** `proxyl_analysis/parameter_mapping.py`, `proxyl_analysis/ui/parameter_map_options.py`, `proxyl_analysis/run_analysis.py`
+
+**Tests:** `TestParameterMapStride` in `tests/test_user_feedback_fixes.py` (5 tests)
+
+---
+
 ## Feature Requests (Open)
 
 ### Item 6 — Parameter Map Improvements
 
 Requested improvements to parameter map visualization. Details TBD.
-
-### Item 8 — Image Decimation (32×32 / 16×16)
-
-Support for downsampled parameter mapping at coarser resolutions. Details TBD.

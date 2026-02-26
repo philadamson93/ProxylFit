@@ -228,7 +228,14 @@ def main():
         type=int,
         help='Z-slice for 2D parameter mapping (if not specified, processes all slices)'
     )
-    
+
+    parser.add_argument(
+        '--stride',
+        type=int,
+        default=1,
+        help='Spatial stride for parameter mapping (1 = full resolution, higher = faster/coarser)'
+    )
+
     parser.add_argument(
         '--skip-roi-analysis',
         action='store_true',
@@ -1134,7 +1141,8 @@ def main():
                 window_size=window_size,
                 z_slice=args.map_slice,
                 time_units=args.time_units,
-                progress_callback=print_progress
+                progress_callback=print_progress,
+                stride=args.stride
             )
             
             # Visualize parameter maps
