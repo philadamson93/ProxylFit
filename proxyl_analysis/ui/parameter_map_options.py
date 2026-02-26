@@ -393,12 +393,17 @@ class ParameterMapOptionsDialog(QDialog):
 
         # Stride (downsampling step)
         stride_layout = QHBoxLayout()
-        stride_layout.addWidget(QLabel("Stride:"))
+        stride_layout.addWidget(QLabel("Pixel stride:"))
 
         self.stride_spin = QSpinBox()
         self.stride_spin.setRange(1, 32)
         self.stride_spin.setValue(1)
         self.stride_spin.setSingleStep(1)
+        self.stride_spin.setToolTip(
+            "Skip pixels to trade resolution for speed.\n"
+            "Stride=1: fit every pixel (full resolution)\n"
+            "Stride=8: fit every 8th pixel (~64× faster)"
+        )
         stride_layout.addWidget(self.stride_spin)
 
         stride_info = QLabel("(1 = full resolution, higher = faster/coarser)")

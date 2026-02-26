@@ -65,6 +65,9 @@ python proxyl_analysis/run_analysis.py --dicom data.dcm --z 4 --auto-load
 
 # Create parameter maps
 python proxyl_analysis/run_analysis.py --dicom data.dcm --z 4 --create-parameter-maps
+
+# Create parameter maps with stride (faster, coarser resolution)
+python proxyl_analysis/run_analysis.py --dicom data.dcm --z 4 --create-parameter-maps --stride 8
 ```
 
 ## Next Steps

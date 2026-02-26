@@ -146,6 +146,10 @@ From the main menu, click **"Create Parameter Maps"**.
 **Options dialog:**
 - **Scope**: Single slice or all slices
 - **ROI**: Reuse existing ROI, draw new one, or compute for entire image
+- **Kernel Configuration**:
+  - **Kernel type**: Sliding window (default), Gaussian, Uniform, or Box
+  - **Window size**: Size of the spatial averaging kernel (e.g., 5×5×1 voxels)
+  - **Stride**: Controls spatial resolution vs. speed trade-off. Stride=1 fits every pixel (full resolution). Higher values skip pixels — e.g., stride=8 on a 256×256 image fits a 32×32 grid (~64× faster). Output maps remain full-size with nearest-neighbor fill.
 - **Injection time**: Reuse from ROI analysis or select new
 
 After computation, the results viewer opens:
@@ -246,6 +250,7 @@ Draw an ROI and select injection time first.
 First registration takes several minutes. Subsequent loads use cached data.
 
 ### Parameter mapping is slow
+- **Increase stride** (e.g., stride=4 or stride=8) for a quick preview at coarser resolution
 - Use smaller window size
 - Use "Single Slice" mode
 - Use "ROI Only" to limit computation area

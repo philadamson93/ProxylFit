@@ -125,7 +125,7 @@ Operator error — user was selecting the wrong folder. No code change needed. S
 
 **Files modified:** `proxyl_analysis/parameter_mapping.py`, `proxyl_analysis/ui/parameter_map_options.py`, `proxyl_analysis/run_analysis.py`
 
-**Tests:** `TestParameterMapStride` in `tests/test_user_feedback_fixes.py` (5 tests)
+**Tests:** `TestParameterMapStride`, `TestParameterMapStrideWorker`, `TestParameterMapStrideIntegration`, `TestParameterMapStrideCLI` in `tests/test_user_feedback_fixes.py` and `TestParameterMapOptionsDialog` stride tests in `tests/test_gui_workflows.py` (23 tests total)
 
 ---
 
