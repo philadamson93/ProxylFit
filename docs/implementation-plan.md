@@ -27,7 +27,7 @@ This document tracks the implementation of the main workflow menu (T006) and rel
 | 4 | T005 | Pixel-Level Parameter Maps | planned |
 | 5 | T006 Phase 2 | Polish, additional export formats | planned |
 
-**Backlog**: T004 (Temporal Smoothing)
+**Backlog**: T004 (Temporal Smoothing), T008 (Parallel Parameter Maps), T009 (Fitting Settings UI)
 
 ## Completed Features
 
@@ -79,6 +79,19 @@ This document tracks the implementation of the main workflow menu (T006) and rel
 ### Files to Modify
 - `proxyl_analysis/parameter_mapping.py` - Add `fit_pixel_level_maps()`
 - `proxyl_analysis/ui.py` - Progress dialog
+
+## T008: Parallel Parameter Map Generation (Future)
+
+- Parallelize the per-pixel fitting loop in `create_parameter_maps` using `concurrent.futures.ProcessPoolExecutor`
+- Expected near-linear speedup with core count (4-8x typical)
+- See **`docs/plan-parallel-parameter-maps.md`** for full design
+
+## T009: Fitting Settings UI (Future)
+
+- Expose all fitting parameters (rate constant bounds, quality thresholds, optimizer settings) via a new dialog
+- Save chosen settings as metadata alongside fits and parameter maps for reproducibility
+- Persist user preferences across sessions
+- See **`docs/plan-fitting-settings-ui.md`** for full design
 
 ## Notes
 
