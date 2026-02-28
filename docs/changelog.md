@@ -2,6 +2,14 @@
 
 All notable changes to ProxylFit are documented here.
 
+## [1.3.0] - February 2026
+
+### Added
+- **Parallel parameter map generation (T008)** — voxel fitting now uses `ProcessPoolExecutor` with shared memory for near-linear speedup with CPU core count; `parallel=True` is the default; sequential fallback available via `parallel=False`
+- New metadata fields `parallel` and `num_workers` recorded in parameter map output
+
+---
+
 ## [1.2.2] - February 2025
 
 ### Added
