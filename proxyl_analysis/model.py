@@ -176,11 +176,11 @@ def estimate_initial_parameters_extended(time: np.ndarray, signal: np.ndarray) -
     dict
         Initial parameter estimates
     """
-    # tail level ~ median of last ~20% of points
-    tail = signal[int(0.8*len(signal)):]
+    # tail level ~ median of last ~10% of points
+    tail = signal[int(0.9*len(signal)):]
     tail_level = float(np.median(tail))
 
-    A0_est = np.mean(signal[:max(3, int(0.05*len(signal)))])  # early baseline
+    A0_est = np.mean(signal[:max(3, int(0.04*len(signal)))])  # early baseline
     A2_est = tail_level - A0_est      # can be negative  
 
     # keep your A1_est as before or set from peak - baseline
@@ -404,7 +404,7 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             print("Fallback fitting succeeded with relaxed constraints.")
             
             # Calculate fitted curve
-            fitted_signal = proxyl_kinetic_model_extended(time, A0_fit, A1_fit, A2_fit, 
+            fitted_signal = proxyl_kinetic_model_extended(time, A0_fit, A1_fit, A2_fit,
                                                          kb_fit, kd_fit, knt_fit, 
                                                          t0_fit, tmax_fit)
             
@@ -431,6 +431,8 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                 'A0': A0_fit,
                 'A1': A1_fit,
                 'A2': A2_fit,
+                'A0_est': initial_params['A0'],
+                'A2_est': initial_params['A2'],
                 'kb': kb_fit,
                 'kd': kd_fit,
                 'knt': knt_fit,
