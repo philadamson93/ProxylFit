@@ -67,13 +67,19 @@ class FitResultsDialog(QDialog):
         params_group = QGroupBox("Fitted Parameters")
         params_grid = QGridLayout(params_group)
 
+        # Initial estimates (may be absent on legacy sessions)
+        a0_est = self.fit_results.get('A0_est')
+        a2_est = self.fit_results.get('A2_est')
+        a0_init = f"  (init: {a0_est:.3f})" if a0_est is not None else ""
+        a2_init = f"  (init: {a2_est:.3f})" if a2_est is not None else ""
+
         params = [
             ("kb (buildup)", f"{self.fit_results['kb']:.4f} ± {self.fit_results['kb_error']:.4f}"),
             ("kd (decay)", f"{self.fit_results['kd']:.4f} ± {self.fit_results['kd_error']:.4f}"),
             ("knt (non-tracer)", f"{self.fit_results['knt']:.4f} ± {self.fit_results['knt_error']:.4f}"),
-            ("A0 (baseline)", f"{self.fit_results['A0']:.3f} ± {self.fit_results['A0_error']:.3f}"),
+            ("A0 (baseline)", f"{self.fit_results['A0']:.3f} ± {self.fit_results['A0_error']:.3f}{a0_init}"),
             ("A1 (amplitude)", f"{self.fit_results['A1']:.3f} ± {self.fit_results['A1_error']:.3f}"),
-            ("A2 (non-tracer)", f"{self.fit_results['A2']:.3f} ± {self.fit_results['A2_error']:.3f}"),
+            ("A2 (non-tracer)", f"{self.fit_results['A2']:.3f} ± {self.fit_results['A2_error']:.3f}{a2_init}"),
             ("t0 (onset)", f"{self.fit_results['t0']:.2f} ± {self.fit_results['t0_error']:.2f}"),
             ("tmax (NTE onset)", f"{self.fit_results['tmax']:.2f} ± {self.fit_results['tmax_error']:.2f}"),
         ]
@@ -99,10 +105,19 @@ class FitResultsDialog(QDialog):
             self.pct_enhancement = float('nan')
             self.pct_nte = float('nan')
 
+        # Initial-estimate version of %NTE (may be absent on legacy sessions)
+        if a0_est is not None and a2_est is not None and a0_est != 0:
+            self.pct_nte_est = (a2_est / a0_est) * 100
+        else:
+            self.pct_nte_est = float('nan')
+
         derived_grid.addWidget(QLabel("%Enhancement (A1/A0):"), 0, 0)
         derived_grid.addWidget(QLabel(f"{self.pct_enhancement:.1f}%"), 0, 1)
         derived_grid.addWidget(QLabel("%NTE (A2/A0):"), 1, 0)
         derived_grid.addWidget(QLabel(f"{self.pct_nte:.1f}%"), 1, 1)
+        derived_grid.addWidget(QLabel("%NTE_est (A2_est/A0_est):"), 2, 0)
+        nte_est_text = f"{self.pct_nte_est:.1f}%" if not np.isnan(self.pct_nte_est) else "—"
+        derived_grid.addWidget(QLabel(nte_est_text), 2, 1)
 
         params_layout.addWidget(derived_group)
 
@@ -168,10 +183,22 @@ class FitResultsDialog(QDialog):
         r = self.fit_results
         time_units = r.get('time_units', 'minutes')
 
+        # Initial-estimate values (may be absent on legacy sessions). Render
+        # missing values as empty cells so the column lines up.
+        a0_est = r.get('A0_est')
+        a2_est = r.get('A2_est')
+        a0_est_cell = a0_est if a0_est is not None else ''
+        a2_est_cell = a2_est if a2_est is not None else ''
+        pct_nte_est_cell = (
+            self.pct_nte_est if not np.isnan(self.pct_nte_est) else ''
+        )
+
         rows = [
             ('A0', 'baseline signal', r['A0'], r['A0_error'], ''),
+            ('A0_est', 'baseline signal (initial estimate)', a0_est_cell, '', ''),
             ('A1', 'tracer amplitude', r['A1'], r['A1_error'], ''),
             ('A2', 'non-tracer amplitude', r['A2'], r['A2_error'], ''),
+            ('A2_est', 'non-tracer amplitude (initial estimate)', a2_est_cell, '', ''),
             ('kb', 'buildup rate', r['kb'], r['kb_error'], f'1/{time_units}'),
             ('kd', 'decay rate', r['kd'], r['kd_error'], f'1/{time_units}'),
             ('knt', 'non-tracer rate', r['knt'], r['knt_error'], f'1/{time_units}'),
@@ -179,6 +206,7 @@ class FitResultsDialog(QDialog):
             ('tmax', 'NTE onset', r['tmax'], r['tmax_error'], time_units),
             ('%Enhancement', 'A1/A0 * 100', self.pct_enhancement, '', '%'),
             ('%NTE', 'A2/A0 * 100', self.pct_nte, '', '%'),
+            ('%NTE_est', 'A2_est/A0_est * 100', pct_nte_est_cell, '', '%'),
             ('R_squared', 'goodness of fit', r['r_squared'], '', ''),
             ('RMSE', 'root mean square error', r['rmse'], '', ''),
         ]
@@ -193,14 +221,17 @@ class FitResultsDialog(QDialog):
                               f"Results table saved to:\n{save_path}")
 
     def _save_plot(self):
-        """Save the plot to file."""
-        if self.save_path:
-            save_path = self.save_path
-        else:
-            save_path, _ = QFileDialog.getSaveFileName(
-                self, "Save Plot", "kinetic_fit.png",
-                "PNG Files (*.png);;PDF Files (*.pdf);;All Files (*)"
-            )
+        """Save the plot to file.
+
+        Always prompt the user — even when the GUI workflow seeded a default
+        path — so several ROIs in a row can be saved under different names
+        instead of overwriting the same file.
+        """
+        default_path = self.save_path or "kinetic_fit.png"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Plot", default_path,
+            "PNG Files (*.png);;PDF Files (*.pdf);;All Files (*)"
+        )
 
         if save_path:
             self.canvas.fig.savefig(save_path, dpi=300, bbox_inches='tight')

@@ -1050,15 +1050,27 @@ def main():
                     elif export_type == 'registration_report':
                         print(f"Registration metrics saved to: {auto_registration_dir / 'registration_metrics.json'}")
                     elif export_type == 'timeseries' and roi_state is not None:
-                        # Export time series CSV
-                        csv_file = auto_registration_dir / "roi_timeseries.csv"
+                        # Export time series CSV. Prompt for the filename so
+                        # multiple ROIs can be saved side-by-side instead of
+                        # overwriting a single fixed file.
+                        from PySide6.QtWidgets import QFileDialog
                         import csv
-                        with open(csv_file, 'w', newline='') as f:
-                            writer = csv.writer(f)
-                            writer.writerow(['time', 'signal'])
-                            for t, s in zip(time_array, roi_state['roi_signal']):
-                                writer.writerow([t, s])
-                        print(f"Time series CSV saved to: {csv_file}")
+
+                        default_csv = auto_registration_dir / "roi_timeseries.csv"
+                        save_path, _ = QFileDialog.getSaveFileName(
+                            None, "Save Time Series CSV", str(default_csv),
+                            "CSV Files (*.csv);;All Files (*)"
+                        )
+                        if save_path:
+                            csv_file = Path(save_path)
+                            with open(csv_file, 'w', newline='') as f:
+                                writer = csv.writer(f)
+                                writer.writerow(['time', 'signal'])
+                                for t, s in zip(time_array, roi_state['roi_signal']):
+                                    writer.writerow([t, s])
+                            print(f"Time series CSV saved to: {csv_file}")
+                        else:
+                            print("Time series CSV export cancelled.")
                     print("Export complete.")
                     continue  # Return to menu
 

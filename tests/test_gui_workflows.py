@@ -1727,10 +1727,12 @@ class TestInjectionTimeExport:
             sample_time_array, signal, 'minutes', str(temp_dir)
         )
 
-        with patch('PySide6.QtWidgets.QMessageBox.information'):
-            dialog._export_csv()
-
         csv_file = temp_dir / "timecourse_data.csv"
+        with patch('PySide6.QtWidgets.QFileDialog.getSaveFileName',
+                   return_value=(str(csv_file), 'CSV Files (*.csv)')):
+            with patch('PySide6.QtWidgets.QMessageBox.information'):
+                dialog._export_csv()
+
         assert csv_file.exists()
 
         with open(csv_file, 'r') as f:
@@ -1752,10 +1754,12 @@ class TestInjectionTimeExport:
             sample_time_array, signal, 'minutes', str(temp_dir)
         )
 
-        with patch('PySide6.QtWidgets.QMessageBox.information'):
-            dialog._export_csv()
-
         csv_file = temp_dir / "timecourse_data.csv"
+        with patch('PySide6.QtWidgets.QFileDialog.getSaveFileName',
+                   return_value=(str(csv_file), 'CSV Files (*.csv)')):
+            with patch('PySide6.QtWidgets.QMessageBox.information'):
+                dialog._export_csv()
+
         with open(csv_file, 'r') as f:
             reader = csv.reader(f)
             next(reader)  # skip header

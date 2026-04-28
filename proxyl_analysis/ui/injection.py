@@ -7,7 +7,8 @@ from pathlib import Path
 import numpy as np
 
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox, QStatusBar, QMessageBox
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox, QStatusBar,
+    QMessageBox, QFileDialog,
 )
 from PySide6.QtCore import Signal
 
@@ -164,11 +165,23 @@ class InjectionTimeSelectorDialog(QDialog):
         )
 
     def _export_csv(self):
-        """Export timecourse data to CSV."""
+        """Export timecourse data to CSV.
+
+        Always prompt the user for a filename so several ROIs can be saved
+        side-by-side instead of overwriting the same file each time.
+        """
         import csv
 
         Path(self.output_dir).mkdir(exist_ok=True, parents=True)
-        csv_file = Path(self.output_dir) / "timecourse_data.csv"
+        default_path = str(Path(self.output_dir) / "timecourse_data.csv")
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Timecourse CSV", default_path,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not save_path:
+            return
+
+        csv_file = Path(save_path)
 
         try:
             with open(csv_file, 'w', newline='') as f:
