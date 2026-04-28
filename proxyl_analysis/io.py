@@ -1322,12 +1322,16 @@ def save_parameter_map_as_dicom(
         List of paths to saved DICOM file(s)
     """
     import pydicom
+    import shutil
     from pydicom.dataset import FileDataset
 
     output_path = Path(output_dir)
 
-    # Create subfolder for this parameter map
+    # Create subfolder for this parameter map. Wipe any prior export first so
+    # stale files from a previous run with a different slice count or naming
+    # scheme don't get picked up alongside the fresh series.
     map_dir = output_path / map_name
+    shutil.rmtree(map_dir, ignore_errors=True)
     map_dir.mkdir(parents=True, exist_ok=True)
 
     # Get source metadata
