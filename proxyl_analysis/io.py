@@ -16,6 +16,64 @@ import numpy as np
 import SimpleITK as sitk
 
 
+def _z_step_from_multiframe_ipp(ds) -> Optional[float]:
+    """
+    Compute the geometric Z step (mm) from a multi-frame DICOM's per-frame
+    ImagePositionPatient values.
+
+    This is the most reliable way to determine slice-to-slice distance
+    because it measures the actual slice geometry rather than trusting tags.
+    Some scanners populate SliceThickness with the slice profile width
+    (which can be smaller than the slice spacing when there's a gap) and
+    omit SpacingBetweenSlices entirely.
+
+    Parameters
+    ----------
+    ds : pydicom.Dataset
+        Multi-frame DICOM dataset.
+
+    Returns
+    -------
+    float or None
+        Average distance between adjacent unique z-positions, in mm.
+        Returns None if the dataset isn't multi-frame, has no per-frame
+        position info, or only spans a single z-position.
+    """
+    pfs = getattr(ds, 'PerFrameFunctionalGroupsSequence', None)
+    if not pfs:
+        return None
+
+    z_positions = []
+    for frame in pfs:
+        ipp = None
+        pps = getattr(frame, 'PlanePositionSequence', None)
+        if pps and len(pps) > 0:
+            ipp = getattr(pps[0], 'ImagePositionPatient', None)
+        if ipp is None:
+            ipp = getattr(frame, 'ImagePositionPatient', None)
+        if ipp is not None and len(ipp) >= 3:
+            try:
+                z_positions.append(float(ipp[2]))
+            except (TypeError, ValueError):
+                pass
+
+    if len(z_positions) < 2:
+        return None
+
+    # Many multi-frame DICOMs repeat the same set of z-positions across
+    # timepoints, so dedupe to the unique geometric slice positions before
+    # computing the step.
+    unique = sorted({round(z, 4) for z in z_positions})
+    if len(unique) < 2:
+        return None
+
+    diffs = [unique[i + 1] - unique[i] for i in range(len(unique) - 1)]
+    if not diffs:
+        return None
+    step = abs(sum(diffs) / len(diffs))
+    return step if step > 0 else None
+
+
 def _extract_robust_spacing(filepath: str) -> Tuple[float, float, float]:
     """
     Extract voxel spacing using multiple robust methods.
@@ -48,12 +106,14 @@ def _extract_robust_spacing(filepath: str) -> Tuple[float, float, float]:
             y_spacing = float(ds.PixelSpacing[0])  # Row spacing (Y)
             x_spacing = float(ds.PixelSpacing[1])  # Column spacing (X)
             
-        # Check SliceThickness
-        if hasattr(ds, 'SliceThickness'):
-            z_spacing = float(ds.SliceThickness)
-        elif hasattr(ds, 'SpacingBetweenSlices'):
+        # Z-spacing: prefer SpacingBetweenSlices (true center-to-center distance)
+        # over SliceThickness (which only describes the thickness of one slice
+        # and ignores any gap between slices in non-contiguous acquisitions).
+        if hasattr(ds, 'SpacingBetweenSlices') and ds.SpacingBetweenSlices is not None:
             z_spacing = float(ds.SpacingBetweenSlices)
-        
+        elif hasattr(ds, 'SliceThickness') and ds.SliceThickness is not None:
+            z_spacing = float(ds.SliceThickness)
+
         # Check multi-frame DICOM (Enhanced DICOM)
         if hasattr(ds, 'SharedFunctionalGroupsSequence'):
             for group in ds.SharedFunctionalGroupsSequence:
@@ -62,13 +122,26 @@ def _extract_robust_spacing(filepath: str) -> Tuple[float, float, float]:
                     if hasattr(pm, 'PixelSpacing') and len(pm.PixelSpacing) >= 2:
                         y_spacing = float(pm.PixelSpacing[0])
                         x_spacing = float(pm.PixelSpacing[1])
-                    if hasattr(pm, 'SliceThickness'):
+                    # Same preference order: SpacingBetweenSlices first
+                    if hasattr(pm, 'SpacingBetweenSlices') and pm.SpacingBetweenSlices is not None:
+                        z_spacing = float(pm.SpacingBetweenSlices)
+                    elif hasattr(pm, 'SliceThickness') and pm.SliceThickness is not None:
                         z_spacing = float(pm.SliceThickness)
         
+        # Geometric truth wins: if this is a multi-frame DICOM with per-frame
+        # ImagePositionPatient values, derive Z spacing from those positions
+        # directly. SliceThickness can describe the slice profile rather than
+        # the slice-to-slice distance (e.g., 0.75 mm thick slices with a
+        # 0.75 mm gap = 1.5 mm spacing), and SpacingBetweenSlices is sometimes
+        # absent from vendor exports.
+        ipp_z = _z_step_from_multiframe_ipp(ds)
+        if ipp_z is not None:
+            z_spacing = ipp_z
+
         # Default Z spacing if not found
         if z_spacing is None:
             z_spacing = 1.0
-            
+
         if x_spacing is not None and y_spacing is not None:
             spacing = (x_spacing, y_spacing, z_spacing)
             return spacing
@@ -94,12 +167,15 @@ def _extract_robust_spacing(filepath: str) -> Tuple[float, float, float]:
                 y_spacing = float(parts[0])  # Row spacing
                 x_spacing = float(parts[1])  # Column spacing
                 
-                # Get Z spacing
+                # Get Z spacing — prefer SpacingBetweenSlices over SliceThickness
                 z_spacing = 1.0  # Default
+                spacing_between_slices_tag = "0018|0088"  # SpacingBetweenSlices
                 slice_thickness_tag = "0018|0050"  # SliceThickness
-                if reader.HasMetaDataKey(slice_thickness_tag):
+                if reader.HasMetaDataKey(spacing_between_slices_tag):
+                    z_spacing = float(reader.GetMetaData(spacing_between_slices_tag))
+                elif reader.HasMetaDataKey(slice_thickness_tag):
                     z_spacing = float(reader.GetMetaData(slice_thickness_tag))
-                
+
                 spacing = (x_spacing, y_spacing, z_spacing)
                 return spacing
                 
