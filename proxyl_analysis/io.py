@@ -1347,6 +1347,11 @@ def save_parameter_map_as_dicom(
         'r_squared_map': 'R-squared (fit quality)',
         'a1_amplitude_map': 'Tracer Amplitude (A1)',
         'a2_amplitude_map': 'Non-tracer Amplitude (A2)',
+        'a0_est_map': 'Baseline initial estimate (A0_est)',
+        'a2_est_map': 'Non-tracer Amplitude initial estimate (A2_est)',
+        'a1_percent_map': '%Enhancement (A1/A0)',
+        'a2_percent_map': '%NTE (A2/A0)',
+        'a2_percent_est_map': '%NTE_est (A2_est/A0_est)',
         'baseline_map': 'Baseline (A0)',
         't0_map': 'Tracer Onset (t0)',
         'tmax_map': 'Non-tracer Onset (tmax)'
@@ -1364,7 +1369,9 @@ def save_parameter_map_as_dicom(
     map_offsets = {
         'kb_map': 4000, 'kd_map': 4100, 'knt_map': 4200,
         'r_squared_map': 4300, 'a1_amplitude_map': 4400, 'a2_amplitude_map': 4500,
-        'baseline_map': 4600, 't0_map': 4700, 'tmax_map': 4800
+        'baseline_map': 4600, 't0_map': 4700, 'tmax_map': 4800,
+        'a1_percent_map': 4900, 'a2_percent_map': 5000,
+        'a0_est_map': 5100, 'a2_est_map': 5200, 'a2_percent_est_map': 5300,
     }
     series_offset = map_offsets.get(map_name, 4000)
 

@@ -607,6 +607,7 @@ class ParameterMapResultsDialog(QDialog):
             "R-squared (fit quality)",
             "%Enhancement (A1/A0)",
             "%NTE (A2/A0)",
+            "%NTE_est (A2_est/A0_est)",
         ])
         self.map_combo.currentIndexChanged.connect(self._on_map_changed)
         map_layout.addWidget(self.map_combo)
@@ -750,7 +751,7 @@ class ParameterMapResultsDialog(QDialog):
         """Handle map selection change."""
         map_keys = [
             'kb_map', 'kd_map', 'knt_map', 'r_squared_map',
-            'a1_percent_map', 'a2_percent_map',
+            'a1_percent_map', 'a2_percent_map', 'a2_percent_est_map',
         ]
         self.current_map = map_keys[index] if index < len(map_keys) else 'kb_map'
         self._update_display()
@@ -931,6 +932,15 @@ class ParameterMapResultsDialog(QDialog):
                 'a2_percent_map', mode='symmetric',
                 max_limit=NTE_RANGE_MAX,
             )
+        elif self.current_map == 'a2_percent_est_map':
+            # %NTE_est shares the diverging LUT, the symmetric auto-range,
+            # and the ±NTE_RANGE_MAX cap so it can be visually compared
+            # slice-for-slice against the fitted %NTE map.
+            cmap = nte_diverging
+            vmin, vmax = self._percent_display_range(
+                'a2_percent_est_map', mode='symmetric',
+                max_limit=NTE_RANGE_MAX,
+            )
         else:
             cmap = 'plasma'
             vmin, vmax = None, None
@@ -975,8 +985,11 @@ class ParameterMapResultsDialog(QDialog):
             'r_squared_map': 'R-squared',
             'a1_amplitude_map': 'A1 (tracer amplitude)',
             'a2_amplitude_map': 'A2 (non-tracer amplitude)',
+            'a0_est_map': 'A0_est (baseline initial estimate)',
+            'a2_est_map': 'A2_est (non-tracer initial estimate)',
             'a1_percent_map': '%Enhancement (A1/A0)',
             'a2_percent_map': '%NTE (A2/A0)',
+            'a2_percent_est_map': '%NTE_est (A2_est/A0_est)',
         }
         self.ax.set_title(f"{title_map.get(self.current_map, self.current_map)} (z={self.current_z})")
         self.ax.axis('off')
@@ -1028,6 +1041,7 @@ class ParameterMapResultsDialog(QDialog):
             ('r_squared_map', 'R-squared'),
             ('a1_percent_map', '%Enhancement'),
             ('a2_percent_map', '%NTE'),
+            ('a2_percent_est_map', '%NTE_est'),
         ]
 
         for key, name in param_names:
@@ -1085,6 +1099,7 @@ class ParameterMapResultsDialog(QDialog):
             'r_squared_map': 'R² (fit quality)',
             'a1_percent_map': '%Enhancement (A1/A0)',
             'a2_percent_map': '%NTE (A2/A0)',
+            'a2_percent_est_map': '%NTE_est (A2_est/A0_est)',
             'a1_amplitude_map': 'A1 (amplitude)',
             'a2_amplitude_map': 'A2 (non-tracer amplitude)',
         }

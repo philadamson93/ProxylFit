@@ -46,9 +46,10 @@ def _fit_pixel(pos):
     Returns
     -------
     tuple or None
-        (x, y, z_idx, kb, kd, knt, r_squared, A1, A2, A0, t0, tmax) on success,
-        or None when the pixel is below the signal threshold, too noisy, or
-        the fit fails / is too poor (R² <= 0.1).
+        (x, y, z_idx, kb, kd, knt, r_squared, A1, A2, A0, t0, tmax,
+        A0_est, A2_est) on success, or None when the pixel is below the
+        signal threshold, too noisy, or the fit fails / is too poor
+        (R² <= 0.1).
     """
     x, y, z, z_idx = pos
     ctx = _PIXEL_WORKER_CTX
@@ -98,6 +99,12 @@ def _fit_pixel(pos):
         fit_results['r_squared'],
         fit_results['A1'], fit_results['A2'], fit_results['A0'],
         fit_results['t0'], fit_results['tmax'],
+        # Initial estimates of A0 and A2 (from estimate_initial_parameters_extended).
+        # These power the %NTE_est map and may be absent on legacy fit_results
+        # dicts — fall back to the fitted values so the result tuple shape
+        # stays fixed across worker versions.
+        fit_results.get('A0_est', fit_results['A0']),
+        fit_results.get('A2_est', fit_results['A2']),
     )
 
 
@@ -199,6 +206,8 @@ def create_parameter_maps(registered_4d: np.ndarray,
     r_squared_map = np.full(output_shape, np.nan)
     a1_amplitude_map = np.full(output_shape, np.nan)  # Tracer amplitude
     a2_amplitude_map = np.full(output_shape, np.nan)  # Non-tracer amplitude
+    a0_est_map = np.full(output_shape, np.nan)        # Initial-estimate baseline
+    a2_est_map = np.full(output_shape, np.nan)        # Initial-estimate non-tracer amp
     baseline_map = np.full(output_shape, np.nan)
     t0_map = np.full(output_shape, np.nan)  # Tracer onset time
     tmax_map = np.full(output_shape, np.nan)  # Non-tracer onset time
@@ -254,7 +263,8 @@ def create_parameter_maps(registered_4d: np.ndarray,
         """Write a fit-result tuple into the output maps."""
         if result is None:
             return
-        x, y, z_idx, kb, kd, knt, r2, A1, A2, A0, t0, tmax = result
+        (x, y, z_idx, kb, kd, knt, r2,
+         A1, A2, A0, t0, tmax, A0_est, A2_est) = result
         x_end_blk = min(x + stride, x_size)
         y_end_blk = min(y + stride, y_size)
         kb_map[x:x_end_blk, y:y_end_blk, z_idx] = kb
@@ -263,6 +273,8 @@ def create_parameter_maps(registered_4d: np.ndarray,
         r_squared_map[x:x_end_blk, y:y_end_blk, z_idx] = r2
         a1_amplitude_map[x:x_end_blk, y:y_end_blk, z_idx] = A1
         a2_amplitude_map[x:x_end_blk, y:y_end_blk, z_idx] = A2
+        a0_est_map[x:x_end_blk, y:y_end_blk, z_idx] = A0_est
+        a2_est_map[x:x_end_blk, y:y_end_blk, z_idx] = A2_est
         baseline_map[x:x_end_blk, y:y_end_blk, z_idx] = A0
         t0_map[x:x_end_blk, y:y_end_blk, z_idx] = t0
         tmax_map[x:x_end_blk, y:y_end_blk, z_idx] = tmax
@@ -313,7 +325,20 @@ def create_parameter_maps(registered_4d: np.ndarray,
 
     print(f"Parameter mapping completed in {elapsed_time:.1f} seconds")
     print(f"Successful fits: {successful_fits}/{total_positions} ({success_rate:.1f}%)")
-    
+
+    # Derived percent maps:
+    #   100*A1/A0     (%Enhancement)
+    #   100*A2/A0     (%NTE — fitted)
+    #   100*A2_est/A0_est (%NTE_est — initial-estimate version)
+    # Voxels with A0<=0 (or A0_est<=0) divide-by-zero out to NaN, matching
+    # the "render as —" behavior used for derived parameters elsewhere.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        a0_safe = np.where(baseline_map > 0, baseline_map, np.nan)
+        a0_est_safe = np.where(a0_est_map > 0, a0_est_map, np.nan)
+        a1_percent_map = 100.0 * a1_amplitude_map / a0_safe
+        a2_percent_map = 100.0 * a2_amplitude_map / a0_safe
+        a2_percent_est_map = 100.0 * a2_est_map / a0_est_safe
+
     result = {
         'kb_map': kb_map,
         'kd_map': kd_map,
@@ -321,6 +346,11 @@ def create_parameter_maps(registered_4d: np.ndarray,
         'r_squared_map': r_squared_map,
         'a1_amplitude_map': a1_amplitude_map,
         'a2_amplitude_map': a2_amplitude_map,
+        'a0_est_map': a0_est_map,
+        'a2_est_map': a2_est_map,
+        'a1_percent_map': a1_percent_map,
+        'a2_percent_map': a2_percent_map,
+        'a2_percent_est_map': a2_percent_est_map,
         'baseline_map': baseline_map,
         't0_map': t0_map,
         'tmax_map': tmax_map,
@@ -655,6 +685,11 @@ def save_parameter_maps(param_maps: Dict[str, np.ndarray],
         r_squared_map=param_maps.get('r_squared_map'),
         a1_amplitude_map=param_maps.get('a1_amplitude_map'),
         a2_amplitude_map=param_maps.get('a2_amplitude_map'),
+        a0_est_map=param_maps.get('a0_est_map'),
+        a2_est_map=param_maps.get('a2_est_map'),
+        a1_percent_map=param_maps.get('a1_percent_map'),
+        a2_percent_map=param_maps.get('a2_percent_map'),
+        a2_percent_est_map=param_maps.get('a2_percent_est_map'),
         baseline_map=param_maps.get('baseline_map'),
         t0_map=param_maps.get('t0_map'),
         tmax_map=param_maps.get('tmax_map'),
@@ -728,6 +763,37 @@ def load_parameter_maps(output_dir: str) -> Tuple[Dict[str, np.ndarray], Tuple[f
         'tmax_map': data['tmax_map'],
         'mask': data['mask'],
     }
+    # Older saves may not have the percent maps; compute on the fly so
+    # legacy datasets still display them in the new viewer.
+    if 'a1_percent_map' in data.files:
+        param_maps['a1_percent_map'] = data['a1_percent_map']
+        param_maps['a2_percent_map'] = data['a2_percent_map']
+    else:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            a0_safe = np.where(param_maps['baseline_map'] > 0,
+                               param_maps['baseline_map'], np.nan)
+            param_maps['a1_percent_map'] = (
+                100.0 * param_maps['a1_amplitude_map'] / a0_safe
+            )
+            param_maps['a2_percent_map'] = (
+                100.0 * param_maps['a2_amplitude_map'] / a0_safe
+            )
+
+    # %NTE_est requires the initial-estimate raw maps (a0_est_map, a2_est_map)
+    # and the derived percent map. Legacy saves don't have any of these — leave
+    # them out of param_maps so the dropdown / metrics gracefully skip them.
+    if 'a0_est_map' in data.files:
+        param_maps['a0_est_map'] = data['a0_est_map']
+        param_maps['a2_est_map'] = data['a2_est_map']
+    if 'a2_percent_est_map' in data.files:
+        param_maps['a2_percent_est_map'] = data['a2_percent_est_map']
+    elif 'a0_est_map' in data.files and 'a2_est_map' in data.files:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            a0_est_safe = np.where(param_maps['a0_est_map'] > 0,
+                                   param_maps['a0_est_map'], np.nan)
+            param_maps['a2_percent_est_map'] = (
+                100.0 * param_maps['a2_est_map'] / a0_est_safe
+            )
     spacing = tuple(data['spacing'])
 
     # Optionally load ROI mask if present
