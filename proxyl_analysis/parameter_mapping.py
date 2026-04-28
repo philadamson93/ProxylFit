@@ -82,10 +82,14 @@ def _fit_pixel(pos):
     if cv > 2.0:
         return None
 
-    # Fit
+    # Fit. verbose=False suppresses the per-voxel "Note: <param> at upper
+    # bound" / "Warning: covariance issues" / "First fitting attempt failed"
+    # diagnostics that fit_proxyl_kinetics emits — useful for a single ROI
+    # fit, but at thousands of voxels per run they add measurable I/O cost
+    # on a Mac terminal and obscure the real progress messages.
     try:
         kb, kd, knt, _fitted, fit_results = fit_proxyl_kinetics(
-            time_array, window_signal, time_units
+            time_array, window_signal, time_units, verbose=False
         )
     except Exception:
         return None

@@ -916,9 +916,10 @@ class ParameterMapResultsDialog(QDialog):
         if 'r_squared' in self.current_map:
             cmap = 'RdYlBu_r'
             vmin, vmax = 0, 1
-        elif self.current_map == 'kd_map':
-            # kd uses the ImageJ 16_color LUT with a fixed 0–0.15 range so
-            # the discrete color bands stay comparable across datasets.
+        elif self.current_map in ('kd_map', 'knt_map'):
+            # kd and knt share the ImageJ 16_color LUT with a fixed 0–0.15
+            # range so the discrete color bands stay comparable across
+            # datasets and between the two rate parameters.
             cmap = imagej_16_colors
             vmin, vmax = KD_DISPLAY_MIN, KD_DISPLAY_MAX
         elif self.current_map == 'a1_percent_map':

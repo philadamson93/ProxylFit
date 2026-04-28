@@ -205,19 +205,27 @@ def estimate_initial_parameters_extended(time: np.ndarray, signal: np.ndarray) -
     }
 
 
-def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray, 
-                       time_units: str = 'minutes') -> Tuple[float, float, float, np.ndarray, Dict]:
+def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
+                       time_units: str = 'minutes',
+                       verbose: bool = True) -> Tuple[float, float, float, np.ndarray, Dict]:
     """
     Fit extended Proxyl kinetic model to extract rate parameters.
-    
+
     Parameters
     ----------
     time : np.ndarray
         Time points (in minutes)
-    signal : np.ndarray  
+    signal : np.ndarray
         Signal intensity values
     time_units : str
         Units for time (for display purposes)
+    verbose : bool
+        Print diagnostic ``Note``/``Warning`` messages when parameters hit
+        bounds, the covariance matrix is degenerate, or the primary fit
+        falls back to relaxed bounds. Set to ``False`` for parameter
+        mapping (thousands of fits per run) — the messages are useful for
+        a single ROI fit but become per-voxel noise at scale and slow the
+        run measurably on terminals that re-render each line.
         
     Returns
     -------
@@ -307,7 +315,7 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                 critical_bounds_hit.append(f"{name} at upper bound")
         
         # Only print warning if critical kinetic parameters hit bounds
-        if critical_bounds_hit and len(critical_bounds_hit) <= 2:  # Limit verbosity
+        if verbose and critical_bounds_hit and len(critical_bounds_hit) <= 2:
             print(f"Note: {', '.join(critical_bounds_hit)} - consider adjusting parameter bounds")
         
         # Calculate fitted curve
@@ -321,7 +329,8 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             diag_elements = np.diag(pcov)
             if np.any(diag_elements < 0) or np.any(np.isinf(diag_elements)) or np.any(np.isnan(diag_elements)):
                 # Use relative error estimation if covariance is bad
-                print("Warning: Covariance matrix has numerical issues. Using conservative error estimates.")
+                if verbose:
+                    print("Warning: Covariance matrix has numerical issues. Using conservative error estimates.")
                 param_errors = np.abs(popt) * 0.1  # 10% relative error as fallback
             else:
                 param_errors = np.sqrt(diag_elements)
@@ -330,7 +339,8 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                     if param_errors[i] > abs(popt[i]) * 2:  # Error > 200% of value
                         param_errors[i] = abs(popt[i])  # Cap at 100% error
         except Exception as e:
-            print(f"Warning: Error calculation failed ({e}). Using conservative estimates.")
+            if verbose:
+                print(f"Warning: Error calculation failed ({e}). Using conservative estimates.")
             param_errors = np.abs(popt) * 0.1  # 10% relative error as fallback
         
         # Calculate fit quality metrics
@@ -370,8 +380,9 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
         return kb_fit, kd_fit, knt_fit, fitted_signal, fit_results
 
     except Exception as e:
-        print(f"First fitting attempt failed: {e}")
-        print("Trying alternative fitting approach with relaxed constraints...")
+        if verbose:
+            print(f"First fitting attempt failed: {e}")
+            print("Trying alternative fitting approach with relaxed constraints...")
         
         try:
             # Fallback approach with relaxed bounds and different method
@@ -401,7 +412,8 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             
             A0_fit, A1_fit, A2_fit, kb_fit, kd_fit, knt_fit, t0_fit, tmax_fit = popt
             
-            print("Fallback fitting succeeded with relaxed constraints.")
+            if verbose:
+                print("Fallback fitting succeeded with relaxed constraints.")
             
             # Calculate fitted curve
             fitted_signal = proxyl_kinetic_model_extended(time, A0_fit, A1_fit, A2_fit,
