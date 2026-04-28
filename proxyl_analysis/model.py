@@ -345,6 +345,8 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             'A0': A0_fit,
             'A1': A1_fit,
             'A2': A2_fit,
+            'A0_est': initial_params['A0'],
+            'A2_est': initial_params['A2'],
             'kb': kb_fit,
             'kd': kd_fit,
             'knt': knt_fit,
@@ -352,7 +354,7 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             'tmax': tmax_fit,
             'A0_error': param_errors[0],
             'A1_error': param_errors[1],
-            'A2_error': param_errors[2], 
+            'A2_error': param_errors[2],
             'kb_error': param_errors[3],
             'kd_error': param_errors[4],
             'knt_error': param_errors[5],
@@ -364,9 +366,9 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             'covariance_matrix': pcov,
             'time_units': time_units
         }
-        
+
         return kb_fit, kd_fit, knt_fit, fitted_signal, fit_results
-        
+
     except Exception as e:
         print(f"First fitting attempt failed: {e}")
         print("Trying alternative fitting approach with relaxed constraints...")

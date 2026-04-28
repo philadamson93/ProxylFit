@@ -76,6 +76,7 @@ def sample_fit_results():
     return {
         'kb': 0.98, 'kd': 0.035, 'knt': 0.008,
         'A0': 5200.0, 'A1': 2800.0, 'A2': -400.0,
+        'A0_est': 5100.0, 'A2_est': -350.0,
         't0': 4.3, 'tmax': 30.0,
         'kb_error': 0.697, 'kd_error': 0.010, 'knt_error': 0.003,
         'A0_error': 48.5, 'A1_error': 185.3, 'A2_error': 95.0,
