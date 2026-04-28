@@ -28,6 +28,28 @@ from .styles import init_qt_app
 from .components import HeaderWidget
 
 
+# Percentile used to compute display ranges for the %Enhancement and %NTE
+# colormaps. The 99th percentile gives a robust auto-scale: outlier voxels
+# from poor fits (e.g., where A0 ≈ 0 makes the percent shoot up) saturate at
+# the LUT extremes instead of squashing the typical-signal voxels into a
+# narrow band. Edit if you want tighter or looser auto-range.
+PERCENT_RANGE_PERCENTILE = 99.0
+
+# Hard cap on the %NTE LUT extent. Even after the percentile clip, real
+# datasets can show p99(|NTE|) values > 15% from a few noisy voxels — wide
+# enough to mask the ±15% band where the meaningful non-tracer effect lives.
+# Capping at ±15 keeps the colormap focused on that band; voxels beyond it
+# saturate at the green/magenta extremes. Set to None to disable the cap and
+# let the auto-range run free. Symmetric, so the black midpoint stays on 0.
+NTE_RANGE_MAX = 15.0
+
+# Display range for the kd (decay rate) map. kd is non-negative; values
+# above the upper bound saturate at the brightest LUT color. Adjust if your
+# data sits in a different regime.
+KD_DISPLAY_MIN = 0.0
+KD_DISPLAY_MAX = 0.15
+
+
 class ParameterMappingWorker(QThread):
     """Background worker for running parameter mapping without blocking the UI."""
 
@@ -583,8 +605,8 @@ class ParameterMapResultsDialog(QDialog):
             "kd (decay rate)",
             "knt (non-tracer rate)",
             "R-squared (fit quality)",
-            "A1 (tracer amplitude)",
-            "A2 (non-tracer amplitude)"
+            "%Enhancement (A1/A0)",
+            "%NTE (A2/A0)",
         ])
         self.map_combo.currentIndexChanged.connect(self._on_map_changed)
         map_layout.addWidget(self.map_combo)
@@ -726,7 +748,10 @@ class ParameterMapResultsDialog(QDialog):
 
     def _on_map_changed(self, index: int):
         """Handle map selection change."""
-        map_keys = ['kb_map', 'kd_map', 'knt_map', 'r_squared_map', 'a1_amplitude_map', 'a2_amplitude_map']
+        map_keys = [
+            'kb_map', 'kd_map', 'knt_map', 'r_squared_map',
+            'a1_percent_map', 'a2_percent_map',
+        ]
         self.current_map = map_keys[index] if index < len(map_keys) else 'kb_map'
         self._update_display()
 
@@ -747,6 +772,59 @@ class ParameterMapResultsDialog(QDialog):
         self.overlay_opacity = value / 100.0
         self.opacity_label.setText(f"{value}%")
         self._update_display()
+
+    def _percent_display_range(self, key: str, mode: str,
+                               max_limit: Optional[float] = None):
+        """
+        Compute (vmin, vmax) for a percent map, robust to outliers, and cache
+        the result so cross-slice scrolling keeps a stable color scale.
+
+        Parameters
+        ----------
+        key : str
+            'a1_percent_map' or 'a2_percent_map'.
+        mode : str
+            'positive' for %Enhancement (vmin=0, vmax=p99), or 'symmetric'
+            for %NTE (vmin=-p99(|data|), vmax=+p99(|data|)) with black at zero.
+        max_limit : float, optional
+            Hard cap on the absolute extent of the range. Useful for the
+            %NTE map where even the percentile-clipped extent can be wider
+            than the band of interest — capping keeps the colormap focused
+            on that band and saturates outliers at the LUT extremes.
+
+        Returns
+        -------
+        (vmin, vmax) : tuple of (float | None)
+            Falls back to (None, None) — letting matplotlib auto-scale —
+            when the map is empty or entirely NaN.
+        """
+        cache_attr = f'_range_cache_{key}'
+        cached = getattr(self, cache_attr, None)
+        if cached is not None:
+            return cached
+
+        data = self.param_maps.get(key)
+        if data is None:
+            result = (None, None)
+        else:
+            finite = data[np.isfinite(data)]
+            if finite.size == 0:
+                result = (None, None)
+            elif mode == 'symmetric':
+                limit = float(np.percentile(np.abs(finite), PERCENT_RANGE_PERCENTILE))
+                if max_limit is not None:
+                    limit = min(limit, max_limit)
+                result = (-limit, limit) if limit > 0 else (None, None)
+            elif mode == 'positive':
+                limit = float(np.percentile(finite, PERCENT_RANGE_PERCENTILE))
+                if max_limit is not None:
+                    limit = min(limit, max_limit)
+                result = (0.0, limit) if limit > 0 else (None, None)
+            else:
+                raise ValueError(f"unknown range mode: {mode!r}")
+
+        setattr(self, cache_attr, result)
+        return result
 
     def _on_pixel_hover(self, event):
         """Handle mouse hover over parameter map canvas."""
@@ -822,10 +900,37 @@ class ParameterMapResultsDialog(QDialog):
         # Mask invalid values
         display_data = np.where(mask_slice, map_slice, np.nan)
 
-        # Choose colormap
+        # Choose colormap. R² uses a 0–1 diverging palette; %Enhancement uses
+        # the ImageJ 16_color discrete LUT (positive-only); %NTE uses a custom
+        # diverging LUT with black at zero so the sign of non-tracer
+        # enhancement reads at a glance. Other maps stay on plasma.
+        #
+        # Display ranges for the two percent maps are auto-scaled per dataset
+        # from the 99th percentile of the full 3D volume (see
+        # _percent_display_range), so outlier voxels saturate at the LUT
+        # extremes instead of compressing the rest of the map. The cached
+        # range is shared across all z-slices so visual comparison between
+        # slices stays consistent.
+        from .colormaps import imagej_16_colors, nte_diverging  # noqa: F401
         if 'r_squared' in self.current_map:
             cmap = 'RdYlBu_r'
             vmin, vmax = 0, 1
+        elif self.current_map == 'kd_map':
+            # kd uses the ImageJ 16_color LUT with a fixed 0–0.15 range so
+            # the discrete color bands stay comparable across datasets.
+            cmap = imagej_16_colors
+            vmin, vmax = KD_DISPLAY_MIN, KD_DISPLAY_MAX
+        elif self.current_map == 'a1_percent_map':
+            cmap = imagej_16_colors
+            vmin, vmax = self._percent_display_range(
+                'a1_percent_map', mode='positive'
+            )
+        elif self.current_map == 'a2_percent_map':
+            cmap = nte_diverging
+            vmin, vmax = self._percent_display_range(
+                'a2_percent_map', mode='symmetric',
+                max_limit=NTE_RANGE_MAX,
+            )
         else:
             cmap = 'plasma'
             vmin, vmax = None, None
@@ -869,7 +974,9 @@ class ParameterMapResultsDialog(QDialog):
             'knt_map': 'knt (non-tracer rate)',
             'r_squared_map': 'R-squared',
             'a1_amplitude_map': 'A1 (tracer amplitude)',
-            'a2_amplitude_map': 'A2 (non-tracer amplitude)'
+            'a2_amplitude_map': 'A2 (non-tracer amplitude)',
+            'a1_percent_map': '%Enhancement (A1/A0)',
+            'a2_percent_map': '%NTE (A2/A0)',
         }
         self.ax.set_title(f"{title_map.get(self.current_map, self.current_map)} (z={self.current_z})")
         self.ax.axis('off')
@@ -918,7 +1025,9 @@ class ParameterMapResultsDialog(QDialog):
             ('kb_map', 'kb (buildup)'),
             ('kd_map', 'kd (decay)'),
             ('knt_map', 'knt (non-tracer)'),
-            ('r_squared_map', 'R-squared')
+            ('r_squared_map', 'R-squared'),
+            ('a1_percent_map', '%Enhancement'),
+            ('a2_percent_map', '%NTE'),
         ]
 
         for key, name in param_names:
@@ -974,8 +1083,10 @@ class ParameterMapResultsDialog(QDialog):
             'kd_map': 'kd (decay rate)',
             'knt_map': 'knt (non-tracer rate)',
             'r_squared_map': 'R² (fit quality)',
+            'a1_percent_map': '%Enhancement (A1/A0)',
+            'a2_percent_map': '%NTE (A2/A0)',
             'a1_amplitude_map': 'A1 (amplitude)',
-            'a2_amplitude_map': 'A2 (non-tracer amplitude)'
+            'a2_amplitude_map': 'A2 (non-tracer amplitude)',
         }
 
         checkboxes = {}
