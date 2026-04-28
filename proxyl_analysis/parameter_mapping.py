@@ -9,6 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy import ndimage
 from typing import Tuple, Optional, Dict, Any, Union
+import os
 import time
 from pathlib import Path
 import sys
@@ -17,7 +18,90 @@ from .model import fit_proxyl_kinetics, add_proxylfit_logo, set_proxylfit_style,
 from .roi_selection import ManualContourROISelector
 
 
-def create_parameter_maps(registered_4d: np.ndarray, 
+# ---------------------------------------------------------------------------
+# Per-voxel fitting worker (used by both the sequential path and the
+# multiprocessing.Pool path). Worker processes get their context via
+# `_init_pixel_worker` so that `registered_4d` is pickled once per worker
+# instead of once per voxel.
+# ---------------------------------------------------------------------------
+
+_PIXEL_WORKER_CTX: Dict[str, Any] = {}
+
+
+def _init_pixel_worker(registered_4d, time_array, kernel_type, window_size,
+                       signal_threshold, time_units):
+    """Pool initializer — stash the read-only fitting inputs as worker globals."""
+    _PIXEL_WORKER_CTX['registered_4d'] = registered_4d
+    _PIXEL_WORKER_CTX['time_array'] = time_array
+    _PIXEL_WORKER_CTX['kernel_type'] = kernel_type
+    _PIXEL_WORKER_CTX['window_size'] = window_size
+    _PIXEL_WORKER_CTX['signal_threshold'] = signal_threshold
+    _PIXEL_WORKER_CTX['time_units'] = time_units
+
+
+def _fit_pixel(pos):
+    """
+    Fit a single (x, y, z, z_idx) position from `_PIXEL_WORKER_CTX`.
+
+    Returns
+    -------
+    tuple or None
+        (x, y, z_idx, kb, kd, knt, r_squared, A1, A2, A0, t0, tmax) on success,
+        or None when the pixel is below the signal threshold, too noisy, or
+        the fit fails / is too poor (R² <= 0.1).
+    """
+    x, y, z, z_idx = pos
+    ctx = _PIXEL_WORKER_CTX
+    registered_4d = ctx['registered_4d']
+    time_array = ctx['time_array']
+    kernel_type = ctx['kernel_type']
+    window_size = ctx['window_size']
+    signal_threshold = ctx['signal_threshold']
+    time_units = ctx['time_units']
+
+    # Extract signal using the configured kernel
+    if kernel_type == 'sliding_window':
+        window_signal = _extract_sliding_window_signal(
+            registered_4d, x, y, z, window_size
+        )
+    else:
+        window_signal = _extract_kernel_signal(
+            registered_4d, x, y, z, window_size, kernel_type
+        )
+
+    # Threshold checks (same as the original sequential loop)
+    max_signal = float(np.max(window_signal))
+    min_signal = float(np.min(window_signal))
+    signal_variation = max_signal - min_signal
+    if max_signal < signal_threshold or signal_variation < signal_threshold * 0.1:
+        return None
+
+    mean_signal = float(np.mean(window_signal))
+    cv = (float(np.std(window_signal)) / mean_signal) if mean_signal > 0 else float('inf')
+    if cv > 2.0:
+        return None
+
+    # Fit
+    try:
+        kb, kd, knt, _fitted, fit_results = fit_proxyl_kinetics(
+            time_array, window_signal, time_units
+        )
+    except Exception:
+        return None
+
+    if fit_results['r_squared'] <= 0.1:
+        return None
+
+    return (
+        x, y, z_idx,
+        kb, kd, knt,
+        fit_results['r_squared'],
+        fit_results['A1'], fit_results['A2'], fit_results['A0'],
+        fit_results['t0'], fit_results['tmax'],
+    )
+
+
+def create_parameter_maps(registered_4d: np.ndarray,
                          time_array: np.ndarray,
                          window_size: Union[int, Tuple[int, int, int]] = 5,
                          z_slice: Optional[int] = None,
@@ -27,7 +111,8 @@ def create_parameter_maps(registered_4d: np.ndarray,
                          roi_mask: Optional[np.ndarray] = None,
                          kernel_type: str = 'sliding_window',
                          injection_time_index: Optional[int] = None,
-                         stride: int = 1) -> Dict[str, np.ndarray]:
+                         stride: int = 1,
+                         n_workers: Optional[int] = None) -> Dict[str, np.ndarray]:
     """
     Create spatial parameter maps using sliding window or convolution approach.
     
@@ -61,6 +146,10 @@ def create_parameter_maps(registered_4d: np.ndarray,
         Step size for spatial iteration. stride=1 fits every pixel (full resolution).
         stride=N fits every Nth pixel and fills surrounding NxN blocks with the
         fitted value (nearest-neighbor fill). Output maps remain full-size.
+    n_workers : int, optional
+        Number of worker processes used for parallel per-voxel fitting.
+        Defaults to ``min(os.cpu_count(), 8)``. Pass ``1`` to force sequential
+        execution. Pass ``0`` for the same auto-select behaviour as ``None``.
 
     Returns
     -------
@@ -119,112 +208,109 @@ def create_parameter_maps(registered_4d: np.ndarray,
     max_signal = np.max(registered_4d)
     signal_threshold = min_signal_threshold * max_signal
     
-    # Calculate total positions for progress tracking
-    total_positions = 0
+    # Build the list of (x, y, z, z_idx) positions we'll fit. Doing this once
+    # up front replaces the original "count first, fit second" pattern and
+    # gives multiprocessing.Pool a flat work list to chew through.
+    positions = []
     for z in range(z_start, z_end):
+        z_idx = z if z_slice is None else 0
         for x in range(0, x_size, stride):
             for y in range(0, y_size, stride):
-                # Check if pixel is in ROI (if ROI mask is provided)
                 if roi_mask is not None and not roi_mask[x, y]:
                     continue
-                total_positions += 1
-    
+                positions.append((x, y, z, z_idx))
+    total_positions = len(positions)
+
     print(f"Creating parameter maps using {window_x}x{window_y}x{window_z} {kernel_type} kernel (stride={stride})...")
     if roi_mask is not None:
         print(f"Processing within ROI on {'single slice' if z_slice is not None else 'all slices'}: {total_positions} positions")
     else:
         print(f"Processing {'single slice' if z_slice is not None else 'all slices'}: {total_positions} positions")
     print(f"Signal threshold: {signal_threshold:.2f}")
-    
-    current_position = 0
+
+    # Worker count: None/0 -> auto, capped at 8 to avoid pathological RAM use
+    # on machines with many cores (each worker gets a copy of registered_4d).
+    if not n_workers:
+        n_workers = min(os.cpu_count() or 1, 8)
+    n_workers = max(1, int(n_workers))
+    use_pool = n_workers > 1 and total_positions >= 8 * n_workers
+
+    if total_positions:
+        print(
+            f"Fitting with {n_workers} worker"
+            f"{'s' if n_workers != 1 else ''} ("
+            f"{'parallel' if use_pool else 'sequential'})"
+        )
+
+    # Stash inputs on the main process so the sequential path can reuse the
+    # same _fit_pixel helper as the worker processes. Worker subprocesses get
+    # their own copy via the Pool initializer below.
+    _init_pixel_worker(
+        registered_4d, time_array, kernel_type,
+        (window_x, window_y, window_z), signal_threshold, time_units,
+    )
+
+    def _store(result):
+        """Write a fit-result tuple into the output maps."""
+        if result is None:
+            return
+        x, y, z_idx, kb, kd, knt, r2, A1, A2, A0, t0, tmax = result
+        x_end_blk = min(x + stride, x_size)
+        y_end_blk = min(y + stride, y_size)
+        kb_map[x:x_end_blk, y:y_end_blk, z_idx] = kb
+        kd_map[x:x_end_blk, y:y_end_blk, z_idx] = kd
+        knt_map[x:x_end_blk, y:y_end_blk, z_idx] = knt
+        r_squared_map[x:x_end_blk, y:y_end_blk, z_idx] = r2
+        a1_amplitude_map[x:x_end_blk, y:y_end_blk, z_idx] = A1
+        a2_amplitude_map[x:x_end_blk, y:y_end_blk, z_idx] = A2
+        baseline_map[x:x_end_blk, y:y_end_blk, z_idx] = A0
+        t0_map[x:x_end_blk, y:y_end_blk, z_idx] = t0
+        tmax_map[x:x_end_blk, y:y_end_blk, z_idx] = tmax
+        fit_mask[x:x_end_blk, y:y_end_blk, z_idx] = True
+
     start_time = time.time()
     cancelled = False
+    current_position = 0
 
-    # Process each voxel position
-    for z in range(z_start, z_end):
-        if cancelled:
-            break
-        z_idx = z if z_slice is None else 0  # Index for output arrays
+    if use_pool:
+        from multiprocessing import Pool
 
-        for x in range(0, x_size, stride):
-            if cancelled:
-                break
-            for y in range(0, y_size, stride):
-                # Check if pixel is in ROI (if ROI mask is provided)
-                if roi_mask is not None and not roi_mask[x, y]:
-                    continue
+        # ~16 chunks per worker keeps progress updates smooth without much
+        # IPC overhead.
+        chunksize = max(1, total_positions // (n_workers * 16))
+        init_args = (
+            registered_4d, time_array, kernel_type,
+            (window_x, window_y, window_z), signal_threshold, time_units,
+        )
 
-                current_position += 1
+        with Pool(n_workers, initializer=_init_pixel_worker, initargs=init_args) as pool:
+            iterator = pool.imap_unordered(_fit_pixel, positions, chunksize=chunksize)
+            for current_position, result in enumerate(iterator, 1):
+                _store(result)
 
-                # Progress reporting (callback returns False to request cancellation)
                 if progress_callback:
                     progress_pct = 100.0 * current_position / total_positions
-                    if progress_callback(progress_pct, current_position, total_positions) is False:
+                    if progress_callback(progress_pct, current_position,
+                                         total_positions) is False:
                         print("Parameter mapping cancelled by user.")
                         cancelled = True
+                        pool.terminate()
                         break
+    else:
+        for current_position, pos in enumerate(positions, 1):
+            if progress_callback:
+                progress_pct = 100.0 * current_position / total_positions
+                if progress_callback(progress_pct, current_position,
+                                     total_positions) is False:
+                    print("Parameter mapping cancelled by user.")
+                    cancelled = True
+                    break
+            _store(_fit_pixel(pos))
 
-                # Extract signal using specified kernel type
-                if kernel_type == 'sliding_window':
-                    window_signal = _extract_sliding_window_signal(
-                        registered_4d, x, y, z, (window_x, window_y, window_z)
-                    )
-                else:
-                    window_signal = _extract_kernel_signal(
-                        registered_4d, x, y, z, (window_x, window_y, window_z), kernel_type
-                    )
-                
-                # Check if window has sufficient signal and quality
-                max_signal = np.max(window_signal)
-                min_signal = np.min(window_signal)
-                signal_variation = max_signal - min_signal
-                
-                # Skip if signal too low or no meaningful variation
-                if max_signal < signal_threshold or signal_variation < signal_threshold * 0.1:
-                    continue
-                
-                # Skip if signal has too much noise (coefficient of variation too high)
-                cv = np.std(window_signal) / np.mean(window_signal) if np.mean(window_signal) > 0 else float('inf')
-                if cv > 2.0:  # Skip very noisy signals
-                    continue
-                
-                # Attempt kinetic fitting
-                try:
-                    kb, kd, knt, fitted_signal, fit_results = fit_proxyl_kinetics(
-                        time_array, window_signal, time_units
-                    )
-                    
-                    # Check fit quality (require reasonable R-squared)
-                    if fit_results['r_squared'] > 0.1:  # Minimum R² threshold
-                        # Fill stride×stride block (nearest-neighbor fill)
-                        x_end_blk = min(x + stride, x_size)
-                        y_end_blk = min(y + stride, y_size)
-                        kb_map[x:x_end_blk, y:y_end_blk, z_idx] = kb
-                        kd_map[x:x_end_blk, y:y_end_blk, z_idx] = kd
-                        knt_map[x:x_end_blk, y:y_end_blk, z_idx] = knt
-                        r_squared_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['r_squared']
-                        a1_amplitude_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['A1']
-                        a2_amplitude_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['A2']
-                        baseline_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['A0']
-                        t0_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['t0']
-                        tmax_map[x:x_end_blk, y:y_end_blk, z_idx] = fit_results['tmax']
-                        fit_mask[x:x_end_blk, y:y_end_blk, z_idx] = True
-                        # Per-voxel success log
-                        try:
-                            print(f"Fit success at (x={x}, y={y}, z={z_idx}): "
-                                  f"kb={kb:.4f}, kd={kd:.4f}, knt={knt:.4f}, R2={fit_results['r_squared']:.3f}")
-                        except Exception:
-                            # Avoid any logging-related crashes
-                            pass
-                        
-                except Exception:
-                    # Fitting failed - leave as NaN
-                    continue
-    
     elapsed_time = time.time() - start_time
-    successful_fits = np.sum(fit_mask)
-    success_rate = 100.0 * successful_fits / total_positions
-    
+    successful_fits = int(np.sum(fit_mask))
+    success_rate = (100.0 * successful_fits / total_positions) if total_positions else 0.0
+
     print(f"Parameter mapping completed in {elapsed_time:.1f} seconds")
     print(f"Successful fits: {successful_fits}/{total_positions} ({success_rate:.1f}%)")
     

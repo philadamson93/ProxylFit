@@ -285,10 +285,11 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             signal,
             p0=p0,
             bounds=(lower_bounds, upper_bounds),
-            maxfev=5000,  # More iterations for extended model
+            maxfev=500,    # Cap iterations; pathological pixels fall through
+                           # to the relaxed-bounds dogbox retry below.
             method='trf',  # Trust region reflective algorithm
-            ftol=1e-8,     # Tighter tolerance
-            xtol=1e-8
+            ftol=1e-6,     # Loosened from 1e-8 — the initial estimates are
+            xtol=1e-6,     # close enough that 1e-6 converges in far fewer steps.
         )
         
         A0_fit, A1_fit, A2_fit, kb_fit, kd_fit, knt_fit, t0_fit, tmax_fit = popt
