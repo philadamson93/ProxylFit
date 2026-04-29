@@ -953,6 +953,24 @@ class ParameterMapResultsDialog(QDialog):
             cmap = 'plasma'
             vmin, vmax = None, None
 
+        # Render NaN / undefined voxels (mask=False, divide-by-zero in
+        # %Enhancement / %NTE, etc.) as black in the standalone view —
+        # otherwise the matplotlib default (transparent → white axes
+        # background) makes unfit voxels disappear into the page. Resolve
+        # string colormap names to a Colormap object first, and copy so
+        # we don't mutate the global instance shared with other plots.
+        # In overlay mode we keep the default (transparent) so the
+        # grayscale anatomical underneath stays visible through unfit
+        # voxels — black there would just darken the anatomy uselessly.
+        import matplotlib as mpl
+        if isinstance(cmap, str):
+            cmap = mpl.colormaps[cmap].copy()
+        else:
+            cmap = cmap.copy()
+        overlay_active = self.overlay_mode and self.reference_image is not None
+        if not overlay_active:
+            cmap.set_bad('black')
+
         # Show anatomical image as background if overlay mode is enabled
         if self.overlay_mode and self.reference_image is not None:
             # Get reference slice
