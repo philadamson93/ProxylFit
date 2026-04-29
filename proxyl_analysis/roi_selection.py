@@ -196,41 +196,53 @@ def select_rectangle_roi(image_4d: np.ndarray, z_index: int) -> np.ndarray:
     return roi_mask
 
 
-def compute_roi_timeseries(image_4d: np.ndarray, roi_mask: np.ndarray) -> np.ndarray:
+def compute_roi_timeseries(image_4d: np.ndarray, roi_mask: np.ndarray,
+                           z_slice: Optional[int] = None) -> np.ndarray:
     """
-    Compute mean intensity time series for ROI across all timepoints.
-    
+    Compute mean intensity time series for an ROI across all timepoints.
+
     Parameters
     ----------
     image_4d : np.ndarray
-        4D array with shape [x, y, z, t]
+        4D array with shape [x, y, z, t].
     roi_mask : np.ndarray
-        Boolean mask of shape [x, y] defining the ROI
-        
+        Boolean mask of shape [x, y] defining the ROI in-plane.
+    z_slice : int, optional
+        Z-slice the ROI was drawn on. When provided, the signal is the
+        mean of ``image_4d[roi_mask, z_slice, t]`` across timepoints —
+        i.e., a single-slice mean, matching what an ImageJ user gets
+        when drawing a 2D ROI on one slice. **Pass this whenever you
+        know which slice the ROI belongs to** — otherwise (None), the
+        function falls back to averaging the same 2D mask across every
+        z-slice of the volume, which is rarely what's wanted because
+        ROI features change slice to slice.
+
     Returns
     -------
     timeseries : np.ndarray
-        1D array of mean ROI intensity for each timepoint
+        1D array of mean ROI intensity for each timepoint.
     """
     if not np.any(roi_mask):
         raise ValueError("ROI mask contains no True values")
-    
+
     t_points = image_4d.shape[3]
+
+    if z_slice is not None:
+        # Single-slice mean — vectorized over time for speed and clarity.
+        roi_pixels_per_t = image_4d[roi_mask, z_slice, :]  # (n_roi, t)
+        return roi_pixels_per_t.mean(axis=0)
+
+    # Legacy all-z fallback. Averages the same 2D mask across every
+    # z-slice. Kept for backwards compatibility with callers (e.g., older
+    # tests) that don't pass z_slice.
     timeseries = np.zeros(t_points)
-    
-    # Compute mean for each timepoint
     for t in range(t_points):
-        # Extract 2D slice for this timepoint
-        slice_2d = image_4d[:, :, :, t]
-        
-        # Apply mask and compute mean across all z-slices
+        slice_3d = image_4d[:, :, :, t]
         masked_values = []
-        for z in range(slice_2d.shape[2]):
-            slice_z = slice_2d[:, :, z]
-            masked_values.extend(slice_z[roi_mask])
-        
+        for z in range(slice_3d.shape[2]):
+            masked_values.extend(slice_3d[:, :, z][roi_mask])
         timeseries[t] = np.mean(masked_values)
-    
+
     return timeseries
 
 

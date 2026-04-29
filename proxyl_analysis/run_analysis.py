@@ -839,7 +839,12 @@ def main():
                     print(f"  ROI selected with {np.sum(roi_mask)} pixels")
 
                     # Extract time series from T1 (always use T1 for signal)
-                    roi_signal = compute_roi_timeseries(registered_4d, roi_mask)
+                    # on the same z-slice the ROI was drawn on — ROI features
+                    # change slice to slice, so the kinetic curve must come
+                    # from the slice the user actually selected.
+                    roi_signal = compute_roi_timeseries(
+                        registered_4d, roi_mask, z_slice=args.z
+                    )
                     print(f"  Extracted {len(roi_signal)} time points")
 
                     # Select injection time
@@ -848,12 +853,16 @@ def main():
                     injection_time = time_array[injection_idx]
                     print(f"  Injection time: {injection_time:.1f} {args.time_units} (index {injection_idx})")
 
-                    # Store ROI state
+                    # Store ROI state. z_slice is recorded so subsequent
+                    # menu actions (kinetic fit, parameter mapping injection
+                    # time, exports) can recompute single-slice signals
+                    # against the same slice the ROI was drawn on.
                     roi_state = {
                         'roi_mask': roi_mask,
                         'roi_signal': roi_signal,
                         'injection_idx': injection_idx,
-                        'injection_time': injection_time
+                        'injection_time': injection_time,
+                        'z_slice': args.z,
                     }
                     print("ROI and injection time set. Returning to menu.")
                     continue  # Return to menu with ROI state
@@ -960,8 +969,15 @@ def main():
                     elif options['select_injection']:
                         # Need to get representative curve
                         if param_roi_mask is not None:
-                            # Use ROI mean signal (compute_roi_timeseries imported at top of file)
-                            rep_signal = compute_roi_timeseries(registered_4d, param_roi_mask)
+                            # Single-slice mean from the slice the ROI was
+                            # drawn on. param_roi_z is None only if a legacy
+                            # roi_state without z_slice is being reused —
+                            # in that case fall back to the existing
+                            # all-slices behavior (better than crashing).
+                            rep_signal = compute_roi_timeseries(
+                                registered_4d, param_roi_mask,
+                                z_slice=param_roi_z,
+                            )
                         elif roi_state is not None and roi_state.get('roi_signal') is not None:
                             rep_signal = roi_state['roi_signal']
                         else:
@@ -1274,7 +1290,12 @@ def main():
             else:
                 next_step = "4"
             print(f"Step {next_step}: Computing ROI time series...")
-            signal_timeseries = compute_roi_timeseries(registered_4d, roi_mask)
+            # Use only the slice the ROI was drawn on — single-slice mean
+            # matches the ImageJ workflow and is what the curve is
+            # supposed to represent. See compute_roi_timeseries docstring.
+            signal_timeseries = compute_roi_timeseries(
+                registered_4d, roi_mask, z_slice=args.z
+            )
             
             # Create time array
             time_array = create_time_array(len(signal_timeseries), args.time_units, temporal_resolution_s=temporal_res)
