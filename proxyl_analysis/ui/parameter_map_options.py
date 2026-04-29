@@ -579,6 +579,18 @@ class ParameterMapResultsDialog(QDialog):
         self.overlay_mode = False
         self.overlay_opacity = 0.7
 
+        # Optional second ROI drawn directly on a parameter map for
+        # measurement-only purposes (separate from the fitting ROI used
+        # during parameter mapping). 2D mask in (x, y) shape, applies to
+        # whichever z-slice is currently displayed. None when no
+        # measurement is active.
+        self.measurement_roi_mask = None
+        # z-slice index where the measurement ROI was originally drawn,
+        # so the metrics panel can flag "drawn on z=3, viewing z=5" when
+        # the user scrolls to a different slice.
+        self.measurement_roi_drawn_z = None
+        self._measurement_lasso = None
+
         self.setWindowTitle("Parameter Map Results")
         self.setMinimumSize(900, 700)
         self.resize(950, 750)
@@ -703,6 +715,34 @@ class ParameterMapResultsDialog(QDialog):
         metrics_layout.addWidget(self.metrics_label)
 
         right_layout.addWidget(metrics_group)
+
+        # Measurement ROI tool — lets the user draw a lasso ROI on any
+        # currently displayed parameter map (or anatomical underlay) and
+        # read out mean ± std for every available map within it. This is
+        # separate from the fitting ROI used during parameter mapping;
+        # both are shown simultaneously when both exist.
+        measure_group = QGroupBox("Measurement ROI")
+        measure_layout = QVBoxLayout(measure_group)
+
+        self.measure_status_label = QLabel(
+            "Click 'Draw' then drag-and-release on the map."
+        )
+        self.measure_status_label.setStyleSheet("font-size: 10px; color: #666;")
+        self.measure_status_label.setWordWrap(True)
+        measure_layout.addWidget(self.measure_status_label)
+
+        measure_btn_row = QHBoxLayout()
+        self.draw_measure_btn = QPushButton("Draw")
+        self.draw_measure_btn.clicked.connect(self._start_drawing_measurement_roi)
+        measure_btn_row.addWidget(self.draw_measure_btn)
+
+        self.clear_measure_btn = QPushButton("Clear")
+        self.clear_measure_btn.clicked.connect(self._clear_measurement_roi)
+        self.clear_measure_btn.setEnabled(False)
+        measure_btn_row.addWidget(self.clear_measure_btn)
+        measure_layout.addLayout(measure_btn_row)
+
+        right_layout.addWidget(measure_group)
 
         # Processing info
         info_group = QGroupBox("Processing Info")
@@ -876,6 +916,101 @@ class ParameterMapResultsDialog(QDialog):
         else:
             self.pixel_label.setText(f"Pixel ({xi}, {yi}): {map_short} = {value:.4f}")
 
+    # ------------------------------------------------------------------
+    # Measurement ROI (drawn on any displayed map)
+    # ------------------------------------------------------------------
+
+    def _start_drawing_measurement_roi(self):
+        """Activate the lasso selector on the parameter map canvas.
+
+        The user drag-and-releases to draw a freeform polygon. On release,
+        ``_on_measurement_lasso_done`` converts the vertices into a 2D
+        mask in (x, y) shape that matches every parameter map in
+        ``self.param_maps``. Drawing replaces any previous measurement
+        ROI; the fitting ROI from parameter mapping is unaffected.
+        """
+        from matplotlib.widgets import LassoSelector
+
+        # If a previous lasso is still active (e.g., user clicked Draw
+        # twice without finishing), drop it first so we don't stack
+        # listeners.
+        if self._measurement_lasso is not None:
+            try:
+                self._measurement_lasso.disconnect_events()
+            except Exception:
+                pass
+            self._measurement_lasso = None
+
+        self.measure_status_label.setText(
+            "Drawing\u2026 drag a freeform shape on the map and release."
+        )
+        self.draw_measure_btn.setEnabled(False)
+
+        self._measurement_lasso = LassoSelector(
+            self.ax,
+            onselect=self._on_measurement_lasso_done,
+            useblit=True,
+        )
+        self.canvas.draw_idle()
+
+    def _on_measurement_lasso_done(self, vertices):
+        """Convert the lasso polygon into a (x, y) boolean mask."""
+        from matplotlib.path import Path
+
+        # Always tear down the lasso first so the user can re-arm Draw
+        # even if this draw produced an empty mask.
+        if self._measurement_lasso is not None:
+            try:
+                self._measurement_lasso.disconnect_events()
+            except Exception:
+                pass
+            self._measurement_lasso = None
+        self.draw_measure_btn.setEnabled(True)
+
+        if not vertices or len(vertices) < 3:
+            self.measure_status_label.setText(
+                "Need at least 3 points \u2014 click 'Draw' to try again."
+            )
+            return
+
+        # Param maps are indexed (x, y, z); event.xdata is the x-index
+        # and event.ydata is the y-index after the .T transpose used in
+        # _update_display. Build a (nx, ny) mask the same shape so it
+        # plugs straight into the existing slice_data[mask] indexing.
+        nx, ny = self.kb_map.shape[0], self.kb_map.shape[1]
+        xs, ys = np.mgrid[0:nx, 0:ny]
+        points = np.column_stack([xs.ravel(), ys.ravel()])
+        path = Path(vertices)
+        inside = path.contains_points(points).reshape(nx, ny)
+
+        if not inside.any():
+            self.measure_status_label.setText(
+                "Polygon enclosed no whole pixels \u2014 click 'Draw' to retry."
+            )
+            return
+
+        self.measurement_roi_mask = inside
+        self.measurement_roi_drawn_z = self.current_z
+        self.clear_measure_btn.setEnabled(True)
+        n_pixels = int(inside.sum())
+        self.measure_status_label.setText(
+            f"ROI active: {n_pixels} pixels. Stats below; "
+            f"click 'Clear' to remove."
+        )
+
+        # Redraws the contour and recomputes metrics.
+        self._update_display()
+
+    def _clear_measurement_roi(self):
+        """Drop the measurement ROI and refresh the display + metrics."""
+        self.measurement_roi_mask = None
+        self.measurement_roi_drawn_z = None
+        self.clear_measure_btn.setEnabled(False)
+        self.measure_status_label.setText(
+            "Click 'Draw' then drag-and-release on the map."
+        )
+        self._update_display()
+
     def _update_display(self):
         """Update the parameter map display."""
         # Remove old colorbar if it exists
@@ -996,7 +1131,8 @@ class ParameterMapResultsDialog(QDialog):
         else:
             im = self.ax.imshow(display_data, cmap=cmap, origin='lower', vmin=vmin, vmax=vmax)
 
-        # Add ROI contour if enabled
+        # Add ROI contour if enabled (cyan = the fitting ROI used during
+        # parameter mapping)
         if self.roi_checkbox.isChecked() and self.roi_mask is not None:
             if self.roi_mask.ndim == 2:
                 roi_slice = self.roi_mask.T
@@ -1007,6 +1143,15 @@ class ParameterMapResultsDialog(QDialog):
 
             if roi_slice is not None and np.any(roi_slice):
                 self.ax.contour(roi_slice, levels=[0.5], colors='cyan', linewidths=2)
+
+        # Measurement ROI contour (yellow), shown whenever set so it's
+        # visually distinct from the cyan fitting ROI. The mask is 2D
+        # in (x, y) and applies to whichever z-slice is shown.
+        if self.measurement_roi_mask is not None:
+            self.ax.contour(
+                self.measurement_roi_mask.T,
+                levels=[0.5], colors='yellow', linewidths=2,
+            )
 
         # Colorbar - store reference so we can remove it later
         self.colorbar = self.figure.colorbar(im, ax=self.ax, fraction=0.046)
@@ -1035,39 +1180,17 @@ class ParameterMapResultsDialog(QDialog):
         self._update_metrics()
 
     def _update_metrics(self):
-        """Update the metrics display."""
-        if self.roi_mask is None:
-            self.metrics_label.setText("No ROI available.\nDraw ROI to see metrics.")
-            return
+        """Update the metrics display.
 
-        # Get values within ROI for each parameter
-        lines = []
-
-        # Get ROI slice
-        if self.roi_mask.ndim == 2:
-            roi_slice = self.roi_mask
-        elif self.current_z < self.roi_mask.shape[2]:
-            roi_slice = self.roi_mask[:, :, self.current_z]
-        else:
-            self.metrics_label.setText("ROI not available for this slice")
-            return
-
-        mask = self.param_maps.get('mask')
-        if mask is None:
-            return
-
-        # Combined mask: ROI and valid fits
-        if mask.ndim == 3:
-            combined_mask = roi_slice & mask[:, :, self.current_z]
-        else:
-            combined_mask = roi_slice & mask[:, :, 0]
-
-        n_pixels = int(np.sum(combined_mask))
-        lines.append(f"ROI + fitted: {n_pixels} pixels")
-        lines.append(f"Z-slice: {self.current_z}")
-        lines.append("")
-
-        # Calculate metrics for each map
+        Shows up to two sections:
+        - 'Fitting ROI' — the ROI used during parameter mapping (if any).
+          Stats are intersected with the fit_mask so only converged
+          voxels contribute.
+        - 'Measurement ROI' — a freeform ROI drawn directly on the
+          displayed map (if any). Stats use just NaN-filtering so the
+          user gets exactly what they outlined.
+        """
+        # Param names shared across both ROI sections
         param_names = [
             ('kb_map', 'kb (buildup)'),
             ('kd_map', 'kd (decay)'),
@@ -1078,22 +1201,98 @@ class ParameterMapResultsDialog(QDialog):
             ('a2_percent_est_map', '%NTE_est'),
         ]
 
-        for key, name in param_names:
-            map_data = self.param_maps.get(key)
-            if map_data is None:
-                continue
+        lines = []
 
-            if map_data.ndim == 3:
-                slice_data = map_data[:, :, self.current_z]
+        # ----- Fitting ROI block (existing behavior) -----
+        if self.roi_mask is not None:
+            if self.roi_mask.ndim == 2:
+                roi_slice = self.roi_mask
+            elif self.current_z < self.roi_mask.shape[2]:
+                roi_slice = self.roi_mask[:, :, self.current_z]
             else:
-                slice_data = map_data[:, :, 0]
+                roi_slice = None
 
-            roi_values = slice_data[combined_mask]
-            if len(roi_values) > 0:
-                mean_val = np.nanmean(roi_values)
-                std_val = np.nanstd(roi_values)
-                lines.append(f"{name}:")
-                lines.append(f"  {mean_val:.4f} +/- {std_val:.4f}")
+            mask = self.param_maps.get('mask')
+            if roi_slice is not None and mask is not None:
+                if mask.ndim == 3:
+                    combined_mask = roi_slice & mask[:, :, self.current_z]
+                else:
+                    combined_mask = roi_slice & mask[:, :, 0]
+
+                n_pixels = int(np.sum(combined_mask))
+                lines.append("─── Fitting ROI (cyan) ───")
+                lines.append(f"ROI + fitted: {n_pixels} pixels")
+                lines.append(f"Z-slice: {self.current_z}")
+                lines.append("")
+
+                for key, name in param_names:
+                    map_data = self.param_maps.get(key)
+                    if map_data is None:
+                        continue
+                    if map_data.ndim == 3:
+                        slice_data = map_data[:, :, self.current_z]
+                    else:
+                        slice_data = map_data[:, :, 0]
+                    roi_values = slice_data[combined_mask]
+                    if len(roi_values) > 0:
+                        lines.append(f"{name}:")
+                        lines.append(
+                            f"  {np.nanmean(roi_values):.4f} "
+                            f"+/- {np.nanstd(roi_values):.4f}"
+                        )
+
+        # ----- Measurement ROI block -----
+        if self.measurement_roi_mask is not None:
+            if lines:
+                lines.append("")
+            lines.append("─── Measurement ROI (yellow) ───")
+            n_drawn = int(self.measurement_roi_mask.sum())
+            drawn_z = self.measurement_roi_drawn_z
+            # If viewing a different slice from where the ROI was drawn,
+            # flag it explicitly — the same 2D mask is being applied to
+            # whatever slice is shown, but feature alignment may have
+            # drifted, so the user should usually re-draw on the new
+            # slice for a clean measurement.
+            if drawn_z is not None and drawn_z != self.current_z:
+                lines.append(
+                    f"Drawn: {n_drawn} pixels  "
+                    f"(drawn on z={drawn_z}, viewing z={self.current_z})"
+                )
+            else:
+                lines.append(
+                    f"Drawn: {n_drawn} pixels  (z-slice {self.current_z})"
+                )
+            lines.append("")
+
+            for key, name in param_names:
+                map_data = self.param_maps.get(key)
+                if map_data is None:
+                    continue
+                if map_data.ndim == 3:
+                    slice_data = map_data[:, :, self.current_z]
+                else:
+                    slice_data = map_data[:, :, 0]
+                # Don't intersect with fit_mask here — the user drew this
+                # ROI to measure exactly what they outlined. NaN voxels
+                # are filtered out by nanmean/nanstd, so unfit pixels
+                # don't poison the stats.
+                roi_values = slice_data[self.measurement_roi_mask]
+                valid = roi_values[~np.isnan(roi_values)]
+                if len(valid) > 0:
+                    lines.append(f"{name}:")
+                    lines.append(
+                        f"  {np.nanmean(valid):.4f} "
+                        f"+/- {np.nanstd(valid):.4f}  (n={len(valid)})"
+                    )
+                else:
+                    lines.append(f"{name}: — (no fitted voxels in ROI)")
+
+        if not lines:
+            self.metrics_label.setText(
+                "No ROI available.\n"
+                "Draw a measurement ROI on the map to see stats."
+            )
+            return
 
         self.metrics_label.setText('\n'.join(lines))
 
