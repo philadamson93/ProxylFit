@@ -923,6 +923,14 @@ class ParameterMapResultsDialog(QDialog):
         if 'r_squared' in self.current_map:
             cmap = 'RdYlBu_r'
             vmin, vmax = 0, 1
+        elif self.current_map == 'kb_map':
+            # kb (buildup rate) shares the ImageJ 16_color LUT with kd/knt
+            # for visual consistency, but auto-ranges instead of using the
+            # fixed 0–0.15 cap — kb upper bound in the fit model is 1.0,
+            # an order of magnitude higher than kd/knt, so a fixed cap
+            # would saturate most voxels at the bright end of the LUT.
+            cmap = imagej_16_colors
+            vmin, vmax = None, None
         elif self.current_map in ('kd_map', 'knt_map'):
             # kd and knt share the ImageJ 16_color LUT with a fixed 0–0.15
             # range so the discrete color bands stay comparable across
