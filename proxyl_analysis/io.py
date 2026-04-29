@@ -1106,6 +1106,153 @@ def load_registered_t2(output_dir: str) -> Tuple[Optional[np.ndarray], Tuple[flo
     return registered_t2, spacing
 
 
+def save_volume_as_dicom_series(
+    volume: np.ndarray,
+    label: str,
+    output_dir: str,
+    spacing: Tuple[float, float, float],
+    source_dicom: Optional[str] = None,
+    series_description: Optional[str] = None,
+    series_offset: int = 1000,
+) -> List[str]:
+    """
+    Save a 3D anatomical volume as a DICOM series in a named subfolder.
+
+    Used by the parameter-map dialog to write reference T1 and T2 volumes
+    alongside the parameter maps in the same export folder so a clinician
+    opening the folder gets parameter maps + anatomical references in one
+    place. Subfolder layout matches ``save_parameter_map_as_dicom`` so the
+    resulting tree is consistent across map-style and anatomical exports.
+
+    Parameters
+    ----------
+    volume : np.ndarray
+        3D image array with shape [x, y, z].
+    label : str
+        Short identifier used as the subfolder name and filename prefix
+        (e.g. ``"T1_baseline"`` or ``"T2"``). Files land at
+        ``<output_dir>/<label>/<label>_z{ZZ}.dcm``.
+    output_dir : str
+        Base output directory. The ``<label>/`` subdirectory is created
+        (and wiped clean if it already exists, matching the parameter-map
+        export's "fresh series only" behavior).
+    spacing : tuple
+        Voxel spacing (x, y, z) in mm.
+    source_dicom : str, optional
+        Path to a source DICOM to copy patient/study metadata from. If
+        omitted, anonymous defaults are used.
+    series_description : str, optional
+        SeriesDescription tag. Defaults to ``f"Registered {label}"``.
+    series_offset : int
+        Added to the source's OriginalSeriesNumber to keep this series
+        unique relative to other series in the same study.
+
+    Returns
+    -------
+    List[str]
+        Paths to the saved DICOM files, one per z-slice.
+    """
+    import pydicom
+    import shutil
+    from pydicom.dataset import FileDataset
+
+    if volume.ndim != 3:
+        raise ValueError(f"Expected 3D volume, got shape {volume.shape}")
+
+    output_path = Path(output_dir)
+    series_dir = output_path / label
+    # Same wipe-before-write convention as save_parameter_map_as_dicom so
+    # stale slices from a previous run don't mix with the new series.
+    shutil.rmtree(series_dir, ignore_errors=True)
+    series_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy source metadata where possible
+    source_metadata = {}
+    if source_dicom:
+        source_metadata = _copy_dicom_metadata(source_dicom)
+
+    series_uid = _generate_uid()
+    study_uid = source_metadata.get('StudyInstanceUID', _generate_uid())
+    original_series = source_metadata.get('OriginalSeriesNumber', 1)
+    series_number = original_series + series_offset
+    desc = series_description or f"Registered {label}"
+
+    x_dim, y_dim, z_dim = volume.shape
+    saved_files: List[str] = []
+
+    for z in range(z_dim):
+        # 2D slice in [x, y]; DICOM stores [row, col] = [y, x].
+        slice_2d = volume[:, :, z].T
+
+        filepath = series_dir / f"{label}_z{z:02d}.dcm"
+
+        file_meta = pydicom.dataset.FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = pydicom.uid.MRImageStorage
+        file_meta.MediaStorageSOPInstanceUID = _generate_uid()
+        file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+        ds = FileDataset(str(filepath), {}, file_meta=file_meta, preamble=b"\0" * 128)
+
+        # Patient / study
+        ds.PatientID = source_metadata.get('PatientID', 'ANONYMOUS')
+        ds.PatientName = source_metadata.get('PatientName', 'Anonymous')
+        ds.StudyInstanceUID = study_uid
+        ds.StudyDate = source_metadata.get('StudyDate', time.strftime('%Y%m%d'))
+        ds.StudyDescription = source_metadata.get('StudyDescription', 'DCE-MRI Study')
+
+        # Series
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesNumber = series_number
+        ds.SeriesDescription = desc
+
+        # Instance
+        ds.SOPClassUID = pydicom.uid.MRImageStorage
+        ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+        ds.InstanceNumber = z + 1
+
+        # Geometry
+        ds.SliceLocation = float(z * spacing[2])
+        ds.ImagePositionPatient = [0.0, 0.0, float(z * spacing[2])]
+        ds.InStackPositionNumber = z + 1
+
+        ds.Modality = 'MR'
+        # DERIVED/SECONDARY because these come from the registered volume,
+        # not the original acquisition.
+        ds.ImageType = ['DERIVED', 'SECONDARY', 'REGISTERED']
+        ds.Rows = y_dim
+        ds.Columns = x_dim
+        ds.PixelSpacing = [float(spacing[1]), float(spacing[0])]
+        ds.SliceThickness = float(spacing[2])
+        ds.SpacingBetweenSlices = float(spacing[2])
+
+        # Pixel data — anatomical T1/T2 are non-negative; map to uint16 with
+        # a global rescale so the full dynamic range survives.
+        ds.BitsAllocated = 16
+        ds.BitsStored = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 0
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = 'MONOCHROME2'
+
+        slice_clean = np.nan_to_num(slice_2d, nan=0.0)
+        slice_min = float(slice_clean.min())
+        slice_max = float(slice_clean.max())
+        if slice_max > slice_min:
+            scaled = ((slice_clean - slice_min) / (slice_max - slice_min) * 65535).astype(np.uint16)
+            ds.RescaleSlope = (slice_max - slice_min) / 65535
+            ds.RescaleIntercept = slice_min
+        else:
+            scaled = np.zeros_like(slice_clean, dtype=np.uint16)
+            ds.RescaleSlope = 1.0
+            ds.RescaleIntercept = 0.0
+        ds.PixelData = scaled.tobytes()
+
+        ds.save_as(str(filepath))
+        saved_files.append(str(filepath))
+
+    return saved_files
+
+
 def save_derived_image_as_dicom(
     image: np.ndarray,
     output_path: str,

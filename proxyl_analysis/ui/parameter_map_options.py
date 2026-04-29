@@ -548,6 +548,8 @@ class ParameterMapResultsDialog(QDialog):
                  output_dir: str = './output',
                  reference_image: Optional[np.ndarray] = None,
                  source_dicom: Optional[str] = None,
+                 registered_4d: Optional[np.ndarray] = None,
+                 registered_t2: Optional[np.ndarray] = None,
                  parent=None):
         super().__init__(parent)
         self.param_maps = param_maps
@@ -556,6 +558,11 @@ class ParameterMapResultsDialog(QDialog):
         self.output_dir = output_dir
         self.reference_image = reference_image or param_maps.get('reference_slice')
         self.source_dicom = source_dicom
+        # Anatomical sources kept around so the Save-as-DICOM export can
+        # optionally write the corresponding T1 baseline and T2 volumes
+        # alongside the parameter maps. Either may be None if not available.
+        self.registered_4d = registered_4d
+        self.registered_t2 = registered_t2
 
         # Get map dimensions
         self.kb_map = param_maps.get('kb_map', np.array([]))
@@ -1113,11 +1120,71 @@ class ParameterMapResultsDialog(QDialog):
                 checkboxes[key] = cb
                 layout.addWidget(cb)
 
+        # Reset the captured anatomical-export flags — these are populated
+        # below from checkbox state *before* the dialog goes out of scope.
+        # We can't keep the QCheckBox widgets around past dialog.exec()
+        # because Qt deletes child widgets when the parent dialog is
+        # destroyed, leaving stale Python wrappers that raise RuntimeError
+        # on .isChecked(). So we read the values now, store booleans.
+        self._include_t1 = False
+        self._include_t2 = False
+
+        # Local checkbox handles (don't store on self — they die with the dialog).
+        include_t1_cb = None
+        include_t2_cb = None
+
+        if format_type == 'dicom':
+            anat_label = QLabel("\nInclude anatomical reference:")
+            anat_label.setStyleSheet("font-weight: bold;")
+            layout.addWidget(anat_label)
+
+            if self.registered_4d is not None:
+                include_t1_cb = QCheckBox("T1 baseline (timepoint 0)")
+                # Default off — the parameter maps are the primary export;
+                # T1/T2 are opt-in extras.
+                include_t1_cb.setChecked(False)
+                layout.addWidget(include_t1_cb)
+            if self.registered_t2 is not None:
+                include_t2_cb = QCheckBox("T2 anatomical")
+                include_t2_cb.setChecked(False)
+                layout.addWidget(include_t2_cb)
+            if include_t1_cb is None and include_t2_cb is None:
+                disabled = QLabel("(no T1/T2 source available for this dataset)")
+                disabled.setStyleSheet("color: #888; font-style: italic;")
+                layout.addWidget(disabled)
+
+        # PNG-only: anatomical-overlay variant checkboxes. Captured as
+        # booleans on self before the dialog goes out of scope.
+        self._png_plain = True
+        self._png_overlay = False
+        png_plain_cb = None
+        png_overlay_cb = None
+
         if format_type == 'png':
             layout.addWidget(QLabel(""))  # Spacer
+
             self._include_roi_cb = QCheckBox("Include ROI overlay")
             self._include_roi_cb.setChecked(self.roi_checkbox.isChecked())
             layout.addWidget(self._include_roi_cb)
+
+            anat_label = QLabel("\nAnatomical underlay:")
+            anat_label.setStyleSheet("font-weight: bold;")
+            layout.addWidget(anat_label)
+
+            png_plain_cb = QCheckBox("Save without anatomical overlay")
+            png_plain_cb.setChecked(True)
+            layout.addWidget(png_plain_cb)
+
+            png_overlay_cb = QCheckBox("Save with anatomical overlay")
+            # Only enabled when there's a reference image to underlay on.
+            has_reference = self.reference_image is not None
+            png_overlay_cb.setEnabled(has_reference)
+            png_overlay_cb.setChecked(has_reference)
+            layout.addWidget(png_overlay_cb)
+            if not has_reference:
+                hint = QLabel("(no anatomical reference loaded for this dataset)")
+                hint.setStyleSheet("color: #888; font-style: italic;")
+                layout.addWidget(hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -1127,6 +1194,23 @@ class ParameterMapResultsDialog(QDialog):
         if dialog.exec() == QDialog.Accepted:
             selected = [key for key, cb in checkboxes.items() if cb.isChecked()]
             include_roi = self._include_roi_cb.isChecked() if format_type == 'png' else False
+            # Capture anatomical flags as plain booleans while the dialog
+            # (and its child widgets) are still alive.
+            self._include_t1 = bool(include_t1_cb and include_t1_cb.isChecked())
+            self._include_t2 = bool(include_t2_cb and include_t2_cb.isChecked())
+            # Same for PNG variant flags.
+            if format_type == 'png':
+                self._png_plain = bool(png_plain_cb and png_plain_cb.isChecked())
+                self._png_overlay = bool(png_overlay_cb and png_overlay_cb.isChecked())
+                # Default to at least the plain variant if user accidentally
+                # unchecked both — exporting nothing is rarely the intent.
+                if not (self._png_plain or self._png_overlay):
+                    self._png_plain = True
+            # Allow OK with zero parameter maps but at least one anatomical
+            # checked — useful when the user just wants T1/T2 alongside an
+            # existing parameter-map export.
+            if not selected and not (self._include_t1 or self._include_t2):
+                return None, False
             return selected, include_roi
         return None, False
 
@@ -1137,11 +1221,25 @@ class ParameterMapResultsDialog(QDialog):
 
         # Show map selection dialog
         selected_maps, include_roi = self._show_map_selection_dialog(format_type)
-        if not selected_maps:
+
+        # Anatomical-export flags are captured as booleans (not widget
+        # references) inside the dialog method — see _show_map_selection_dialog
+        # — so they're safe to read here even though the dialog has gone
+        # out of scope and Qt has destroyed the underlying QCheckBox widgets.
+        include_t1 = bool(format_type == 'dicom' and getattr(self, '_include_t1', False))
+        include_t2 = bool(format_type == 'dicom' and getattr(self, '_include_t2', False))
+
+        # Allow proceeding when at least one of: parameter maps, T1, or T2
+        # was checked. The dialog enforces this too, but guard here in case
+        # of a code path that bypasses it.
+        if not selected_maps and not include_t1 and not include_t2:
             return
+        # selected_maps may be an empty list if the user only wants T1/T2.
+        if selected_maps is None:
+            selected_maps = []
 
         if format_type == 'dicom':
-            from ..io import save_parameter_map_as_dicom
+            from ..io import save_parameter_map_as_dicom, save_volume_as_dicom_series
 
             folder = QFileDialog.getExistingDirectory(
                 self, "Select Export Folder",
@@ -1161,6 +1259,29 @@ class ParameterMapResultsDialog(QDialog):
                         )
                         total_files += len(saved)
 
+                # Optional: T1 baseline (timepoint 0 of the registered 4D
+                # series). Use a 4900-range series offset, well clear of
+                # the parameter-map offsets (4000–5300).
+                if include_t1 and self.registered_4d is not None:
+                    t1_baseline = self.registered_4d[:, :, :, 0]
+                    saved = save_volume_as_dicom_series(
+                        t1_baseline, "T1_baseline", str(folder), self.spacing,
+                        source_dicom=self.source_dicom,
+                        series_description="T1 baseline (registered, t=0)",
+                        series_offset=6000,
+                    )
+                    total_files += len(saved)
+
+                # Optional: T2 anatomical
+                if include_t2 and self.registered_t2 is not None:
+                    saved = save_volume_as_dicom_series(
+                        self.registered_t2, "T2", str(folder), self.spacing,
+                        source_dicom=self.source_dicom,
+                        series_description="T2 anatomical (registered)",
+                        series_offset=6100,
+                    )
+                    total_files += len(saved)
+
                 QMessageBox.information(
                     self, "Exported",
                     f"Saved {total_files} DICOM files to:\n{folder}"
@@ -1172,36 +1293,74 @@ class ParameterMapResultsDialog(QDialog):
                 str(output_path)
             )
             if folder:
+                import shutil
+
                 folder = Path(folder)
                 saved_files = []
 
-                # Save current display settings
+                # Save current display settings so we can restore the
+                # viewer to where the user left it after the export run.
                 original_map = self.current_map
+                original_z = self.current_z
                 original_roi = self.roi_checkbox.isChecked()
+                original_overlay = self.overlay_mode
 
                 # Set ROI display
                 self.roi_checkbox.setChecked(include_roi)
 
+                # Build the list of anatomical-overlay variants the user
+                # asked for. Each entry is (overlay_on?, filename_suffix).
+                # When both are checked we emit two PNGs per slice with
+                # different suffixes so they can coexist in the same
+                # subfolder without overwriting each other.
+                variants = []
+                if getattr(self, '_png_plain', True):
+                    variants.append((False, ''))
+                if getattr(self, '_png_overlay', False):
+                    variants.append((True, '_overlay'))
+                if not variants:
+                    variants = [(False, '')]  # safety net
+
+                # Iterate over every selected map AND every z-slice so the
+                # export gives you a complete stack instead of just whatever
+                # slice was visible at the moment Save was clicked. Each map
+                # gets its own subfolder mirroring the DICOM export layout
+                # (<folder>/<map_name>/<map_name>_zNN.png), and stale files
+                # from previous exports are wiped before the new run so a
+                # re-export with different settings doesn't leave orphans.
                 for key in selected_maps:
-                    # Update display to this map
                     self.current_map = key
-                    self._update_display()
-
-                    # Generate filename
                     map_name = key.replace('_map', '')
-                    filename = f"{map_name}_z{self.current_z:02d}"
-                    if include_roi:
-                        filename += "_with_roi"
-                    filename += ".png"
 
-                    filepath = folder / filename
-                    self.figure.savefig(str(filepath), dpi=150, bbox_inches='tight',
-                                       facecolor='white', edgecolor='none')
-                    saved_files.append(str(filepath))
+                    map_dir = folder / map_name
+                    shutil.rmtree(map_dir, ignore_errors=True)
+                    map_dir.mkdir(parents=True, exist_ok=True)
+
+                    for z in range(self.num_slices):
+                        self.current_z = z
+                        for overlay_on, variant_suffix in variants:
+                            self.overlay_mode = overlay_on
+                            self._update_display()
+
+                            filename = f"{map_name}_z{z:02d}"
+                            if variant_suffix:
+                                filename += variant_suffix
+                            if include_roi:
+                                filename += "_with_roi"
+                            filename += ".png"
+
+                            filepath = map_dir / filename
+                            self.figure.savefig(
+                                str(filepath), dpi=150, bbox_inches='tight',
+                                facecolor='white', edgecolor='none',
+                            )
+                            saved_files.append(str(filepath))
 
                 # Restore original settings
                 self.current_map = original_map
+                self.current_z = original_z
                 self.roi_checkbox.setChecked(original_roi)
+                self.overlay_mode = original_overlay
                 self._update_display()
 
                 QMessageBox.information(
@@ -1323,7 +1482,9 @@ def show_parameter_map_results(param_maps: Dict[str, np.ndarray],
                                 spacing: Tuple[float, float, float],
                                 roi_mask: Optional[np.ndarray] = None,
                                 output_dir: str = './output',
-                                source_dicom: Optional[str] = None) -> None:
+                                source_dicom: Optional[str] = None,
+                                registered_4d: Optional[np.ndarray] = None,
+                                registered_t2: Optional[np.ndarray] = None) -> None:
     """
     Show the parameter map results viewer.
 
@@ -1339,6 +1500,13 @@ def show_parameter_map_results(param_maps: Dict[str, np.ndarray],
         Output directory for exports
     source_dicom : str, optional
         Path to source DICOM for metadata in exports
+    registered_4d : np.ndarray, optional
+        Registered T1 4D volume [x, y, z, t]. When provided, the Save-as-
+        DICOM export gains a "Include T1 baseline" checkbox that writes
+        registered_4d[:, :, :, 0] alongside the parameter maps.
+    registered_t2 : np.ndarray, optional
+        Registered T2 3D volume. When provided, the Save-as-DICOM export
+        gains a "Include T2 anatomical" checkbox.
     """
     app = init_qt_app()
 
@@ -1347,7 +1515,9 @@ def show_parameter_map_results(param_maps: Dict[str, np.ndarray],
         spacing=spacing,
         roi_mask=roi_mask,
         output_dir=output_dir,
-        source_dicom=source_dicom
+        source_dicom=source_dicom,
+        registered_4d=registered_4d,
+        registered_t2=registered_t2,
     )
 
     dialog.exec()

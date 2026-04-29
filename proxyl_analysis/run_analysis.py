@@ -1002,14 +1002,19 @@ def main():
                         # Store entire 3D reference for z-slice navigation
                         param_maps['reference_slice'] = registered_4d[:, :, :, 0]
 
-                    # Show results viewer (T014)
+                    # Show results viewer (T014). Pass registered_4d and
+                    # registered_t2 so the Save-as-DICOM export can offer
+                    # "Include T1 baseline" / "Include T2 anatomical"
+                    # alongside the parameter maps.
                     print("Displaying parameter map results...")
                     show_parameter_map_results(
                         param_maps=param_maps,
                         spacing=spacing,
                         roi_mask=param_roi_mask,
                         output_dir=str(auto_registration_dir),
-                        source_dicom=args.dicom
+                        source_dicom=args.dicom,
+                        registered_4d=registered_4d,
+                        registered_t2=registered_t2,
                     )
 
                     # Save parameter maps
