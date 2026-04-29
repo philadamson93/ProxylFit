@@ -263,10 +263,18 @@ def create_parameter_maps(registered_4d: np.ndarray,
         (window_x, window_y, window_z), signal_threshold, time_units,
     )
 
+    # Counter incremented inside _store on every non-None fit result.
+    # Used as the basis for success_rate so the percentage reflects
+    # iterated-positions converged, not filled pixels — without this,
+    # stride>1 inflates the pixel count by stride² and pushes the rate
+    # past 100% (a stride=3 run with ~53% convergence reads as ~478%).
+    successful_count = [0]
+
     def _store(result):
         """Write a fit-result tuple into the output maps."""
         if result is None:
             return
+        successful_count[0] += 1
         (x, y, z_idx, kb, kd, knt, r2,
          A1, A2, A0, t0, tmax, A0_est, A2_est) = result
         x_end_blk = min(x + stride, x_size)
@@ -324,11 +332,19 @@ def create_parameter_maps(registered_4d: np.ndarray,
             _store(_fit_pixel(pos))
 
     elapsed_time = time.time() - start_time
-    successful_fits = int(np.sum(fit_mask))
+    # successful_fits is the count of iterated positions where the fit
+    # converged — capped at total_positions, so success_rate stays in
+    # [0, 100]%. fit_mask sums many more pixels than that whenever
+    # stride>1 (each successful position fills a stride×stride block),
+    # so don't reuse it for the rate.
+    successful_fits = successful_count[0]
+    filled_pixels = int(np.sum(fit_mask))
     success_rate = (100.0 * successful_fits / total_positions) if total_positions else 0.0
 
     print(f"Parameter mapping completed in {elapsed_time:.1f} seconds")
     print(f"Successful fits: {successful_fits}/{total_positions} ({success_rate:.1f}%)")
+    if filled_pixels != successful_fits:
+        print(f"  Filled pixels (stride blocks): {filled_pixels}")
 
     # Derived percent maps:
     #   100*A1/A0     (%Enhancement)

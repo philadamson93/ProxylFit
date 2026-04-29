@@ -939,24 +939,29 @@ def main():
                         current_z=roi_state.get('z_slice', 4) if roi_state else 4,
                         existing_roi=roi_state.get('roi_mask') if roi_state else None,
                         existing_injection_idx=roi_state.get('injection_idx') if roi_state else None,
-                        default_window_size=menu_result.get('window_size', (15, 15, 3))
+                        default_window_size=menu_result.get('window_size', (15, 15, 1))
                     )
 
                     if options is None:
                         print("Parameter mapping cancelled.")
                         continue
 
-                    # Determine ROI mask to use
+                    # Determine ROI mask to use, and remember the slice
+                    # that ROI lives on so the representative-curve signal
+                    # is computed from that slice (not averaged across z).
                     param_roi_mask = None
+                    param_roi_z = None
                     if options['roi_only']:
                         if options['reuse_roi'] and roi_state is not None:
                             param_roi_mask = roi_state['roi_mask']
+                            param_roi_z = roi_state.get('z_slice')
                             print(f"Reusing existing ROI ({np.sum(param_roi_mask)} pixels)")
                         elif options['redraw_roi']:
                             # Draw new ROI for parameter mapping
                             z_for_roi = options['z_slice'] if options['single_slice'] else registered_4d.shape[2] // 2
                             print(f"Drawing new ROI on slice {z_for_roi}...")
                             param_roi_mask = select_manual_contour_roi_qt(registered_4d, z_for_roi)
+                            param_roi_z = z_for_roi
                             if not np.any(param_roi_mask):
                                 print("No ROI was drawn. Returning to menu.")
                                 continue

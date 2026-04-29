@@ -239,7 +239,7 @@ class ParameterMapOptionsDialog(QDialog):
                  current_z: int = 4,
                  existing_roi: Optional[np.ndarray] = None,
                  existing_injection_idx: Optional[int] = None,
-                 default_window_size: Tuple[int, int, int] = (15, 15, 3),
+                 default_window_size: Tuple[int, int, int] = (15, 15, 1),
                  parent=None):
         super().__init__(parent)
         self.max_z = max_z
@@ -1457,7 +1457,7 @@ def show_parameter_map_options(max_z: int = 8,
                                 current_z: int = 4,
                                 existing_roi: Optional[np.ndarray] = None,
                                 existing_injection_idx: Optional[int] = None,
-                                default_window_size: Tuple[int, int, int] = (15, 15, 3)) -> Optional[dict]:
+                                default_window_size: Tuple[int, int, int] = (15, 15, 1)) -> Optional[dict]:
     """
     Show the parameter map options dialog.
 
