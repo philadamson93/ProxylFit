@@ -680,10 +680,22 @@ def save_registered_as_dicom_series(
     source_dicom: str = None
 ) -> str:
     """
-    Save registered 4D data as a series of 2D DICOM files.
+    Save registered 4D data as a series of 2D DICOM files, organized by slice.
 
-    Each file is a single 2D slice. Files are organized as z{ZZ}_t{TTT}.dcm
-    where slices iterate through all timepoints before moving to the next z-slice.
+    Layout:
+        <output_dir>/registered/dicoms/T1/
+            z00/
+                t000.dcm
+                t001.dcm
+                ...
+            z01/
+                ...
+            series_info.json
+
+    The T1 subfolder sits alongside the T2 subfolder produced by
+    save_registered_t2_as_dicom, and the per-slice z folders avoid having
+    1000+ files in a single directory (which gets unwieldy in Finder /
+    most DICOM viewers).
 
     Parameters
     ----------
@@ -692,7 +704,7 @@ def save_registered_as_dicom_series(
     spacing : tuple
         Voxel spacing (x, y, z) in mm
     output_dir : str
-        Output directory (will create 'registered/dicoms' subdirectory)
+        Output directory (will create 'registered/dicoms/T1' subdirectory)
     series_description : str
         DICOM SeriesDescription tag value
     source_dicom : str, optional
@@ -701,13 +713,18 @@ def save_registered_as_dicom_series(
     Returns
     -------
     str
-        Path to the created DICOM series directory
+        Path to the created DICOM series directory (the T1/ subdir).
     """
     import pydicom
+    import shutil
     from pydicom.dataset import FileDataset
 
-    # Create output directory
-    dicom_dir = get_dataset_path(output_dir, 'registered/dicoms')
+    # Wipe the T1 subdir before writing so a re-run doesn't leave stale
+    # files from a previous shape (e.g., different number of timepoints
+    # after reloading a different DICOM source).
+    dicom_dir = Path(get_dataset_path(output_dir, 'registered/dicoms')) / 'T1'
+    shutil.rmtree(dicom_dir, ignore_errors=True)
+    dicom_dir.mkdir(parents=True, exist_ok=True)
 
     x_dim, y_dim, z_dim, n_timepoints = registered_4d.shape
     total_files = z_dim * n_timepoints
@@ -725,17 +742,20 @@ def save_registered_as_dicom_series(
     original_series = source_metadata.get('OriginalSeriesNumber', 1)
     series_number = original_series + 1000
 
-    # Save each 2D slice as a separate DICOM file
+    # Save each 2D slice as a separate DICOM file. One subfolder per
+    # z-slice; files inside are simply t<TTT>.dcm.
     instance_number = 1
     for z in range(z_dim):
+        slice_dir = dicom_dir / f'z{z:02d}'
+        slice_dir.mkdir(parents=True, exist_ok=True)
+
         for t in range(n_timepoints):
             # Get 2D slice [x, y] -> need [y, x] for DICOM
             slice_2d = registered_4d[:, :, z, t]
             slice_dicom = slice_2d.T  # Transpose to [y, x]
 
-            # Create file with z and t in filename
-            filename = f"z{z:02d}_t{t:03d}.dcm"
-            filepath = dicom_dir / filename
+            filename = f"t{t:03d}.dcm"
+            filepath = slice_dir / filename
 
             # Create minimal DICOM dataset
             file_meta = pydicom.dataset.FileMetaDataset()
@@ -808,9 +828,9 @@ def save_registered_as_dicom_series(
 
     # Save series info JSON
     series_info = {
-        'format_version': '2.0',
-        'format_type': '2d_slices',
-        'file_pattern': 'z{z:02d}_t{t:03d}.dcm',
+        'format_version': '2.1',  # bumped from 2.0: per-slice subdirs
+        'format_type': '2d_slices_per_slice_dirs',
+        'file_pattern': 'z{z:02d}/t{t:03d}.dcm',
         'n_slices': z_dim,
         'n_timepoints': n_timepoints,
         'total_files': total_files,
@@ -832,12 +852,18 @@ def save_registered_as_dicom_series(
 
 def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[float, float, float]]:
     """
-    Load a registered DICOM series (2D slice format) back into 4D array.
+    Load a registered DICOM series (2D slice format) back into a 4D array.
+
+    Auto-detects both the current per-slice-subdir layout
+    (``z{ZZ}/t{TTT}.dcm`` written by save_registered_as_dicom_series since
+    format_version 2.1) and the legacy flat layout
+    (``z{ZZ}_t{TTT}.dcm`` from version 2.0). Pre-existing on-disk
+    registrations from older runs continue to load without re-running.
 
     Parameters
     ----------
     series_dir : str
-        Path to directory containing registered DICOM files (z{ZZ}_t{TTT}.dcm format)
+        Path to directory containing the registered DICOM files.
 
     Returns
     -------
@@ -849,17 +875,24 @@ def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[flo
     Raises
     ------
     FileNotFoundError
-        If the directory doesn't contain valid 2D slice DICOM files
+        If neither layout's marker file is present.
     """
     import pydicom
 
     series_path = Path(series_dir)
 
-    # Check for new 2D slice format
-    if not (series_path / 'z00_t000.dcm').exists():
+    # Detect layout. New: z00/t000.dcm. Old: z00_t000.dcm.
+    new_layout_marker = series_path / 'z00' / 't000.dcm'
+    old_layout_marker = series_path / 'z00_t000.dcm'
+    if new_layout_marker.exists():
+        layout = 'per_slice_dirs'
+    elif old_layout_marker.exists():
+        layout = 'flat'
+    else:
         raise FileNotFoundError(
             f"No valid DICOM series found in {series_path}.\n"
-            "Expected format: z00_t000.dcm, z00_t001.dcm, ...\n"
+            "Expected either z00/t000.dcm (current layout) or z00_t000.dcm "
+            "(legacy flat layout).\n"
             "Please re-run registration to generate updated DICOM output."
         )
 
@@ -880,10 +913,14 @@ def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[flo
     # Initialize 4D array
     registered_4d = np.zeros((x_dim, y_dim, z_dim, n_timepoints), dtype=np.float64)
 
-    # Load each 2D slice
+    # Load each 2D slice using the layout we detected.
     for z in range(z_dim):
         for t in range(n_timepoints):
-            filepath = series_path / f'z{z:02d}_t{t:03d}.dcm'
+            if layout == 'per_slice_dirs':
+                filepath = series_path / f'z{z:02d}' / f't{t:03d}.dcm'
+            else:  # 'flat'
+                filepath = series_path / f'z{z:02d}_t{t:03d}.dcm'
+
             if not filepath.exists():
                 raise FileNotFoundError(f"Missing DICOM file: {filepath}")
 
@@ -897,7 +934,7 @@ def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[flo
             # Transpose from [y, x] to [x, y] and store
             registered_4d[:, :, z, t] = pixel_data.T
 
-    print(f"Loaded registered DICOM series with shape: {registered_4d.shape}")
+    print(f"Loaded registered DICOM series ({layout}) with shape: {registered_4d.shape}")
     return registered_4d, spacing
 
 
@@ -929,10 +966,15 @@ def save_registered_t2_as_dicom(
         Path to the created DICOM series directory
     """
     import pydicom
+    import shutil
     from pydicom.dataset import FileDataset
 
-    # Create output directory
-    dicom_dir = get_dataset_path(output_dir, 'registered/dicoms/T2')
+    # Wipe the T2 subdir before writing so a re-run doesn't leave stale
+    # files (e.g., if a different T2 source was loaded). Same convention
+    # as the T1 series writer.
+    dicom_dir = Path(get_dataset_path(output_dir, 'registered/dicoms')) / 'T2'
+    shutil.rmtree(dicom_dir, ignore_errors=True)
+    dicom_dir.mkdir(parents=True, exist_ok=True)
 
     x_dim, y_dim, z_dim = registered_t2.shape
 
