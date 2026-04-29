@@ -200,10 +200,24 @@ class RegistrationProgressDialog(QDialog):
                 f"Time: {metrics_info['time']:.1f}s"
             )
 
-            # Add to plot data
-            self.timepoints.append(current)
+            # Plot against the actual timepoint index, not the completion
+            # count — in parallel mode timepoints come back in arbitrary
+            # order, and using `current` as the x-axis makes the live plot
+            # disagree with the final accept-page chart (which is sorted
+            # by timepoint). Fall back to `current` for older callers that
+            # don't pass 'timepoint' in metrics_info.
+            tp = metrics_info.get('timepoint', current)
+            self.timepoints.append(tp)
             self.translations.append(metrics_info['translation_mm'])
             self.mse_values.append(metrics_info['mse'])
+
+            # Sort by timepoint so the line plot stays monotonic in x
+            # regardless of completion order.
+            order = sorted(range(len(self.timepoints)),
+                           key=lambda i: self.timepoints[i])
+            self.timepoints   = [self.timepoints[i]   for i in order]
+            self.translations = [self.translations[i] for i in order]
+            self.mse_values   = [self.mse_values[i]   for i in order]
 
             # Update plots
             self._update_plots(total)

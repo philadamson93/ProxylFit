@@ -3,17 +3,105 @@ Registration module for rigid registration of time-resolved MRI volumes.
 Enhanced with save/load functionality, quality metrics, and visualization.
 """
 
+import os
 import numpy as np
 import SimpleITK as sitk
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.widgets import Button
 from pathlib import Path
 import json
 import time
-from typing import Tuple, Optional, Dict, List, Callable
+from typing import Tuple, Optional, Dict, List, Callable, Any
 from dataclasses import dataclass, asdict
-from .model import add_proxylfit_logo, set_proxylfit_style
+
+# matplotlib + model are imported lazily inside the visualization functions.
+# Top-level imports here would force every multiprocessing.Pool subprocess
+# to re-import the entire matplotlib stack and model.py at spawn time, which
+# was costing ~4s/worker on macOS (8 workers × 4s = ~30+ seconds of init
+# before the first registration even started).
+
+
+# ---------------------------------------------------------------------------
+# Per-timepoint registration worker (used by both the sequential path and
+# the multiprocessing.Pool path in register_timeseries). Workers receive the
+# reference volume once via _init_register_worker so we don't pickle it on
+# every task. Each worker also pins SimpleITK to a single thread — Pool
+# already gives us one process per core, and SimpleITK's internal threading
+# would otherwise oversubscribe (e.g., 8 workers × 8 threads = 64 logical
+# threads on an 8-core machine).
+# ---------------------------------------------------------------------------
+
+_REGISTER_WORKER_CTX: Dict[str, Any] = {}
+
+
+def _init_register_context(reference_volume, spacing):
+    """Stash the reference image + spacing in the worker context.
+
+    Used by both the main process for the sequential fallback path, and
+    by Pool subprocesses (via _init_register_worker). Does NOT touch
+    SimpleITK's thread setting — sequential mode benefits from default
+    multi-threading, parallel mode needs single-threaded workers.
+    """
+    _REGISTER_WORKER_CTX['reference_image'] = _numpy_to_sitk(
+        reference_volume, spacing
+    )
+    _REGISTER_WORKER_CTX['reference_volume'] = reference_volume
+    _REGISTER_WORKER_CTX['spacing'] = spacing
+
+
+def _init_register_worker(reference_volume, spacing):
+    """Pool initializer — stash reference, pin SimpleITK to 1 thread.
+
+    The thread pin matters: Pool already gives us one process per core,
+    and SimpleITK's internal threading would otherwise oversubscribe
+    (e.g., 8 workers × 8 threads = 64 logical threads on an 8-core box).
+    Only the Pool subprocesses run this; the main process uses
+    _init_register_context directly to keep its default thread count.
+    """
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+    _init_register_context(reference_volume, spacing)
+
+
+def _register_one_timepoint(args):
+    """
+    Register a single timepoint volume against the cached reference.
+
+    Returns a flat tuple of plain-Python / numpy values so it survives
+    pickling. The caller reassembles a RegistrationMetrics record from these.
+    """
+    timepoint, moving_volume = args
+    ctx = _REGISTER_WORKER_CTX
+    reference_image = ctx['reference_image']
+    reference_volume = ctx['reference_volume']
+    spacing = ctx['spacing']
+
+    start_time = time.time()
+
+    moving_image = _numpy_to_sitk(moving_volume, spacing)
+    registered_image, transform, reg_metrics = _register_volumes_with_metrics(
+        reference_image, moving_image
+    )
+    registered_volume = _sitk_to_numpy(registered_image)
+
+    ncc = compute_registration_quality(reference_image, registered_image)
+    mutual_info = compute_mutual_information(reference_image, registered_image)
+    mse = compute_mean_squared_error(reference_volume, registered_volume)
+
+    translation = transform.GetTranslation()
+    rotation = (transform.GetAngleX(), transform.GetAngleY(), transform.GetAngleZ())
+
+    registration_time = time.time() - start_time
+
+    return (
+        timepoint,
+        registered_volume,
+        ncc,
+        mutual_info,
+        mse,
+        translation,
+        rotation,
+        reg_metrics['iterations'],
+        reg_metrics['final_metric'],
+        registration_time,
+    )
 
 
 @dataclass
@@ -34,7 +122,8 @@ def register_timeseries(image_4d: np.ndarray, spacing: Tuple[float, float, float
                        output_dir: Optional[str] = None,
                        show_quality_window: bool = True,
                        dicom_path: Optional[str] = None,
-                       progress_callback: Optional[Callable[[int, int, str], None]] = None) -> Tuple[np.ndarray, List[RegistrationMetrics]]:
+                       progress_callback: Optional[Callable[[int, int, str], None]] = None,
+                       n_workers: Optional[int] = None) -> Tuple[np.ndarray, List[RegistrationMetrics]]:
     """
     Register each timepoint volume to the first timepoint using rigid registration.
 
@@ -55,6 +144,14 @@ def register_timeseries(image_4d: np.ndarray, spacing: Tuple[float, float, float
         Signature: progress_callback(current: int, total: int, message: str, metrics_info: dict|None) -> None
         metrics_info is None when starting a timepoint, or a dict with 'mse', 'translation_mm',
         'translation_px', 'time' after completion.
+    n_workers : int, optional
+        Number of worker processes used for parallel per-timepoint
+        registration. Defaults to ``min(os.cpu_count(), n_timepoints, 12)``,
+        which adapts to the host machine and never spawns more workers than
+        there is work to do. Pass ``1`` to force sequential execution; pass
+        ``0`` for the same auto-select behaviour as ``None``. Each worker
+        runs SimpleITK single-threaded so that N parallel workers use
+        exactly N cores instead of oversubscribing the CPU.
 
     Returns
     -------
@@ -89,43 +186,44 @@ def register_timeseries(image_4d: np.ndarray, spacing: Tuple[float, float, float
     metrics.append(ref_metrics)
     
     print(f"Registering {t-1} timepoints to reference (t=0)...")
-    
-    # Register each subsequent timepoint
-    for timepoint in range(1, t):
-        status_msg = f"Registering timepoint {timepoint}/{t-1}"
-        print(f"  {status_msg}")
 
-        # Call progress callback if provided (None for metrics_info means "in progress")
-        if progress_callback:
-            progress_callback(timepoint, t - 1, status_msg, None)
-        
-        start_time = time.time()
-        
-        # Convert moving volume to SimpleITK image
-        moving_volume = image_4d[:, :, :, timepoint]
-        moving_image = _numpy_to_sitk(moving_volume, spacing)
-        
-        # Perform rigid registration with metrics
-        registered_image, transform, reg_metrics = _register_volumes_with_metrics(
-            reference_image, moving_image
+    # Auto-select worker count: cap at min(cpu_count, n_timepoints, 12).
+    # The 12 cap leaves some breathing room on big machines (Mac Studios
+    # and the like) so registration doesn't peg every core; raise it if
+    # you've got a many-core box and want more parallelism. Pool startup
+    # has measurable overhead, so fall back to sequential when there
+    # aren't enough timepoints to justify it.
+    n_timepoints = t - 1
+    if not n_workers:
+        n_workers = min(os.cpu_count() or 1, max(n_timepoints, 1), 12)
+    n_workers = max(1, int(n_workers))
+    use_pool = n_workers > 1 and n_timepoints >= 2 * n_workers
+
+    if n_timepoints:
+        print(
+            f"  Using {n_workers} worker"
+            f"{'s' if n_workers != 1 else ''} ("
+            f"{'parallel' if use_pool else 'sequential'})"
         )
-        
-        # Convert back to numpy and store
-        registered_volume = _sitk_to_numpy(registered_image)
+
+    # Stash inputs on the main process so the sequential path can reuse the
+    # same _register_one_timepoint helper as the worker processes. Use
+    # _init_register_context (not _init_register_worker) here so the main
+    # process keeps SimpleITK's default multi-threaded behavior — the
+    # thread pin is only desirable inside Pool subprocesses.
+    _init_register_context(reference_volume, spacing)
+
+    def _ingest_result(result):
+        """Reassemble a RegistrationMetrics record from the worker's tuple
+        and run the same post-processing the original sequential loop did:
+        store registered volume, append to metrics, print a summary line,
+        fire the progress callback."""
+        (timepoint, registered_volume, ncc, mutual_info, mse,
+         translation, rotation, iterations, final_metric,
+         registration_time) = result
+
         registered_4d[:, :, :, timepoint] = registered_volume
-        
-        # Calculate additional quality metrics
-        ncc = compute_registration_quality(reference_image, registered_image)
-        mutual_info = compute_mutual_information(reference_image, registered_image)
-        mse = compute_mean_squared_error(_sitk_to_numpy(reference_image), registered_volume)
-        
-        # Extract transform parameters
-        translation = transform.GetTranslation()
-        rotation = (transform.GetAngleX(), transform.GetAngleY(), transform.GetAngleZ())
-        
-        registration_time = time.time() - start_time
-        
-        # Store metrics
+
         timepoint_metrics = RegistrationMetrics(
             timepoint=timepoint,
             ncc=ncc,
@@ -133,39 +231,73 @@ def register_timeseries(image_4d: np.ndarray, spacing: Tuple[float, float, float
             mean_squared_error=mse,
             translation=translation,
             rotation=rotation,
-            optimizer_iterations=reg_metrics['iterations'],
-            optimizer_metric_value=reg_metrics['final_metric'],
-            registration_time=registration_time
+            optimizer_iterations=iterations,
+            optimizer_metric_value=final_metric,
+            registration_time=registration_time,
         )
         metrics.append(timepoint_metrics)
-        
-        # Print detailed registration results with pixel debugging
-        tx, ty, tz = translation  # These are in mm from SimpleITK
-        trans_mag = np.sqrt(tx**2 + ty**2 + tz**2)
-        
-        # Calculate pixel values for debugging
-        # Extract transform parameters and convert to pixels
+
+        # Per-timepoint summary line (kept identical to the sequential path)
+        tx, ty, tz = translation
+        trans_mag = float(np.sqrt(tx ** 2 + ty ** 2 + tz ** 2))
         tx_pixels = tx / spacing[0] if spacing[0] > 0 else 0
-        ty_pixels = ty / spacing[1] if spacing[1] > 0 else 0  
+        ty_pixels = ty / spacing[1] if spacing[1] > 0 else 0
         tz_pixels = tz / spacing[2] if spacing[2] > 0 else 0
-        trans_mag_pixels = np.sqrt(tx_pixels**2 + ty_pixels**2 + tz_pixels**2)
-        
+        trans_mag_pixels = float(np.sqrt(tx_pixels ** 2 + ty_pixels ** 2 + tz_pixels ** 2))
+
+        print(f"  Timepoint {timepoint}/{n_timepoints} done in {registration_time:.1f}s")
         print(f"    MI: {mutual_info:.2f}, MSE: {mse:.2f}")
         print(f"    Translation (mm): X={tx:.2f}, Y={ty:.2f}, Z={tz:.2f} (mag={trans_mag:.2f})")
         print(f"    Translation (pixels): X={tx_pixels:.1f}, Y={ty_pixels:.1f}, Z={tz_pixels:.1f} (mag={trans_mag_pixels:.1f})")
-        print(f"    Voxel spacing (mm): X={spacing[0]:.3f}, Y={spacing[1]:.3f}, Z={spacing[2]:.3f}")
-        print(f"    Time: {registration_time:.1f}s")
 
-        # Call progress callback with metrics after completion
         if progress_callback:
             metrics_info = {
                 'mse': mse,
                 'translation_mm': trans_mag,
                 'translation_px': trans_mag_pixels,
-                'time': registration_time
+                'time': registration_time,
+                # Actual timepoint index — needed because parallel mode
+                # completes timepoints in arbitrary order. The progress
+                # dialog uses this for the live plot's x-axis so the
+                # running display matches what the accept-page eventually
+                # shows when metrics are sorted.
+                'timepoint': timepoint,
             }
-            progress_callback(timepoint, t - 1, f"Completed timepoint {timepoint}/{t-1}", metrics_info)
-    
+            progress_callback(
+                len(metrics) - 1,  # current count completed (excluding ref)
+                n_timepoints,
+                f"Completed timepoint {timepoint}/{n_timepoints}",
+                metrics_info,
+            )
+
+    tasks = [
+        (timepoint, image_4d[:, :, :, timepoint])
+        for timepoint in range(1, t)
+    ]
+
+    if use_pool:
+        from multiprocessing import Pool
+
+        # ~4 tasks per worker keeps load balancing reasonable without
+        # excessive IPC; registration tasks are large enough that we don't
+        # need fine-grained chunks.
+        chunksize = max(1, n_timepoints // (n_workers * 4))
+        init_args = (reference_volume, spacing)
+        with Pool(n_workers,
+                  initializer=_init_register_worker,
+                  initargs=init_args) as pool:
+            for result in pool.imap_unordered(
+                    _register_one_timepoint, tasks, chunksize=chunksize):
+                _ingest_result(result)
+    else:
+        for task in tasks:
+            _ingest_result(_register_one_timepoint(task))
+
+    # Pool.imap_unordered returns results in completion order; sort by
+    # timepoint so downstream consumers (visualizer, JSON metrics) see
+    # them in the natural order.
+    metrics.sort(key=lambda m: m.timepoint)
+
     print("Registration complete.")
     
     # Save registration data if output directory specified
@@ -289,13 +421,25 @@ def load_registration_data(output_dir: str) -> Tuple[np.ndarray, Tuple[float, fl
     from .io import load_registered_dicom_series
 
     output_path = Path(output_dir)
-    dicom_dir = output_path / "registered" / "dicoms"
 
-    # Load from DICOM series (only supported format)
-    if not dicom_dir.exists():
+    # Current layout puts T1 in registered/dicoms/T1/ (with per-slice
+    # subdirs); legacy layout had everything flat in registered/dicoms/.
+    # Try the new path first, fall back to the legacy one if the new T1
+    # subdir doesn't exist yet (i.e., this dataset was registered before
+    # the layout change). load_registered_dicom_series itself also handles
+    # the per-slice-vs-flat detection within whichever directory we pass.
+    t1_dir = output_path / "registered" / "dicoms" / "T1"
+    legacy_dir = output_path / "registered" / "dicoms"
+
+    if t1_dir.exists() and (t1_dir / 'series_info.json').exists():
+        dicom_dir = t1_dir
+    elif legacy_dir.exists() and (legacy_dir / 'series_info.json').exists():
+        dicom_dir = legacy_dir
+    else:
         raise FileNotFoundError(
             f"No registered data found in: {output_dir}\n"
-            f"Expected DICOM series at: {dicom_dir}\n"
+            f"Expected DICOM series at: {t1_dir}\n"
+            f"or legacy location: {legacy_dir}\n"
             "Please re-run registration to generate DICOM output."
         )
 
@@ -323,22 +467,28 @@ def load_registration_data(output_dir: str) -> Tuple[np.ndarray, Tuple[float, fl
     return registered_4d, spacing, metrics
 
 
-def visualize_registration_quality(original_4d: np.ndarray, registered_4d: np.ndarray, 
+def visualize_registration_quality(original_4d: np.ndarray, registered_4d: np.ndarray,
                                   metrics: List[RegistrationMetrics], z_slice: int = None) -> None:
     """
     Interactive visualization window for registration quality assessment.
-    
+
     Parameters
     ----------
     original_4d : np.ndarray
         Original 4D data
     registered_4d : np.ndarray
-        Registered 4D data  
+        Registered 4D data
     metrics : List[RegistrationMetrics]
         Registration quality metrics
     z_slice : int, optional
         Z-slice to display (default: middle slice)
     """
+    # Lazy imports to keep multiprocessing.Pool subprocess startup fast —
+    # workers don't need any of these.
+    import matplotlib.pyplot as plt
+    from matplotlib.widgets import Button
+    from .model import add_proxylfit_logo, set_proxylfit_style
+
     if z_slice is None:
         z_slice = original_4d.shape[2] // 2
     
@@ -665,24 +815,37 @@ def _register_volumes_with_metrics(reference: sitk.Image, moving: sitk.Image) ->
     """
     # Initialize registration framework
     registration_method = sitk.ImageRegistrationMethod()
-    
-    # Set metric - Mutual Information with improved sampling
-    registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=100)  # More bins for better metric
+
+    # Set metric — Mattes Mutual Information.
+    # Earlier values (100 bins, 5% sampling) were tuned for accuracy at the
+    # expense of speed. For DCE-MRI where moving and reference share
+    # modality and motion is small, 50 bins × 2% sampling is well within
+    # the regime where the registration result is unchanged but each metric
+    # evaluation is ~3× cheaper.
+    registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
     registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
-    registration_method.SetMetricSamplingPercentage(0.05)  # More sampling for better accuracy
-    
+    registration_method.SetMetricSamplingPercentage(0.02)
+
     # Set interpolator - Linear
     registration_method.SetInterpolator(sitk.sitkLinear)
-    
-    # Set optimizer - Regular Step Gradient Descent with improved parameters
+
+    # Set optimizer — Regular Step Gradient Descent.
+    # Tolerances loosened from the earlier values: minStep 1e-6 → 1e-4 and
+    # gradient tolerance 1e-10 → 1e-6. The earlier settings refined the
+    # transform far below what the Z resolution can support (T1 z-spacing
+    # is ~1.5 mm; sub-100-µm z translations are interpolation noise, not
+    # signal). maxIter dropped from 2000 → 1000 — real fits converge in
+    # well under that, but at 500 the largest-motion timepoints showed
+    # visible degradation, so 1000 keeps the safety net while still being
+    # half the original ceiling.
     registration_method.SetOptimizerAsRegularStepGradientDescent(
-        learningRate=1.0,  # Reduced learning rate for more stable convergence
-        minStep=1e-6,      # Smaller minimum step for finer adjustments
-        numberOfIterations=2000,  # Increased iterations for better convergence
-        gradientMagnitudeTolerance=1e-10  # Tighter convergence tolerance
+        learningRate=1.0,
+        minStep=1e-4,
+        numberOfIterations=1000,
+        gradientMagnitudeTolerance=1e-6,
     )
     registration_method.SetOptimizerScalesFromPhysicalShift()
-    
+
     # Set transform - 3D Euler (rotation + translation)
     initial_transform = sitk.CenteredTransformInitializer(
         reference,
@@ -691,10 +854,14 @@ def _register_volumes_with_metrics(reference: sitk.Image, moving: sitk.Image) ->
         sitk.CenteredTransformInitializerFilter.GEOMETRY
     )
     registration_method.SetInitialTransform(initial_transform)
-    
-    # Set shrink factors and smoothing sigmas for multi-resolution with more levels
-    registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[8, 4, 2, 1])  # More resolution levels
-    registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[4, 2, 1, 0])  # Corresponding smoothing
+
+    # Multi-resolution pyramid — three levels (4×, 2×, 1×) instead of four
+    # (8×, 4×, 2×, 1×). The 8× level mostly catches large initial
+    # misalignments; for DCE-MRI timepoint-to-reference motion is at most
+    # a few mm so we don't need it. Three levels typically halve total
+    # iterations across the pyramid.
+    registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
+    registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
     registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
     
     # Track optimization progress
@@ -1060,6 +1227,11 @@ def _visualize_t2_t1_registration(t1_volume: np.ndarray, t2_original: np.ndarray
     z_slice : int, optional
         Z-slice to display (default: middle slice)
     """
+    # Lazy imports — same reasoning as visualize_registration_quality.
+    import matplotlib.pyplot as plt
+    from matplotlib.widgets import Button
+    from .model import set_proxylfit_style
+
     if z_slice is None:
         z_slice = t1_volume.shape[2] // 2
 
