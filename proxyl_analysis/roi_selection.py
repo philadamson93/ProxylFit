@@ -246,7 +246,75 @@ def compute_roi_timeseries(image_4d: np.ndarray, roi_mask: np.ndarray,
     return timeseries
 
 
-def visualize_roi_on_slice(image_slice: np.ndarray, roi_mask: np.ndarray, 
+def save_roi_overlay_png(reference_image: np.ndarray,
+                         roi_mask: np.ndarray,
+                         output_path: str,
+                         z_slice: Optional[int] = None,
+                         title: Optional[str] = None,
+                         contour_color: str = 'cyan') -> str:
+    """
+    Render an anatomical / parameter slice with an ROI contour overlay as a PNG.
+
+    Used as a companion to CSV exports so the saved data is self-documenting:
+    a CSV with mean ± std stats sits next to a PNG showing exactly which
+    pixels produced those numbers.
+
+    Parameters
+    ----------
+    reference_image : np.ndarray
+        2D image (x, y) or 3D volume (x, y, z) — typically the T1 baseline
+        (registered_4d[..., 0]) or a parameter map slice.
+    roi_mask : np.ndarray
+        2D boolean mask (x, y) defining the ROI to outline.
+    output_path : str
+        Destination .png path.
+    z_slice : int, optional
+        Z-slice to render when reference_image is 3D. Defaults to the
+        middle slice. Ignored if reference_image is already 2D.
+    title : str, optional
+        Plot title. Defaults to "ROI on slice z=N".
+    contour_color : str
+        matplotlib color spec for the ROI contour (default 'cyan').
+
+    Returns
+    -------
+    str
+        The output path actually written.
+    """
+    import matplotlib
+    # Use a non-interactive backend so this works headless / from worker
+    # threads / inside batch exports without popping a window.
+    if matplotlib.get_backend().lower() not in ('agg', 'pdf', 'svg', 'ps'):
+        # Already on something interactive — savefig still works fine,
+        # we just don't bother switching backends.
+        pass
+    import matplotlib.pyplot as plt
+
+    if reference_image.ndim == 3:
+        if z_slice is None:
+            z_slice = reference_image.shape[2] // 2
+        ref_slice = reference_image[:, :, z_slice]
+    else:
+        ref_slice = reference_image
+        if z_slice is None:
+            z_slice = 0
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.imshow(ref_slice.T, cmap='gray', origin='lower')
+    if roi_mask is not None and np.any(roi_mask):
+        ax.contour(roi_mask.T, levels=[0.5],
+                   colors=contour_color, linewidths=2)
+    ax.set_title(title or f"ROI on slice z={z_slice}")
+    ax.axis('off')
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=150, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close(fig)
+
+    return str(output_path)
+
+
+def visualize_roi_on_slice(image_slice: np.ndarray, roi_mask: np.ndarray,
                           title: str = "ROI Visualization") -> None:
     """
     Visualize the selected ROI overlaid on the image slice.

@@ -24,13 +24,24 @@ class FitResultsDialog(QDialog):
 
     def __init__(self, time: np.ndarray, signal: np.ndarray,
                  fitted_signal: np.ndarray, fit_results: Dict,
-                 save_path: Optional[str] = None, parent=None):
+                 save_path: Optional[str] = None,
+                 roi_mask: Optional[np.ndarray] = None,
+                 reference_image: Optional[np.ndarray] = None,
+                 roi_z_slice: Optional[int] = None,
+                 parent=None):
         super().__init__(parent)
         self.time = time
         self.signal = signal
         self.fitted_signal = fitted_signal
         self.fit_results = fit_results
         self.save_path = save_path
+        # Optional ROI context for the Save Results Table companion PNG.
+        # When all three are present, saving the CSV also writes a
+        # same-basename .png showing the reference image with the ROI
+        # contour overlaid, so the kinetic data is self-documenting.
+        self.roi_mask = roi_mask
+        self.reference_image = reference_image
+        self.roi_z_slice = roi_z_slice
 
         self.setWindowTitle("ProxylFit - Kinetic Model Fitting Results")
         self.setMinimumSize(1000, 750)
@@ -217,8 +228,32 @@ class FitResultsDialog(QDialog):
             for row in rows:
                 writer.writerow(row)
 
+        # Companion PNG: reference image (T1 baseline) on the slice the
+        # ROI was drawn on, with ROI contour overlaid. Lives next to the
+        # CSV so the fit data is traceable back to the source region.
+        # Only attempt if the caller plumbed in the ROI context.
+        png_msg = ""
+        if (self.roi_mask is not None
+                and self.reference_image is not None):
+            from pathlib import Path
+            from ..roi_selection import save_roi_overlay_png
+            png_path = Path(save_path).with_suffix('.png')
+            try:
+                save_roi_overlay_png(
+                    reference_image=self.reference_image,
+                    roi_mask=self.roi_mask,
+                    z_slice=self.roi_z_slice,
+                    output_path=str(png_path),
+                    title=(f"ROI on T1 baseline (z={self.roi_z_slice})"
+                           if self.roi_z_slice is not None
+                           else "ROI on T1 baseline"),
+                )
+                png_msg = f"\nROI overlay PNG: {png_path}"
+            except Exception as e:
+                png_msg = f"\n(PNG companion failed: {e})"
+
         QMessageBox.information(self, "Save Complete",
-                              f"Results table saved to:\n{save_path}")
+                              f"Results table saved to:\n{save_path}{png_msg}")
 
     def _save_plot(self):
         """Save the plot to file.
@@ -241,15 +276,26 @@ class FitResultsDialog(QDialog):
 
 def plot_fit_results_qt(time: np.ndarray, signal: np.ndarray,
                        fitted_signal: np.ndarray, fit_results: Dict,
-                       save_path: Optional[str] = None) -> None:
+                       save_path: Optional[str] = None,
+                       roi_mask: Optional[np.ndarray] = None,
+                       reference_image: Optional[np.ndarray] = None,
+                       roi_z_slice: Optional[int] = None) -> None:
     """
     Qt-based fit results visualization.
 
-    Drop-in replacement for plot_fit_results().
+    Drop-in replacement for plot_fit_results(). The optional roi_mask /
+    reference_image / roi_z_slice arguments are forwarded to the dialog
+    so its Save Results Table button can drop a companion PNG showing
+    the ROI on the anatomical reference next to the saved CSV.
     """
     app = init_qt_app()
 
-    dialog = FitResultsDialog(time, signal, fitted_signal, fit_results, save_path)
+    dialog = FitResultsDialog(
+        time, signal, fitted_signal, fit_results, save_path,
+        roi_mask=roi_mask,
+        reference_image=reference_image,
+        roi_z_slice=roi_z_slice,
+    )
 
     # Auto-save if path provided
     if save_path:

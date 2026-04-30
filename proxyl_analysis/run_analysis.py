@@ -847,9 +847,17 @@ def main():
                     )
                     print(f"  Extracted {len(roi_signal)} time points")
 
-                    # Select injection time
+                    # Select injection time. Pass ROI context so the
+                    # Export CSV button in the dialog can drop a
+                    # companion ROI overlay PNG.
                     print("Select injection time point...")
-                    injection_idx = select_injection_time_qt(time_array, roi_signal, args.time_units, str(auto_registration_dir))
+                    injection_idx = select_injection_time_qt(
+                        time_array, roi_signal, args.time_units,
+                        str(auto_registration_dir),
+                        roi_mask=roi_mask,
+                        reference_image=registered_4d[:, :, :, 0],
+                        roi_z_slice=args.z,
+                    )
                     injection_time = time_array[injection_idx]
                     print(f"  Injection time: {injection_time:.1f} {args.time_units} (index {injection_idx})")
 
@@ -899,10 +907,18 @@ def main():
                         print(f"  Tracer half-life (buildup):  {derived_params['half_life_buildup']:.2f} ± {derived_params['half_life_buildup_error']:.2f} {args.time_units}")
                         print(f"  Tracer half-life (decay):    {derived_params['half_life_decay']:.2f} ± {derived_params['half_life_decay_error']:.2f} {args.time_units}")
 
-                        # Show fit plot (Qt-based)
+                        # Show fit plot (Qt-based). Pass ROI context so the
+                        # Save Results Table button can drop a companion PNG
+                        # showing the T1 baseline + ROI contour next to the
+                        # saved CSV.
                         plot_file = auto_registration_dir / "kinetic_fit.png"
-                        plot_fit_results_qt(time_array_fit, signal_fit, fitted_signal,
-                                           fit_results, str(plot_file))
+                        plot_fit_results_qt(
+                            time_array_fit, signal_fit, fitted_signal,
+                            fit_results, str(plot_file),
+                            roi_mask=roi_mask,
+                            reference_image=registered_4d[:, :, :, 0],
+                            roi_z_slice=args.z,
+                        )
 
                         # Save results
                         results_file = auto_registration_dir / "kinetic_results.txt"
@@ -993,7 +1009,11 @@ def main():
 
                         print("Select injection time...")
                         injection_idx = select_injection_time_qt(
-                            time_array, rep_signal, args.time_units, str(auto_registration_dir)
+                            time_array, rep_signal, args.time_units,
+                            str(auto_registration_dir),
+                            roi_mask=param_roi_mask,
+                            reference_image=registered_4d[:, :, :, 0],
+                            roi_z_slice=param_roi_z,
                         )
                         print(f"Selected injection time index: {injection_idx}")
 
@@ -1095,6 +1115,24 @@ def main():
                                 for t, s in zip(time_array, roi_state['roi_signal']):
                                     writer.writerow([t, s])
                             print(f"Time series CSV saved to: {csv_file}")
+
+                            # Companion PNG: T1 baseline (timepoint 0) on
+                            # the slice where the ROI was drawn, with the
+                            # ROI contour overlaid. Lives next to the CSV
+                            # so the data is self-documenting.
+                            from .roi_selection import save_roi_overlay_png
+                            png_path = csv_file.with_suffix('.png')
+                            try:
+                                save_roi_overlay_png(
+                                    reference_image=registered_4d[:, :, :, 0],
+                                    roi_mask=roi_state.get('roi_mask'),
+                                    z_slice=roi_state.get('z_slice'),
+                                    output_path=str(png_path),
+                                    title=f"ROI on T1 baseline (z={roi_state.get('z_slice')})",
+                                )
+                                print(f"ROI overlay PNG saved to: {png_path}")
+                            except Exception as e:
+                                print(f"  (PNG companion failed: {e})")
                         else:
                             print("Time series CSV export cancelled.")
                     print("Export complete.")
@@ -1317,7 +1355,14 @@ def main():
             print(f"Step {next_step}: Selecting injection time...")
             print("  Please click on the time point when contrast was injected.")
             print("  Using Qt-based UI with proper layout management.")
-            injection_index = select_injection_time_qt(time_array, signal_timeseries, args.time_units, str(output_dir))
+            # Pass ROI context so the dialog's Export CSV button can
+            # drop a companion ROI overlay PNG.
+            injection_index = select_injection_time_qt(
+                time_array, signal_timeseries, args.time_units, str(output_dir),
+                roi_mask=roi_mask,
+                reference_image=registered_4d[:, :, :, 0],
+                roi_z_slice=args.z,
+            )
             
             # Trim data to start from injection time
             time_array_fit = time_array[injection_index:]
@@ -1447,11 +1492,17 @@ def main():
             )
             print(f"  Raw data saved to: {data_file}")
             
-            # Create and save plot
+            # Create and save plot. ROI context lets the Save Results
+            # Table button drop a companion ROI overlay PNG.
             if not args.no_plot:
                 plot_file = output_dir / "kinetic_fit.png"
-                plot_fit_results_qt(time_array_fit, signal_timeseries_fit, fitted_signal,
-                                   fit_results, str(plot_file))
+                plot_fit_results_qt(
+                    time_array_fit, signal_timeseries_fit, fitted_signal,
+                    fit_results, str(plot_file),
+                    roi_mask=roi_mask,
+                    reference_image=registered_4d[:, :, :, 0],
+                    roi_z_slice=args.z,
+                )
         
         print("\nAnalysis completed successfully!")
         print("="*60)

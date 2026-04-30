@@ -3,6 +3,7 @@ Injection time selection dialog for ProxylFit.
 """
 
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -25,6 +26,9 @@ class InjectionTimeSelectorDialog(QDialog):
 
     def __init__(self, time: np.ndarray, signal: np.ndarray,
                  time_units: str = 'minutes', output_dir: str = './output',
+                 roi_mask: Optional[np.ndarray] = None,
+                 reference_image: Optional[np.ndarray] = None,
+                 roi_z_slice: Optional[int] = None,
                  parent=None):
         super().__init__(parent)
         self.time = time
@@ -32,6 +36,13 @@ class InjectionTimeSelectorDialog(QDialog):
         self.time_units = time_units
         self.output_dir = output_dir
         self.injection_index = 0
+        # Optional ROI context for the Export CSV companion PNG. When
+        # roi_mask + reference_image are both supplied, the timecourse
+        # CSV is accompanied by a same-basename .png showing the
+        # anatomical slice with the ROI contour drawn on it.
+        self.roi_mask = roi_mask
+        self.reference_image = reference_image
+        self.roi_z_slice = roi_z_slice
 
         self.setWindowTitle("ProxylFit - Injection Time Selection")
         self.setMinimumSize(1000, 650)
@@ -165,10 +176,13 @@ class InjectionTimeSelectorDialog(QDialog):
         )
 
     def _export_csv(self):
-        """Export timecourse data to CSV.
+        """Export timecourse data to CSV with a companion ROI overlay PNG.
 
-        Always prompt the user for a filename so several ROIs can be saved
-        side-by-side instead of overwriting the same file each time.
+        Always prompt the user for a filename so several ROIs can be
+        saved side-by-side instead of overwriting the same file each
+        time. When the dialog was given an ROI mask + reference image,
+        a same-basename PNG showing the anatomical slice with the ROI
+        contour drawn on it is saved alongside the CSV.
         """
         import csv
 
@@ -190,9 +204,29 @@ class InjectionTimeSelectorDialog(QDialog):
                 for t, s in zip(self.time, self.signal):
                     writer.writerow([f'{t:.3f}', f'{s:.6f}'])
 
+            # Companion PNG when ROI context was provided
+            png_msg = ""
+            if (self.roi_mask is not None
+                    and self.reference_image is not None):
+                from ..roi_selection import save_roi_overlay_png
+                png_path = csv_file.with_suffix('.png')
+                try:
+                    save_roi_overlay_png(
+                        reference_image=self.reference_image,
+                        roi_mask=self.roi_mask,
+                        z_slice=self.roi_z_slice,
+                        output_path=str(png_path),
+                        title=(f"ROI on T1 baseline (z={self.roi_z_slice})"
+                               if self.roi_z_slice is not None
+                               else "ROI on T1 baseline"),
+                    )
+                    png_msg = f"\nROI overlay PNG: {png_path}"
+                except Exception as e:
+                    png_msg = f"\n(PNG companion failed: {e})"
+
             self.status_bar.showMessage(f"Exported to: {csv_file}")
             QMessageBox.information(self, "Export Complete",
-                                  f"Data exported to:\n{csv_file}")
+                                  f"Data exported to:\n{csv_file}{png_msg}")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", f"Failed to export: {e}")
 
@@ -208,15 +242,26 @@ class InjectionTimeSelectorDialog(QDialog):
 
 def select_injection_time_qt(time: np.ndarray, signal: np.ndarray,
                             time_units: str = 'minutes',
-                            output_dir: str = './output') -> int:
+                            output_dir: str = './output',
+                            roi_mask: Optional[np.ndarray] = None,
+                            reference_image: Optional[np.ndarray] = None,
+                            roi_z_slice: Optional[int] = None) -> int:
     """
     Qt-based interactive injection time selection.
 
-    Drop-in replacement for select_injection_time().
+    Drop-in replacement for select_injection_time(). The optional roi_mask /
+    reference_image / roi_z_slice arguments are forwarded to the dialog so
+    its Export CSV button can drop a companion ROI overlay PNG next to the
+    saved timecourse.
     """
     app = init_qt_app()
 
-    dialog = InjectionTimeSelectorDialog(time, signal, time_units, output_dir)
+    dialog = InjectionTimeSelectorDialog(
+        time, signal, time_units, output_dir,
+        roi_mask=roi_mask,
+        reference_image=reference_image,
+        roi_z_slice=roi_z_slice,
+    )
     result = dialog.exec()
 
     injection_index = dialog.get_injection_index()

@@ -1594,7 +1594,20 @@ class ParameterMapResultsDialog(QDialog):
                 )
 
     def _export_metrics(self):
-        """Export metrics to CSV."""
+        """Export metrics to CSV with a companion ROI overlay PNG.
+
+        CSV schema: roi_type, z_slice, parameter, n_pixels, mean, std,
+        min, max. Writes a row per (ROI × parameter × z-slice). Both the
+        fitting ROI (per slice, intersected with the fit mask) and the
+        measurement ROI (single slice — wherever it was drawn — with NaN
+        filtering only) are included so the file captures everything
+        the user can see in the metrics panel.
+
+        A companion PNG is saved alongside the CSV (same basename, .png
+        extension) showing the currently-displayed parameter map with
+        whichever ROI contours are active. Gives the data context: a
+        future reader can see exactly where the numbers came from.
+        """
         import csv
 
         from ..io import get_dataset_path
@@ -1609,55 +1622,107 @@ class ParameterMapResultsDialog(QDialog):
         if not filepath:
             return
 
-        # Calculate metrics for all slices
+        # All parameter maps that appear in the dialog metrics panel —
+        # keep this list in sync with _update_metrics' param_names so
+        # the CSV reflects everything the user sees on screen.
+        param_names = [
+            ('kb_map', 'kb'),
+            ('kd_map', 'kd'),
+            ('knt_map', 'knt'),
+            ('r_squared_map', 'r_squared'),
+            ('a1_percent_map', 'pct_enhancement'),
+            ('a2_percent_map', 'pct_nte'),
+            ('a2_percent_est_map', 'pct_nte_est'),
+        ]
+
+        def _stats_row(roi_type, z, parameter, values):
+            """Compute n/mean/std/min/max safely for a 1D values array."""
+            valid = values[np.isfinite(values)]
+            if len(valid) == 0:
+                return None
+            return [
+                roi_type, z, parameter, len(valid),
+                float(np.nanmean(valid)),
+                float(np.nanstd(valid)),
+                float(np.nanmin(valid)),
+                float(np.nanmax(valid)),
+            ]
+
         with open(filepath, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['z_slice', 'parameter', 'n_pixels', 'mean', 'std', 'min', 'max'])
+            writer.writerow([
+                'roi_type', 'z_slice', 'parameter',
+                'n_pixels', 'mean', 'std', 'min', 'max',
+            ])
 
-            for z in range(self.num_slices):
-                # Get ROI for this slice
-                if self.roi_mask is None:
-                    continue
+            # ----- Fitting ROI: per slice, intersected with fit mask -----
+            if self.roi_mask is not None:
+                fit_mask = self.param_maps.get('mask')
+                for z in range(self.num_slices):
+                    if self.roi_mask.ndim == 2:
+                        roi_slice = self.roi_mask
+                    else:
+                        roi_slice = self.roi_mask[:, :, z]
 
-                if self.roi_mask.ndim == 2:
-                    roi_slice = self.roi_mask
-                else:
-                    roi_slice = self.roi_mask[:, :, z]
+                    if fit_mask is not None:
+                        if fit_mask.ndim == 3:
+                            combined = roi_slice & fit_mask[:, :, z]
+                        else:
+                            combined = roi_slice & fit_mask[:, :, 0]
+                    else:
+                        combined = roi_slice
 
-                mask = self.param_maps.get('mask')
-                if mask is None:
-                    continue
+                    if not combined.any():
+                        continue
 
-                if mask.ndim == 3:
-                    combined_mask = roi_slice & mask[:, :, z]
-                else:
-                    combined_mask = roi_slice & mask[:, :, 0]
+                    for key, csv_name in param_names:
+                        map_data = self.param_maps.get(key)
+                        if map_data is None:
+                            continue
+                        if map_data.ndim == 3:
+                            slice_data = map_data[:, :, z]
+                        else:
+                            slice_data = map_data[:, :, 0]
+                        row = _stats_row('fitting', z, csv_name,
+                                         slice_data[combined])
+                        if row:
+                            writer.writerow(row)
 
-                n_pixels = int(np.sum(combined_mask))
-                if n_pixels == 0:
-                    continue
-
-                for key in ['kb_map', 'kd_map', 'knt_map', 'r_squared_map']:
+            # ----- Measurement ROI: single z-slice, NaN-filtered only -----
+            if self.measurement_roi_mask is not None:
+                z = self.measurement_roi_drawn_z
+                if z is None:
+                    z = self.current_z
+                for key, csv_name in param_names:
                     map_data = self.param_maps.get(key)
                     if map_data is None:
                         continue
-
                     if map_data.ndim == 3:
                         slice_data = map_data[:, :, z]
                     else:
                         slice_data = map_data[:, :, 0]
+                    row = _stats_row('measurement', z, csv_name,
+                                     slice_data[self.measurement_roi_mask])
+                    if row:
+                        writer.writerow(row)
 
-                    roi_values = slice_data[combined_mask]
-                    writer.writerow([
-                        z, key.replace('_map', ''),
-                        n_pixels,
-                        np.nanmean(roi_values),
-                        np.nanstd(roi_values),
-                        np.nanmin(roi_values),
-                        np.nanmax(roi_values)
-                    ])
+        # Companion PNG: snapshot of the currently-displayed figure (with
+        # whatever map, z-slice, and ROI contours are active). Lives next
+        # to the CSV so the data is self-documenting.
+        png_path = Path(filepath).with_suffix('.png')
+        try:
+            self.figure.savefig(
+                str(png_path), dpi=150, bbox_inches='tight',
+                facecolor='white', edgecolor='none',
+            )
+            png_msg = f"\nROI overlay PNG: {png_path}"
+        except Exception as e:
+            png_msg = f"\n(PNG companion failed: {e})"
 
-        QMessageBox.information(self, "Exported", f"Metrics exported to:\n{filepath}")
+        QMessageBox.information(
+            self, "Exported",
+            f"Metrics CSV: {filepath}{png_msg}",
+        )
 
 
 def show_parameter_map_options(max_z: int = 8,
