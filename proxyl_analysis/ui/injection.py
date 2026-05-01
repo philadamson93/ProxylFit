@@ -66,7 +66,8 @@ class InjectionTimeSelectorDialog(QDialog):
             "Instructions:\n"
             "- Click on the plot to select the injection time point\n"
             "- The red vertical line shows the current selection\n"
-            "- Use 'Export CSV' to save the timecourse data"
+            "- Timecourse data is saved later from the kinetic fit "
+            "page so the per-ROI bundle stays consistent."
         )
         layout.addWidget(instructions)
 
@@ -108,11 +109,15 @@ class InjectionTimeSelectorDialog(QDialog):
 
         layout.addLayout(content_layout)
 
-        # Button bar
+        # Button bar — no Export CSV here. Timecourse data is saved
+        # from the kinetic fit page (Save button) along with the fit
+        # results CSV, plot PNG, and ROI overlay PNG, all sharing one
+        # auto-incremented index N. Splitting the timecourse export
+        # across two pages used to let N drift, making per-ROI bundles
+        # hard to reassemble.
         button_bar = ButtonBar()
         button_bar.add_button("cancel", "Cancel", self.reject, "cancel")
         button_bar.add_stretch()
-        button_bar.add_button("export", "Export CSV", self._export_csv, "export")
         button_bar.add_button("accept", "Set Injection Time", self._accept_time, "accept")
         layout.addWidget(button_bar)
 
@@ -178,18 +183,22 @@ class InjectionTimeSelectorDialog(QDialog):
     def _export_csv(self):
         """Export timecourse data to CSV with a companion ROI overlay PNG.
 
-        Always prompt the user for a filename so several ROIs can be
-        saved side-by-side instead of overwriting the same file each
-        time. When the dialog was given an ROI mask + reference image,
-        a same-basename PNG showing the anatomical slice with the ROI
-        contour drawn on it is saved alongside the CSV.
+        Default location: ``<output_dir>/kinetic_fits/timecourse_data_<N>.csv``
+        with N auto-incremented per ROI so successive ROIs in a session
+        don't overwrite each other. The matching ROI overlay companion
+        PNG is ``kinetic_fit_roi_<N>.png`` in the same directory (same N).
         """
         import csv
+        from ..io import next_indexed_path, index_from_filename
 
-        Path(self.output_dir).mkdir(exist_ok=True, parents=True)
-        default_path = str(Path(self.output_dir) / "timecourse_data.csv")
+        # Default to the dataset's kinetic_fits/ subfolder with the
+        # next free index — keeps per-ROI bundles together.
+        kinetic_dir = Path(self.output_dir) / "kinetic_fits"
+        default_path = next_indexed_path(
+            kinetic_dir, "timecourse_data", ".csv"
+        )
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Export Timecourse CSV", default_path,
+            self, "Export Timecourse CSV", str(default_path),
             "CSV Files (*.csv);;All Files (*)"
         )
         if not save_path:
@@ -204,12 +213,23 @@ class InjectionTimeSelectorDialog(QDialog):
                 for t, s in zip(self.time, self.signal):
                     writer.writerow([f'{t:.3f}', f'{s:.6f}'])
 
-            # Companion PNG when ROI context was provided
+            # Companion PNG when ROI context was provided. Filename
+            # uses the matching index (kinetic_fit_roi_<N>.png) so the
+            # bundle for one ROI shares one N. Falls back to the next
+            # free roi_<N>.png if the user renamed the CSV.
             png_msg = ""
             if (self.roi_mask is not None
                     and self.reference_image is not None):
                 from ..roi_selection import save_roi_overlay_png
-                png_path = csv_file.with_suffix('.png')
+                n = index_from_filename(
+                    csv_file, "timecourse_data", ".csv"
+                )
+                if n is not None:
+                    png_path = csv_file.parent / f"kinetic_fit_roi_{n}.png"
+                else:
+                    png_path = next_indexed_path(
+                        csv_file.parent, "kinetic_fit_roi", ".png"
+                    )
                 try:
                     save_roi_overlay_png(
                         reference_image=self.reference_image,
