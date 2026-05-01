@@ -29,14 +29,25 @@ _PIXEL_WORKER_CTX: Dict[str, Any] = {}
 
 
 def _init_pixel_worker(registered_4d, time_array, kernel_type, window_size,
-                       signal_threshold, time_units):
-    """Pool initializer — stash the read-only fitting inputs as worker globals."""
+                       signal_threshold, time_units,
+                       pre_injection_4d=None):
+    """Pool initializer — stash the read-only fitting inputs as worker globals.
+
+    ``pre_injection_4d`` is the slice of the original 4D volume *before*
+    the injection time. When provided, the worker extracts the same
+    kernel window from it for each voxel and passes the resulting
+    per-voxel baseline signal to ``fit_proxyl_kinetics`` so A0 is
+    pinned to the pre-injection mean — same behavior as the kinetic
+    fit page. When None (no injection time, or all timepoints used),
+    the per-voxel fit falls back to the 8-param free-A0 mode.
+    """
     _PIXEL_WORKER_CTX['registered_4d'] = registered_4d
     _PIXEL_WORKER_CTX['time_array'] = time_array
     _PIXEL_WORKER_CTX['kernel_type'] = kernel_type
     _PIXEL_WORKER_CTX['window_size'] = window_size
     _PIXEL_WORKER_CTX['signal_threshold'] = signal_threshold
     _PIXEL_WORKER_CTX['time_units'] = time_units
+    _PIXEL_WORKER_CTX['pre_injection_4d'] = pre_injection_4d
 
 
 def _fit_pixel(pos):
@@ -59,6 +70,7 @@ def _fit_pixel(pos):
     window_size = ctx['window_size']
     signal_threshold = ctx['signal_threshold']
     time_units = ctx['time_units']
+    pre_injection_4d = ctx.get('pre_injection_4d')
 
     # Extract signal using the configured kernel
     if kernel_type == 'sliding_window':
@@ -82,6 +94,22 @@ def _fit_pixel(pos):
     if cv > 2.0:
         return None
 
+    # Per-voxel pre-injection signal: same kernel applied to the
+    # pre-injection slice of the volume (when one was preserved by
+    # create_parameter_maps). Pinning A0 here makes the per-voxel
+    # parameter map match the curve-fit page's results for the same
+    # ROI; without it, A0 is free per voxel and biases A1/A2/etc.
+    pre_injection_signal = None
+    if pre_injection_4d is not None and pre_injection_4d.shape[3] > 0:
+        if kernel_type == 'sliding_window':
+            pre_injection_signal = _extract_sliding_window_signal(
+                pre_injection_4d, x, y, z, window_size
+            )
+        else:
+            pre_injection_signal = _extract_kernel_signal(
+                pre_injection_4d, x, y, z, window_size, kernel_type
+            )
+
     # Fit. verbose=False suppresses the per-voxel "Note: <param> at upper
     # bound" / "Warning: covariance issues" / "First fitting attempt failed"
     # diagnostics that fit_proxyl_kinetics emits — useful for a single ROI
@@ -89,7 +117,8 @@ def _fit_pixel(pos):
     # on a Mac terminal and obscure the real progress messages.
     try:
         kb, kd, knt, _fitted, fit_results = fit_proxyl_kinetics(
-            time_array, window_signal, time_units, verbose=False
+            time_array, window_signal, time_units, verbose=False,
+            pre_injection_signal=pre_injection_signal,
         )
     except Exception:
         return None
@@ -186,12 +215,21 @@ def create_parameter_maps(registered_4d: np.ndarray,
     else:
         window_x, window_y, window_z = window_size
     
-    # Handle injection time selection
+    # Handle injection time selection. Keep the pre-injection slice
+    # of the volume around so each per-voxel fit can pin A0 to the
+    # local pre-injection mean (same A0-pinning logic as the curve-fit
+    # page — keeps parameter maps and curve fits in agreement).
+    pre_injection_4d = None
     if injection_time_index is not None:
+        if injection_time_index > 0:
+            pre_injection_4d = registered_4d[:, :, :, :injection_time_index]
         # Trim time array and image data to start from injection
         time_array = time_array[injection_time_index:]
         registered_4d = registered_4d[:, :, :, injection_time_index:]
         print(f"Using data from injection time onwards: {len(time_array)} timepoints")
+        if pre_injection_4d is not None:
+            print(f"Pre-injection slice retained for per-voxel A0 pinning: "
+                  f"{pre_injection_4d.shape[3]} timepoints")
     
     # Determine processing dimensions
     if z_slice is not None:
@@ -261,6 +299,7 @@ def create_parameter_maps(registered_4d: np.ndarray,
     _init_pixel_worker(
         registered_4d, time_array, kernel_type,
         (window_x, window_y, window_z), signal_threshold, time_units,
+        pre_injection_4d=pre_injection_4d,
     )
 
     # Counter incremented inside _store on every non-None fit result.
@@ -302,9 +341,13 @@ def create_parameter_maps(registered_4d: np.ndarray,
         # ~16 chunks per worker keeps progress updates smooth without much
         # IPC overhead.
         chunksize = max(1, total_positions // (n_workers * 16))
+        # Note: pre_injection_4d is positional-7 in _init_pixel_worker's
+        # signature; we pass it here so each Pool subprocess gets the
+        # same volume slice as the main process for per-voxel A0 pinning.
         init_args = (
             registered_4d, time_array, kernel_type,
             (window_x, window_y, window_z), signal_threshold, time_units,
+            pre_injection_4d,
         )
 
         with Pool(n_workers, initializer=_init_pixel_worker, initargs=init_args) as pool:
