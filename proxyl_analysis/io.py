@@ -8,12 +8,67 @@ Includes functions for:
 """
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 
 import numpy as np
 import SimpleITK as sitk
+
+
+def next_indexed_path(directory: Path, prefix: str, suffix: str) -> Path:
+    """
+    Return ``directory / f"{prefix}_<N>{suffix}"`` for the next available N.
+
+    Scans the directory for existing files matching the
+    ``<prefix>_<N><suffix>`` pattern and picks ``max(N) + 1`` so successive
+    saves never overwrite earlier exports. Used to give per-ROI
+    auto-incremented defaults for kinetic-fit, timecourse, and
+    parameter-map-metrics CSV/PNG exports.
+
+    Parameters
+    ----------
+    directory : Path
+        Target directory. Created (with parents) if it doesn't exist.
+    prefix : str
+        Filename prefix before the index, e.g. ``"timecourse_data"``.
+    suffix : str
+        Extension including the leading dot, e.g. ``".csv"``.
+
+    Returns
+    -------
+    Path
+        ``directory / f"{prefix}_{N}{suffix}"`` where N is the next free
+        positive integer (1 if the directory has no matching files).
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    pattern = re.compile(
+        rf'^{re.escape(prefix)}_(\d+){re.escape(suffix)}$'
+    )
+    max_n = 0
+    for f in directory.iterdir():
+        m = pattern.match(f.name)
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return directory / f"{prefix}_{max_n + 1}{suffix}"
+
+
+def index_from_filename(path: Path, prefix: str, suffix: str) -> Optional[int]:
+    """
+    Extract the ``<N>`` from ``"{prefix}_<N>{suffix}"``-style filenames.
+
+    Used so that companion-PNG names can pick up the same N as the CSV
+    the user just chose, regardless of whether they kept the auto-
+    suggested filename or renamed it before saving. Returns None if the
+    filename doesn't match the pattern.
+    """
+    pattern = re.compile(
+        rf'^{re.escape(prefix)}_(\d+){re.escape(suffix)}$'
+    )
+    m = pattern.match(Path(path).name)
+    return int(m.group(1)) if m else None
 
 
 def _z_step_from_multiframe_ipp(ds) -> Optional[float]:
@@ -450,9 +505,27 @@ def create_dataset_directory(output_base: str, dataset_name: str) -> Path:
     """
     dataset_dir = Path(output_base) / dataset_name
 
-    # Create main directory and subdirectories
-    subdirs = ['registered', 'registered/dicoms', 'roi_analysis',
-               'parameter_maps', 'derived_images']
+    # Create main directory and subdirectories. Layout:
+    #   <dataset>/registered/             — registered DICOM trees
+    #   <dataset>/registered/dicoms/T1/   — per-slice subdirs (set by save_*)
+    #   <dataset>/registered/dicoms/T2/   — flat
+    #   <dataset>/roi_analysis/           — saved ROI masks/state
+    #   <dataset>/derived_images/         — averaged / difference exports
+    #   <dataset>/parameter_maps/         — DICOM, NPZ, and PNG outputs
+    #   <dataset>/parameter_maps/parameter_map_metrics/
+    #                                     — auto-incremented metrics CSVs
+    #                                       and ROI overlay PNGs, one set
+    #                                       per measurement ROI
+    #   <dataset>/kinetic_fits/           — auto-incremented per-ROI bundle:
+    #                                       timecourse_data_<N>.csv,
+    #                                       kinetic_fit_results_<N>.csv,
+    #                                       kinetic_fit_<N>.png,
+    #                                       kinetic_fit_roi_<N>.png
+    subdirs = [
+        'registered', 'registered/dicoms', 'roi_analysis',
+        'parameter_maps', 'parameter_maps/parameter_map_metrics',
+        'derived_images', 'kinetic_fits',
+    ]
 
     for subdir in subdirs:
         (dataset_dir / subdir).mkdir(parents=True, exist_ok=True)
@@ -1293,6 +1366,66 @@ def save_volume_as_dicom_series(
         saved_files.append(str(filepath))
 
     return saved_files
+
+
+def save_volume_as_png_series(volume: np.ndarray,
+                              label: str,
+                              output_dir: str) -> List[str]:
+    """
+    Save a 3D volume as a per-slice PNG series.
+
+    Companion to :func:`save_volume_as_dicom_series`. Used by the
+    parameter-map dialog to write reference T1/T2 anatomical volumes as
+    PNGs alongside the DICOMs (when both export variants are checked).
+
+    Layout: ``<output_dir>/<label>/<label>_z{ZZ}.png``. The subfolder is
+    wiped before writing so re-runs leave only the current series.
+
+    Parameters
+    ----------
+    volume : np.ndarray
+        3D image array with shape [x, y, z].
+    label : str
+        Subfolder name and filename prefix (e.g., ``"T1_baseline"``).
+    output_dir : str
+        Base directory; ``<label>/`` is created underneath.
+
+    Returns
+    -------
+    List[str]
+        Paths to the saved PNG files, one per z-slice.
+    """
+    import shutil
+    import matplotlib.pyplot as plt
+
+    if volume.ndim != 3:
+        raise ValueError(f"Expected 3D volume, got shape {volume.shape}")
+
+    series_dir = Path(output_dir) / label
+    shutil.rmtree(series_dir, ignore_errors=True)
+    series_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: List[str] = []
+    n_z = volume.shape[2]
+    for z in range(n_z):
+        slice_2d = volume[:, :, z]
+        filepath = series_dir / f"{label}_z{z:02d}.png"
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+        # Match the parameter-map PNG export's layout: anatomical in
+        # grayscale, transposed + origin='lower' so axes match the
+        # parameter-map view, no axis ticks for a clean export.
+        ax.imshow(slice_2d.T, cmap='gray', origin='lower')
+        ax.set_title(f"{label} (z={z})")
+        ax.axis('off')
+        fig.tight_layout()
+        fig.savefig(str(filepath), dpi=150, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        plt.close(fig)
+
+        saved.append(str(filepath))
+
+    return saved
 
 
 def save_derived_image_as_dicom(
