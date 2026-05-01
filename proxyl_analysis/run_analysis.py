@@ -815,12 +815,18 @@ def main():
                         roi_selection_image = registered_4d
                         print("  Using T1 for ROI selection")
 
-                    # Do ROI selection
+                    # Do ROI selection. For contour mode, the dialog has
+                    # a z-slider so the user can pick a different slice
+                    # mid-draw — capture the final z and sync args.z to
+                    # it so downstream views (kinetic fit, parameter map)
+                    # open on the slice the ROI actually lives on.
                     print(f"ROI selection ({args.roi_mode}) on slice {args.z}...")
                     if args.roi_mode == 'rectangle':
                         roi_mask = select_rectangle_roi_qt(roi_selection_image, args.z)
                     elif args.roi_mode == 'contour':
-                        roi_mask = select_manual_contour_roi_qt(roi_selection_image, args.z)
+                        roi_mask, args.z = select_manual_contour_roi_qt(
+                            roi_selection_image, args.z, return_z=True
+                        )
                     elif args.roi_mode == 'segment':
                         try:
                             roi_mask = select_segmentation_roi(
@@ -830,7 +836,9 @@ def main():
                             )
                         except Exception as e:
                             print(f"Segmentation failed: {e}, falling back to contour")
-                            roi_mask = select_manual_contour_roi_qt(roi_selection_image, args.z)
+                            roi_mask, args.z = select_manual_contour_roi_qt(
+                                roi_selection_image, args.z, return_z=True
+                            )
 
                     if not np.any(roi_mask):
                         print("No ROI was selected.")
@@ -884,6 +892,14 @@ def main():
                     roi_mask = roi_state['roi_mask']
                     roi_signal = roi_state['roi_signal']
                     injection_idx = roi_state['injection_idx']
+                    # Use the z-slice recorded with the ROI in roi_state,
+                    # not args.z. args.z gets re-set every time the user
+                    # starts a "Draw ROI" action (line 808) — even if they
+                    # cancel — so it can drift away from the slice the
+                    # *currently active* ROI mask lives on. roi_state is
+                    # only updated when an ROI is successfully accepted,
+                    # so it always matches roi_mask.
+                    roi_z = roi_state.get('z_slice')
 
                     # Trim data to start from injection time
                     time_array_fit = time_array[injection_idx:]
@@ -907,17 +923,24 @@ def main():
                         print(f"  Tracer half-life (buildup):  {derived_params['half_life_buildup']:.2f} ± {derived_params['half_life_buildup_error']:.2f} {args.time_units}")
                         print(f"  Tracer half-life (decay):    {derived_params['half_life_decay']:.2f} ± {derived_params['half_life_decay_error']:.2f} {args.time_units}")
 
-                        # Show fit plot (Qt-based). Pass ROI context so the
-                        # Save Results Table button can drop a companion PNG
-                        # showing the T1 baseline + ROI contour next to the
-                        # saved CSV.
-                        plot_file = auto_registration_dir / "kinetic_fit.png"
+                        # Show fit plot (Qt-based). Auto-save kinetic_fit
+                        # PNG goes to <dataset>/kinetic_fits/ with an
+                        # auto-incremented filename so successive ROIs
+                        # in a session each get their own bundle. Save
+                        # Plot / Save Results Table inside the dialog
+                        # default to the same folder + matching N.
+                        from .io import next_indexed_path
+                        plot_file = next_indexed_path(
+                            auto_registration_dir / "kinetic_fits",
+                            "kinetic_fit", ".png",
+                        )
                         plot_fit_results_qt(
                             time_array_fit, signal_fit, fitted_signal,
                             fit_results, str(plot_file),
                             roi_mask=roi_mask,
                             reference_image=registered_4d[:, :, :, 0],
-                            roi_z_slice=args.z,
+                            roi_z_slice=roi_z,
+                            dataset_dir=str(auto_registration_dir),
                         )
 
                         # Save results
@@ -973,10 +996,17 @@ def main():
                             param_roi_z = roi_state.get('z_slice')
                             print(f"Reusing existing ROI ({np.sum(param_roi_mask)} pixels)")
                         elif options['redraw_roi']:
-                            # Draw new ROI for parameter mapping
+                            # Draw new ROI for parameter mapping. Capture
+                            # the final z from the contour selector since
+                            # the user can move the slider mid-draw —
+                            # otherwise param_roi_z would track the
+                            # *initial* slice instead of where the ROI
+                            # actually got drawn.
                             z_for_roi = options['z_slice'] if options['single_slice'] else registered_4d.shape[2] // 2
                             print(f"Drawing new ROI on slice {z_for_roi}...")
-                            param_roi_mask = select_manual_contour_roi_qt(registered_4d, z_for_roi)
+                            param_roi_mask, z_for_roi = select_manual_contour_roi_qt(
+                                registered_4d, z_for_roi, return_z=True
+                            )
                             param_roi_z = z_for_roi
                             if not np.any(param_roi_mask):
                                 print("No ROI was drawn. Returning to menu.")
@@ -1096,13 +1126,21 @@ def main():
                     elif export_type == 'registration_report':
                         print(f"Registration metrics saved to: {auto_registration_dir / 'registration_metrics.json'}")
                     elif export_type == 'timeseries' and roi_state is not None:
-                        # Export time series CSV. Prompt for the filename so
-                        # multiple ROIs can be saved side-by-side instead of
-                        # overwriting a single fixed file.
+                        # Export time series CSV. Default location is
+                        # <dataset>/kinetic_fits/timecourse_data_<N>.csv
+                        # with N auto-incremented so multiple ROIs in a
+                        # session each get their own bundle. The
+                        # companion ROI overlay PNG uses the matching
+                        # N (kinetic_fit_roi_<N>.png) so a single ROI's
+                        # files share an index.
                         from PySide6.QtWidgets import QFileDialog
+                        from .io import next_indexed_path, index_from_filename
                         import csv
 
-                        default_csv = auto_registration_dir / "roi_timeseries.csv"
+                        default_csv = next_indexed_path(
+                            auto_registration_dir / "kinetic_fits",
+                            "timecourse_data", ".csv",
+                        )
                         save_path, _ = QFileDialog.getSaveFileName(
                             None, "Save Time Series CSV", str(default_csv),
                             "CSV Files (*.csv);;All Files (*)"
@@ -1116,12 +1154,18 @@ def main():
                                     writer.writerow([t, s])
                             print(f"Time series CSV saved to: {csv_file}")
 
-                            # Companion PNG: T1 baseline (timepoint 0) on
-                            # the slice where the ROI was drawn, with the
-                            # ROI contour overlaid. Lives next to the CSV
-                            # so the data is self-documenting.
+                            # Companion ROI PNG, matching N when the
+                            # filename keeps the auto-suggested pattern.
                             from .roi_selection import save_roi_overlay_png
-                            png_path = csv_file.with_suffix('.png')
+                            n = index_from_filename(
+                                csv_file, "timecourse_data", ".csv"
+                            )
+                            if n is not None:
+                                png_path = csv_file.parent / f"kinetic_fit_roi_{n}.png"
+                            else:
+                                png_path = next_indexed_path(
+                                    csv_file.parent, "kinetic_fit_roi", ".png"
+                                )
                             try:
                                 save_roi_overlay_png(
                                     reference_image=registered_4d[:, :, :, 0],
@@ -1299,7 +1343,11 @@ def main():
             elif args.roi_mode == 'contour':
                 print(f"  Please draw a contour around the ROI on slice {args.z}")
                 print("  Using Qt-based UI with proper layout management.")
-                roi_mask = select_manual_contour_roi_qt(roi_selection_image, args.z)
+                # Capture final z from the contour selector — user can
+                # change slice via the slider mid-draw.
+                roi_mask, args.z = select_manual_contour_roi_qt(
+                    roi_selection_image, args.z, return_z=True
+                )
 
             elif args.roi_mode == 'segment':
                 print(f"  Please segment the ROI using SegmentAnything on slice {args.z}")
@@ -1492,16 +1540,23 @@ def main():
             )
             print(f"  Raw data saved to: {data_file}")
             
-            # Create and save plot. ROI context lets the Save Results
-            # Table button drop a companion ROI overlay PNG.
+            # Create and save plot. Auto-save uses the kinetic_fits/
+            # subdir with an auto-incremented filename; the dialog's
+            # Save Plot / Save Results Table buttons inherit the same
+            # convention through dataset_dir.
             if not args.no_plot:
-                plot_file = output_dir / "kinetic_fit.png"
+                from .io import next_indexed_path
+                plot_file = next_indexed_path(
+                    Path(output_dir) / "kinetic_fits",
+                    "kinetic_fit", ".png",
+                )
                 plot_fit_results_qt(
                     time_array_fit, signal_timeseries_fit, fitted_signal,
                     fit_results, str(plot_file),
                     roi_mask=roi_mask,
                     reference_image=registered_4d[:, :, :, 0],
                     roi_z_slice=args.z,
+                    dataset_dir=str(output_dir),
                 )
         
         print("\nAnalysis completed successfully!")
