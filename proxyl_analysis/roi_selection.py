@@ -314,6 +314,118 @@ def save_roi_overlay_png(reference_image: np.ndarray,
     return str(output_path)
 
 
+def save_table_as_png(rows: list,
+                      headers: list,
+                      output_path: str,
+                      title: Optional[str] = None) -> str:
+    """
+    Render a simple data table as a PNG.
+
+    Companion to the various CSV exports — gives users a presentation-
+    ready image of the same data without having to import the CSV into
+    a spreadsheet and screenshot it. Cell content is whatever string
+    representation Python's str() produces, so callers should pre-
+    format floats (e.g. ``f"{value:.4f}"``) before passing the rows.
+
+    Column widths are sized proportionally to the longest string in
+    each column so wide columns (e.g. "description") don't clip while
+    narrow columns (e.g. "units") don't get padded with empty space.
+    Figure width scales with the total character count too, so the
+    table never has to compress to fit a fixed canvas.
+
+    Parameters
+    ----------
+    rows : list of list
+        Table body. Each inner list is one row; cells should be strings.
+    headers : list of str
+        Column headers, rendered with bold styling at the top.
+    output_path : str
+        Destination .png path.
+    title : str, optional
+        Plot title shown above the table.
+
+    Returns
+    -------
+    str
+        The output path actually written.
+    """
+    import matplotlib.pyplot as plt
+
+    n_rows = len(rows)
+    n_cols = max(len(headers), 1)
+
+    # Compute the longest cell content per column, including the header
+    # itself. Used to drive both proportional column widths and the
+    # overall figure width — wide columns (long descriptions) get more
+    # horizontal space, narrow columns (units, n_pixels) get less.
+    str_rows = [[str(c) for c in r] for r in rows]
+    col_max_chars = []
+    for col_idx in range(n_cols):
+        widest = len(str(headers[col_idx])) if col_idx < len(headers) else 0
+        for r in str_rows:
+            if col_idx < len(r):
+                widest = max(widest, len(r[col_idx]))
+        # Floor of 4 chars so a 1-character column doesn't collapse to
+        # an unreadable sliver.
+        col_max_chars.append(max(widest, 4))
+
+    total_chars = sum(col_max_chars) or 1
+    col_widths_frac = [w / total_chars for w in col_max_chars]
+
+    # Figure dimensions. Width scales with total content length —
+    # roughly 0.10" per character of combined column content, with
+    # padding for the cell margins. Height scales with row count.
+    fig_width = max(6.0, total_chars * 0.10 + 1.5)
+    fig_height = max(2.0, 0.35 * (n_rows + 1) + (0.6 if title else 0.2))
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis('off')
+
+    if title:
+        ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
+
+    if rows:
+        table = ax.table(
+            cellText=str_rows,
+            colLabels=headers,
+            colWidths=col_widths_frac,
+            cellLoc='center',
+            loc='center',
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        # Slight vertical scale so the rows don't crowd; the default
+        # row height is too tight for readable export.
+        table.scale(1, 1.5)
+        # Bold the header row + style.
+        for col in range(n_cols):
+            cell = table[0, col]
+            cell.set_text_props(weight='bold')
+            cell.set_facecolor('#e0e0e0')
+        # Left-align long text columns (heuristic: any column whose
+        # widest content exceeds ~14 characters reads better
+        # left-aligned than centered).
+        for col_idx, widest in enumerate(col_max_chars):
+            if widest > 14:
+                # Left-align all body cells in this column. Header
+                # stays centered + bold.
+                for row_idx in range(1, n_rows + 1):
+                    cell = table[row_idx, col_idx]
+                    cell.get_text().set_ha('left')
+                    # Slight left padding so text doesn't kiss the edge.
+                    cell.PAD = 0.04
+    else:
+        ax.text(0.5, 0.5, "(no data)", ha='center', va='center',
+                fontsize=12, color='#888', transform=ax.transAxes)
+
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=150, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close(fig)
+
+    return str(output_path)
+
+
 def visualize_roi_on_slice(image_slice: np.ndarray, roi_mask: np.ndarray,
                           title: str = "ROI Visualization") -> None:
     """
