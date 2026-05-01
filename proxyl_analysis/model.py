@@ -160,17 +160,29 @@ def proxyl_kinetic_model_extended(t: np.ndarray, A0: float, A1: float, A2: float
     return signal
 
 
-def estimate_initial_parameters_extended(time: np.ndarray, signal: np.ndarray) -> Dict[str, float]:
+def estimate_initial_parameters_extended(
+    time: np.ndarray,
+    signal: np.ndarray,
+    pre_injection_signal: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
     """
     Estimate initial parameters for extended curve fitting.
-    
+
     Parameters
     ----------
     time : np.ndarray
-        Time points (in minutes)
+        Time points (in minutes), post-injection.
     signal : np.ndarray
-        Signal values
-        
+        Signal values, post-injection.
+    pre_injection_signal : np.ndarray, optional
+        Signal values *before* injection. When provided, A0_est (the
+        baseline) is the mean of these points — that's the actual
+        baseline of the ROI. Without it, the function falls back to
+        the mean of the first ~4% of the post-injection signal, which
+        is unreliable: those points are already on the buildup curve,
+        not at baseline, so A0 is overestimated and A2_est (which is
+        derived from tail − A0) becomes correspondingly biased.
+
     Returns
     -------
     dict
@@ -180,8 +192,20 @@ def estimate_initial_parameters_extended(time: np.ndarray, signal: np.ndarray) -
     tail = signal[int(0.9*len(signal)):]
     tail_level = float(np.median(tail))
 
-    A0_est = np.mean(signal[:max(3, int(0.04*len(signal)))])  # early baseline
-    A2_est = tail_level - A0_est      # can be negative  
+    if pre_injection_signal is not None and len(pre_injection_signal) > 0:
+        # Real baseline: mean of pre-injection points. This is the
+        # physically meaningful A0 — what the signal looks like before
+        # contrast arrives — and matches what an ImageJ user would
+        # compute by averaging the same pre-injection window.
+        A0_est = float(np.mean(pre_injection_signal))
+    else:
+        # Fallback when caller didn't supply pre-injection data. The
+        # first ~4% of the post-injection signal is approximately the
+        # baseline only if the user clicked injection time slightly
+        # late; otherwise these points are already rising.
+        A0_est = float(np.mean(signal[:max(3, int(0.04*len(signal)))]))
+
+    A2_est = tail_level - A0_est      # can be negative
 
     # keep your A1_est as before or set from peak - baseline
     A1_est = max((np.max(signal) - A0_est) - max(A2_est, 0), 0)
@@ -207,16 +231,18 @@ def estimate_initial_parameters_extended(time: np.ndarray, signal: np.ndarray) -
 
 def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                        time_units: str = 'minutes',
-                       verbose: bool = True) -> Tuple[float, float, float, np.ndarray, Dict]:
+                       verbose: bool = True,
+                       pre_injection_signal: Optional[np.ndarray] = None,
+                       ) -> Tuple[float, float, float, np.ndarray, Dict]:
     """
     Fit extended Proxyl kinetic model to extract rate parameters.
 
     Parameters
     ----------
     time : np.ndarray
-        Time points (in minutes)
+        Time points (in minutes), post-injection.
     signal : np.ndarray
-        Signal intensity values
+        Signal intensity values, post-injection.
     time_units : str
         Units for time (for display purposes)
     verbose : bool
@@ -226,6 +252,18 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
         mapping (thousands of fits per run) — the messages are useful for
         a single ROI fit but become per-voxel noise at scale and slow the
         run measurably on terminals that re-render each line.
+    pre_injection_signal : np.ndarray, optional
+        Signal values from before the injection time. When provided,
+        A0 is **fixed** to the mean of these points and dropped from
+        the optimization variables — only A1, A2, kb, kd, knt, t0,
+        tmax are fit. Pre-injection signal is a clean direct
+        measurement of A0; letting the optimizer wiggle it just lets
+        it compensate for model error in the kinetic terms, which
+        biases the derived A1/A2/%Enhancement/%NTE values. The
+        reported ``A0_error`` is 0 in this mode (fixed parameter).
+        Strongly recommended for kinetic-fit-page calls; param-
+        mapping voxels usually leave this as None and fall back to
+        the all-8 fit.
         
     Returns
     -------
@@ -252,7 +290,9 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
         raise ValueError("Need at least 8 time points for model fitting")
     
     # Get initial parameter estimates
-    initial_params = estimate_initial_parameters_extended(time, signal)
+    initial_params = estimate_initial_parameters_extended(
+        time, signal, pre_injection_signal=pre_injection_signal,
+    )
     
 
     # More reasonable bounds to prevent numerical issues
@@ -284,22 +324,61 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
     p0 = [initial_params['A0'], initial_params['A1'], initial_params['A2'],
           initial_params['kb'], initial_params['kd'], initial_params['knt'],
           initial_params['t0'], initial_params['tmax']]
-    
+
+    # When pre-injection data is provided, fix A0 to the pre-injection
+    # mean rather than letting the optimizer wiggle it. Pre-injection
+    # signal is a clean direct measurement of the baseline; opening A0
+    # to the fit just lets the optimizer compensate for model error in
+    # the kinetic terms (which then biases A1, A2, %Enhancement, %NTE).
+    fix_a0 = (pre_injection_signal is not None
+              and len(pre_injection_signal) > 0)
+    A0_fixed = float(initial_params['A0']) if fix_a0 else None
+
+    if fix_a0:
+        # Wrap the model so curve_fit sees only 7 free parameters.
+        def _model_a0_fixed(t, A1, A2, kb, kd, knt, t0, tmax):
+            return proxyl_kinetic_model_extended(
+                t, A0_fixed, A1, A2, kb, kd, knt, t0, tmax,
+            )
+        fit_model = _model_a0_fixed
+        fit_p0 = p0[1:]
+        fit_lower = lower_bounds[1:]
+        fit_upper = upper_bounds[1:]
+    else:
+        fit_model = proxyl_kinetic_model_extended
+        fit_p0 = p0
+        fit_lower = lower_bounds
+        fit_upper = upper_bounds
+
+    def _expand_to_8(popt_, pcov_):
+        """When A0 is fixed, prepend it to popt and pad pcov to 8×8.
+
+        Keeps the rest of the function indexing-compatible whether the
+        fit was 7-param (A0 fixed) or 8-param (A0 free).
+        """
+        if fix_a0:
+            popt_full = np.concatenate(([A0_fixed], popt_))
+            pcov_full = np.zeros((8, 8))
+            pcov_full[1:, 1:] = pcov_
+            return popt_full, pcov_full
+        return popt_, pcov_
+
     try:
         # First attempt with standard fitting
         popt, pcov = curve_fit(
-            proxyl_kinetic_model_extended,
+            fit_model,
             time,
             signal,
-            p0=p0,
-            bounds=(lower_bounds, upper_bounds),
+            p0=fit_p0,
+            bounds=(fit_lower, fit_upper),
             maxfev=500,    # Cap iterations; pathological pixels fall through
                            # to the relaxed-bounds dogbox retry below.
             method='trf',  # Trust region reflective algorithm
             ftol=1e-6,     # Loosened from 1e-8 — the initial estimates are
             xtol=1e-6,     # close enough that 1e-6 converges in far fewer steps.
         )
-        
+        popt, pcov = _expand_to_8(popt, pcov)
+
         A0_fit, A1_fit, A2_fit, kb_fit, kd_fit, knt_fit, t0_fit, tmax_fit = popt
         
         # Check for critical parameters at bounds (only warn for kb, kd, knt)
@@ -397,19 +476,24 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                 time[-1]  # tmax
             ]
             
+            # Slice the relaxed upper bounds when A0 is fixed (fit
+            # sees only 7 params).
+            fit_relaxed_upper = relaxed_upper[1:] if fix_a0 else relaxed_upper
+
             # Try with dogbox method and looser tolerances
             popt, pcov = curve_fit(
-                proxyl_kinetic_model_extended,
+                fit_model,
                 time,
                 signal,
-                p0=p0,
-                bounds=(lower_bounds, relaxed_upper),
+                p0=fit_p0,
+                bounds=(fit_lower, fit_relaxed_upper),
                 maxfev=2000,
                 method='dogbox',  # Different algorithm
                 ftol=1e-6,        # Looser tolerance
                 xtol=1e-6
             )
-            
+            popt, pcov = _expand_to_8(popt, pcov)
+
             A0_fit, A1_fit, A2_fit, kb_fit, kd_fit, knt_fit, t0_fit, tmax_fit = popt
             
             if verbose:

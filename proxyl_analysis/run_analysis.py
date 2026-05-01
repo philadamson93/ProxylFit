@@ -907,8 +907,14 @@ def main():
 
                     print(f"Fitting kinetic model ({len(signal_fit)} points from injection)...")
                     try:
+                        # Pass pre-injection signal so A0 initial estimate
+                        # comes from the actual baseline (mean of pre-
+                        # injection points) instead of the first few
+                        # post-injection samples — those are already on
+                        # the buildup curve and overestimate A0.
                         kb, kd, knt, fitted_signal, fit_results = fit_proxyl_kinetics(
-                            time_array_fit, signal_fit, args.time_units
+                            time_array_fit, signal_fit, args.time_units,
+                            pre_injection_signal=roi_signal[:injection_idx],
                         )
 
                         # Print results
@@ -934,6 +940,10 @@ def main():
                             auto_registration_dir / "kinetic_fits",
                             "kinetic_fit", ".png",
                         )
+                        # Pre-injection slice — points the fit didn't
+                        # see, included in the dialog plot so the user
+                        # can review the full ROI signal at once. The
+                        # fit curve is drawn at A0 over this range.
                         plot_fit_results_qt(
                             time_array_fit, signal_fit, fitted_signal,
                             fit_results, str(plot_file),
@@ -941,6 +951,8 @@ def main():
                             reference_image=registered_4d[:, :, :, 0],
                             roi_z_slice=roi_z,
                             dataset_dir=str(auto_registration_dir),
+                            pre_injection_time=time_array[:injection_idx],
+                            pre_injection_signal=roi_signal[:injection_idx],
                         )
 
                         # Save results
@@ -1427,8 +1439,12 @@ def main():
                 next_step = "6"
             print(f"Step {next_step}: Fitting kinetic model...")
             try:
+                # Pass pre-injection signal for a true-baseline A0
+                # initial estimate — see model.py's
+                # estimate_initial_parameters_extended docstring.
                 kb, kd, knt, fitted_signal, fit_results = fit_proxyl_kinetics(
-                    time_array_fit, signal_timeseries_fit, args.time_units
+                    time_array_fit, signal_timeseries_fit, args.time_units,
+                    pre_injection_signal=signal_timeseries[:injection_index],
                 )
                 
                 # Print results
@@ -1557,6 +1573,8 @@ def main():
                     reference_image=registered_4d[:, :, :, 0],
                     roi_z_slice=args.z,
                     dataset_dir=str(output_dir),
+                    pre_injection_time=time_array[:injection_index],
+                    pre_injection_signal=signal_timeseries[:injection_index],
                 )
         
         print("\nAnalysis completed successfully!")
