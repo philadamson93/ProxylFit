@@ -28,6 +28,7 @@ class FitResultsDialog(QDialog):
                  roi_mask: Optional[np.ndarray] = None,
                  reference_image: Optional[np.ndarray] = None,
                  roi_z_slice: Optional[int] = None,
+                 dataset_dir: Optional[str] = None,
                  parent=None):
         super().__init__(parent)
         self.time = time
@@ -37,11 +38,16 @@ class FitResultsDialog(QDialog):
         self.save_path = save_path
         # Optional ROI context for the Save Results Table companion PNG.
         # When all three are present, saving the CSV also writes a
-        # same-basename .png showing the reference image with the ROI
-        # contour overlaid, so the kinetic data is self-documenting.
+        # same-N .png showing the reference image with the ROI contour
+        # overlaid, so the kinetic data is self-documenting.
         self.roi_mask = roi_mask
         self.reference_image = reference_image
         self.roi_z_slice = roi_z_slice
+        # Per-dataset directory ("study number") used as the parent for
+        # the kinetic_fits/ subdir where Save Plot / Save Results Table
+        # default their auto-incremented filenames. When None, the
+        # dialogs fall back to a reasonable cwd-relative default.
+        self.dataset_dir = dataset_dir
 
         self.setWindowTitle("ProxylFit - Kinetic Model Fitting Results")
         self.setMinimumSize(1000, 750)
@@ -144,10 +150,14 @@ class FitResultsDialog(QDialog):
 
         layout.addLayout(content_layout)
 
-        # Button bar
+        # Button bar — one consolidated Save button that writes all four
+        # per-ROI files with a shared index N: timecourse_data_N.csv,
+        # kinetic_fit_results_N.csv, kinetic_fit_N.png, and
+        # kinetic_fit_roi_N.png. Splitting Plot vs Results Table into
+        # separate buttons used to allow N to drift between them, which
+        # made the bundle hard to reassemble after the fact.
         button_bar = ButtonBar()
-        button_bar.add_button("save", "Save Plot", self._save_plot, "export")
-        button_bar.add_button("save_table", "Save Results Table", self._save_results_table, "export")
+        button_bar.add_button("save", "Save", self._save_all, "export")
         button_bar.add_stretch()
         button_bar.add_button("close", "Close", self.accept, "default")
         layout.addWidget(button_bar)
@@ -181,21 +191,93 @@ class FitResultsDialog(QDialog):
         self.canvas.fig.tight_layout()
         self.canvas.draw()
 
-    def _save_results_table(self):
-        """Save fit results as a CSV table."""
+    def _save_all(self):
+        """Save the full per-ROI bundle with a single shared index N.
+
+        Writes four files into ``<dataset>/kinetic_fits/`` with the next
+        free N (auto-incremented across the dataset's history so prior
+        ROIs aren't overwritten):
+
+        - ``timecourse_data_<N>.csv``      — time and mean signal arrays
+        - ``kinetic_fit_results_<N>.csv``  — fitted parameters + errors
+        - ``kinetic_fit_<N>.png``          — fit curve plot snapshot
+        - ``kinetic_fit_roi_<N>.png``      — anatomical with ROI contour
+                                             (only when ROI context was
+                                             provided to the dialog)
+
+        Splitting Plot vs Results Table into separate buttons used to
+        let N drift between them — e.g., the plot landed at _3 while
+        the table landed at _5 because two new files appeared in the
+        directory between clicks. Bundling them under one button with
+        one N pick guarantees the four files for a given ROI are
+        always findable as a set.
+        """
+        from pathlib import Path
+        from ..io import next_indexed_path
+        from ..roi_selection import save_roi_overlay_png
+
+        # Pick a single N for all four files in this bundle. Use the
+        # results CSV's slot to determine N — the helper scans for any
+        # existing files of that pattern, so we get a value that doesn't
+        # collide with prior bundles.
+        if self.dataset_dir:
+            kinetic_dir = Path(self.dataset_dir) / "kinetic_fits"
+        else:
+            kinetic_dir = Path.cwd() / "kinetic_fits"
+        kinetic_dir.mkdir(parents=True, exist_ok=True)
+
+        default_results_csv = next_indexed_path(
+            kinetic_dir, "kinetic_fit_results", ".csv"
+        )
+        # Extract N from the auto-suggested name.
+        import re
+        m = re.match(r'kinetic_fit_results_(\d+)\.csv$', default_results_csv.name)
+        n_default = int(m.group(1)) if m else 1
+
+        # Let the user confirm/redirect by selecting the results CSV
+        # path. Whatever directory and filename they choose drives the
+        # other three filenames (we infer N from the CSV name; if they
+        # rename it off-pattern, we just take the next free N in the
+        # chosen directory for each output).
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Results Table", "kinetic_fit_results.csv",
+            self, "Save", str(default_results_csv),
             "CSV Files (*.csv);;All Files (*)"
         )
-
         if not save_path:
             return
 
+        results_csv = Path(save_path)
+        target_dir = results_csv.parent
+
+        # Resolve the shared N for the bundle. If the user kept the
+        # auto-suggested filename pattern, use that N; otherwise pick
+        # max+1 across the four pattern slots in the target dir so we
+        # never collide with anything already there.
+        m2 = re.match(r'kinetic_fit_results_(\d+)\.csv$', results_csv.name)
+        if m2:
+            n = int(m2.group(1))
+        else:
+            # Fall back: take the highest N across all four slots and
+            # add 1, so the bundle stays contiguous.
+            from ..io import next_indexed_path as _next
+            candidates = [
+                _next(target_dir, "kinetic_fit_results", ".csv"),
+                _next(target_dir, "timecourse_data", ".csv"),
+                _next(target_dir, "kinetic_fit", ".png"),
+                _next(target_dir, "kinetic_fit_roi", ".png"),
+            ]
+            n = max(int(re.match(r'.*_(\d+)\.\w+$', p.name).group(1))
+                    for p in candidates)
+
+        timecourse_csv = target_dir / f"timecourse_data_{n}.csv"
+        plot_png       = target_dir / f"kinetic_fit_{n}.png"
+        roi_png        = target_dir / f"kinetic_fit_roi_{n}.png"
+        results_png    = target_dir / f"kinetic_fit_results_{n}.png"
+
+        # ---- 1. Results CSV ----
         r = self.fit_results
         time_units = r.get('time_units', 'minutes')
 
-        # Initial-estimate values (may be absent on legacy sessions). Render
-        # missing values as empty cells so the column lines up.
         a0_est = r.get('A0_est')
         a2_est = r.get('A2_est')
         a0_est_cell = a0_est if a0_est is not None else ''
@@ -221,53 +303,176 @@ class FitResultsDialog(QDialog):
             ('R_squared', 'goodness of fit', r['r_squared'], '', ''),
             ('RMSE', 'root mean square error', r['rmse'], '', ''),
         ]
-
-        with open(save_path, 'w', newline='') as f:
+        with open(results_csv, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['parameter', 'description', 'value', 'error', 'units'])
             for row in rows:
                 writer.writerow(row)
 
-        # Companion PNG: reference image (T1 baseline) on the slice the
-        # ROI was drawn on, with ROI contour overlaid. Lives next to the
-        # CSV so the fit data is traceable back to the source region.
-        # Only attempt if the caller plumbed in the ROI context.
-        png_msg = ""
+        # ---- 1b. Results table as a presentation-ready PNG ----
+        # Same content as results CSV but rendered as a table image so
+        # the user can drop it into a slide / report without needing
+        # to import the CSV into a spreadsheet first. Floats formatted
+        # to a sensible number of significant digits per parameter.
+        from ..roi_selection import save_table_as_png
+
+        def _fmt_value(v, fmt='.4f'):
+            if v == '' or v is None:
+                return ''
+            try:
+                return format(float(v), fmt)
+            except (TypeError, ValueError):
+                return str(v)
+
+        png_rows = []
+        for (pname, pdesc, pval, perr, punits) in rows:
+            fmt = '.4f' if pname in ('kb', 'kd', 'knt', 'R_squared') else '.3f'
+            png_rows.append([
+                pname,
+                pdesc,
+                _fmt_value(pval, fmt),
+                _fmt_value(perr, fmt) if perr != '' else '',
+                punits,
+            ])
+        try:
+            save_table_as_png(
+                png_rows,
+                ['parameter', 'description', 'value', 'error', 'units'],
+                str(results_png),
+                title=f"Kinetic fit results (N={n})",
+            )
+            results_png_msg = f"\n  {results_png.name}"
+        except Exception as e:
+            results_png_msg = f"\n  (results table PNG failed: {e})"
+
+        # ---- 2. Timecourse CSV (raw signal arrays) ----
+        with open(timecourse_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([f'Time ({time_units})', 'Mean Intensity'])
+            for t, s in zip(self.time, self.signal):
+                writer.writerow([f'{t:.3f}', f'{s:.6f}'])
+
+        # ---- 3. Fit curve plot ----
+        self.canvas.fig.savefig(
+            str(plot_png), dpi=300, bbox_inches='tight',
+        )
+
+        # ---- 4. ROI overlay companion (when ROI context provided) ----
+        roi_msg = ""
         if (self.roi_mask is not None
                 and self.reference_image is not None):
-            from pathlib import Path
-            from ..roi_selection import save_roi_overlay_png
-            png_path = Path(save_path).with_suffix('.png')
             try:
                 save_roi_overlay_png(
                     reference_image=self.reference_image,
                     roi_mask=self.roi_mask,
                     z_slice=self.roi_z_slice,
-                    output_path=str(png_path),
+                    output_path=str(roi_png),
                     title=(f"ROI on T1 baseline (z={self.roi_z_slice})"
                            if self.roi_z_slice is not None
                            else "ROI on T1 baseline"),
                 )
-                png_msg = f"\nROI overlay PNG: {png_path}"
+                roi_msg = f"\n  {roi_png.name}"
             except Exception as e:
-                png_msg = f"\n(PNG companion failed: {e})"
+                roi_msg = f"\n  (ROI overlay PNG failed: {e})"
+        else:
+            roi_msg = "\n  (no ROI context — overlay PNG skipped)"
 
-        QMessageBox.information(self, "Save Complete",
-                              f"Results table saved to:\n{save_path}{png_msg}")
-
-    def _save_plot(self):
-        """Save the plot to file.
-
-        Always prompt the user — even when the GUI workflow seeded a default
-        path — so several ROIs in a row can be saved under different names
-        instead of overwriting the same file.
-        """
-        default_path = self.save_path or "kinetic_fit.png"
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Plot", default_path,
-            "PNG Files (*.png);;PDF Files (*.pdf);;All Files (*)"
+        QMessageBox.information(
+            self, "Save Complete",
+            f"Saved per-ROI bundle (N={n}) to:\n{target_dir}\n"
+            f"  {results_csv.name}"
+            f"{results_png_msg}\n"
+            f"  {timecourse_csv.name}\n"
+            f"  {plot_png.name}"
+            f"{roi_msg}",
         )
 
+    # ------------------------------------------------------------------
+    # Legacy single-file save methods. Kept callable for tests and any
+    # external programmatic users. The UI no longer exposes these — the
+    # Save button calls _save_all so the per-ROI bundle is written
+    # together with one shared N. Splitting plot vs. results table into
+    # separate buttons used to let N drift between them.
+    # ------------------------------------------------------------------
+
+    def _save_results_table(self):
+        """Single-file: write only the fit-parameters CSV.
+
+        UI no longer wires this; kept for tests and programmatic callers.
+        """
+        from pathlib import Path
+        from ..io import next_indexed_path
+
+        if self.dataset_dir:
+            kinetic_dir = Path(self.dataset_dir) / "kinetic_fits"
+            default_path = next_indexed_path(
+                kinetic_dir, "kinetic_fit_results", ".csv"
+            )
+        else:
+            default_path = Path("kinetic_fit_results.csv")
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Results Table", str(default_path),
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not save_path:
+            return
+
+        r = self.fit_results
+        time_units = r.get('time_units', 'minutes')
+        a0_est = r.get('A0_est')
+        a2_est = r.get('A2_est')
+        a0_est_cell = a0_est if a0_est is not None else ''
+        a2_est_cell = a2_est if a2_est is not None else ''
+        pct_nte_est_cell = (
+            self.pct_nte_est if not np.isnan(self.pct_nte_est) else ''
+        )
+
+        rows = [
+            ('A0', 'baseline signal', r['A0'], r['A0_error'], ''),
+            ('A0_est', 'baseline signal (initial estimate)', a0_est_cell, '', ''),
+            ('A1', 'tracer amplitude', r['A1'], r['A1_error'], ''),
+            ('A2', 'non-tracer amplitude', r['A2'], r['A2_error'], ''),
+            ('A2_est', 'non-tracer amplitude (initial estimate)', a2_est_cell, '', ''),
+            ('kb', 'buildup rate', r['kb'], r['kb_error'], f'1/{time_units}'),
+            ('kd', 'decay rate', r['kd'], r['kd_error'], f'1/{time_units}'),
+            ('knt', 'non-tracer rate', r['knt'], r['knt_error'], f'1/{time_units}'),
+            ('t0', 'tracer onset', r['t0'], r['t0_error'], time_units),
+            ('tmax', 'NTE onset', r['tmax'], r['tmax_error'], time_units),
+            ('%Enhancement', 'A1/A0 * 100', self.pct_enhancement, '', '%'),
+            ('%NTE', 'A2/A0 * 100', self.pct_nte, '', '%'),
+            ('%NTE_est', 'A2_est/A0_est * 100', pct_nte_est_cell, '', '%'),
+            ('R_squared', 'goodness of fit', r['r_squared'], '', ''),
+            ('RMSE', 'root mean square error', r['rmse'], '', ''),
+        ]
+        with open(save_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['parameter', 'description', 'value', 'error', 'units'])
+            for row in rows:
+                writer.writerow(row)
+        QMessageBox.information(self, "Save Complete",
+                              f"Results table saved to:\n{save_path}")
+
+    def _save_plot(self):
+        """Single-file: write only the fit-curve plot PNG.
+
+        UI no longer wires this; kept for tests and programmatic callers.
+        """
+        from pathlib import Path
+        from ..io import next_indexed_path
+
+        if self.dataset_dir:
+            kinetic_dir = Path(self.dataset_dir) / "kinetic_fits"
+            default_path = next_indexed_path(
+                kinetic_dir, "kinetic_fit", ".png"
+            )
+        else:
+            default_path = Path(self.save_path or "kinetic_fit.png")
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Plot", str(default_path),
+            "PNG Files (*.png);;PDF Files (*.pdf);;All Files (*)"
+        )
         if save_path:
             self.canvas.fig.savefig(save_path, dpi=300, bbox_inches='tight')
             QMessageBox.information(self, "Save Complete",
@@ -279,14 +484,16 @@ def plot_fit_results_qt(time: np.ndarray, signal: np.ndarray,
                        save_path: Optional[str] = None,
                        roi_mask: Optional[np.ndarray] = None,
                        reference_image: Optional[np.ndarray] = None,
-                       roi_z_slice: Optional[int] = None) -> None:
+                       roi_z_slice: Optional[int] = None,
+                       dataset_dir: Optional[str] = None) -> None:
     """
     Qt-based fit results visualization.
 
-    Drop-in replacement for plot_fit_results(). The optional roi_mask /
-    reference_image / roi_z_slice arguments are forwarded to the dialog
-    so its Save Results Table button can drop a companion PNG showing
-    the ROI on the anatomical reference next to the saved CSV.
+    Drop-in replacement for plot_fit_results(). Optional kwargs are
+    forwarded to the dialog so its Save Plot / Save Results Table
+    buttons default to ``<dataset_dir>/kinetic_fits/`` with auto-
+    incremented filenames, and so the Save Results Table companion
+    PNG shows the ROI on the anatomical reference.
     """
     app = init_qt_app()
 
@@ -295,6 +502,7 @@ def plot_fit_results_qt(time: np.ndarray, signal: np.ndarray,
         roi_mask=roi_mask,
         reference_image=reference_image,
         roi_z_slice=roi_z_slice,
+        dataset_dir=dataset_dir,
     )
 
     # Auto-save if path provided

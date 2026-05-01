@@ -1358,25 +1358,33 @@ class ParameterMapResultsDialog(QDialog):
         include_t1_cb = None
         include_t2_cb = None
 
-        if format_type == 'dicom':
-            anat_label = QLabel("\nInclude anatomical reference:")
-            anat_label.setStyleSheet("font-weight: bold;")
-            layout.addWidget(anat_label)
+        # T1/T2 anatomical reference checkboxes — apply to BOTH DICOM and
+        # PNG export formats now. For DICOM the destination subfolders are
+        # T1_baseline_map/ and T2_map/ (mirroring the parameter-map naming
+        # where the "_map" suffix marks the DICOM tree). For PNG they go
+        # to T1_baseline/ and T2/ (no suffix, mirroring the parameter-map
+        # PNG layout).
+        anat_label_text = (
+            "\nInclude anatomical reference (DICOM and PNG variants):"
+        )
+        anat_label = QLabel(anat_label_text)
+        anat_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(anat_label)
 
-            if self.registered_4d is not None:
-                include_t1_cb = QCheckBox("T1 baseline (timepoint 0)")
-                # Default off — the parameter maps are the primary export;
-                # T1/T2 are opt-in extras.
-                include_t1_cb.setChecked(False)
-                layout.addWidget(include_t1_cb)
-            if self.registered_t2 is not None:
-                include_t2_cb = QCheckBox("T2 anatomical")
-                include_t2_cb.setChecked(False)
-                layout.addWidget(include_t2_cb)
-            if include_t1_cb is None and include_t2_cb is None:
-                disabled = QLabel("(no T1/T2 source available for this dataset)")
-                disabled.setStyleSheet("color: #888; font-style: italic;")
-                layout.addWidget(disabled)
+        if self.registered_4d is not None:
+            include_t1_cb = QCheckBox("T1 baseline (timepoint 0)")
+            # Default off — parameter maps are the primary export, T1/T2
+            # are opt-in extras.
+            include_t1_cb.setChecked(False)
+            layout.addWidget(include_t1_cb)
+        if self.registered_t2 is not None:
+            include_t2_cb = QCheckBox("T2 anatomical")
+            include_t2_cb.setChecked(False)
+            layout.addWidget(include_t2_cb)
+        if include_t1_cb is None and include_t2_cb is None:
+            disabled = QLabel("(no T1/T2 source available for this dataset)")
+            disabled.setStyleSheet("color: #888; font-style: italic;")
+            layout.addWidget(disabled)
 
         # PNG-only: anatomical-overlay variant checkboxes. Captured as
         # booleans on self before the dialog goes out of scope.
@@ -1451,8 +1459,9 @@ class ParameterMapResultsDialog(QDialog):
         # references) inside the dialog method — see _show_map_selection_dialog
         # — so they're safe to read here even though the dialog has gone
         # out of scope and Qt has destroyed the underlying QCheckBox widgets.
-        include_t1 = bool(format_type == 'dicom' and getattr(self, '_include_t1', False))
-        include_t2 = bool(format_type == 'dicom' and getattr(self, '_include_t2', False))
+        # T1/T2 checkboxes apply to both DICOM and PNG formats now.
+        include_t1 = bool(getattr(self, '_include_t1', False))
+        include_t2 = bool(getattr(self, '_include_t2', False))
 
         # Allow proceeding when at least one of: parameter maps, T1, or T2
         # was checked. The dialog enforces this too, but guard here in case
@@ -1484,23 +1493,26 @@ class ParameterMapResultsDialog(QDialog):
                         )
                         total_files += len(saved)
 
-                # Optional: T1 baseline (timepoint 0 of the registered 4D
-                # series). Use a 4900-range series offset, well clear of
-                # the parameter-map offsets (4000–5300).
+                # Optional: T1 baseline DICOM. Subfolder T1_baseline_map/
+                # (the "_map" suffix marks DICOM trees, mirroring the
+                # parameter-map naming convention). Series offset 6000
+                # is well clear of the parameter-map offsets (4000–5300).
                 if include_t1 and self.registered_4d is not None:
                     t1_baseline = self.registered_4d[:, :, :, 0]
                     saved = save_volume_as_dicom_series(
-                        t1_baseline, "T1_baseline", str(folder), self.spacing,
+                        t1_baseline, "T1_baseline_map",
+                        str(folder), self.spacing,
                         source_dicom=self.source_dicom,
                         series_description="T1 baseline (registered, t=0)",
                         series_offset=6000,
                     )
                     total_files += len(saved)
 
-                # Optional: T2 anatomical
+                # Optional: T2 anatomical DICOM. Subfolder T2_map/.
                 if include_t2 and self.registered_t2 is not None:
                     saved = save_volume_as_dicom_series(
-                        self.registered_t2, "T2", str(folder), self.spacing,
+                        self.registered_t2, "T2_map",
+                        str(folder), self.spacing,
                         source_dicom=self.source_dicom,
                         series_description="T2 anatomical (registered)",
                         series_offset=6100,
@@ -1581,6 +1593,26 @@ class ParameterMapResultsDialog(QDialog):
                             )
                             saved_files.append(str(filepath))
 
+                # Optional anatomical PNG series alongside the parameter
+                # maps. Subfolders T1_baseline/ and T2/ (no "_map" suffix
+                # — the suffix marks the DICOM tree, not PNG).
+                if include_t1 and self.registered_4d is not None:
+                    from ..io import save_volume_as_png_series
+                    saved = save_volume_as_png_series(
+                        self.registered_4d[:, :, :, 0],
+                        "T1_baseline",
+                        str(folder),
+                    )
+                    saved_files.extend(saved)
+                if include_t2 and self.registered_t2 is not None:
+                    from ..io import save_volume_as_png_series
+                    saved = save_volume_as_png_series(
+                        self.registered_t2,
+                        "T2",
+                        str(folder),
+                    )
+                    saved_files.extend(saved)
+
                 # Restore original settings
                 self.current_map = original_map
                 self.current_z = original_z
@@ -1597,25 +1629,35 @@ class ParameterMapResultsDialog(QDialog):
         """Export metrics to CSV with a companion ROI overlay PNG.
 
         CSV schema: roi_type, z_slice, parameter, n_pixels, mean, std,
-        min, max. Writes a row per (ROI × parameter × z-slice). Both the
-        fitting ROI (per slice, intersected with the fit mask) and the
-        measurement ROI (single slice — wherever it was drawn — with NaN
-        filtering only) are included so the file captures everything
-        the user can see in the metrics panel.
+        min, max. Writes a row per (ROI × parameter × z-slice). Both
+        the fitting ROI (per slice, intersected with the fit mask) and
+        the measurement ROI (single slice — wherever it was drawn —
+        with NaN filtering only) are included so the file captures
+        everything the user can see in the metrics panel.
 
-        A companion PNG is saved alongside the CSV (same basename, .png
-        extension) showing the currently-displayed parameter map with
-        whichever ROI contours are active. Gives the data context: a
-        future reader can see exactly where the numbers came from.
+        Default save location is
+        ``<dataset>/parameter_maps/parameter_map_metrics/parameter_map_metric_<N>.csv``
+        with the next available N auto-detected so successive saves
+        don't overwrite each other (one full bundle per measurement
+        ROI). The companion PNG uses the same N and the suffix
+        ``parameter_map_metric_roi_<N>.png``.
         """
         import csv
 
-        from ..io import get_dataset_path
-        output_path = get_dataset_path(self.output_dir, 'parameter_maps')
+        from ..io import get_dataset_path, next_indexed_path, index_from_filename
+
+        # Default save location: the per-dataset metrics subfolder.
+        metrics_dir = Path(get_dataset_path(
+            self.output_dir,
+            'parameter_maps/parameter_map_metrics',
+        ))
+        default_path = next_indexed_path(
+            metrics_dir, "parameter_map_metric", ".csv"
+        )
 
         filepath, _ = QFileDialog.getSaveFileName(
             self, "Export Metrics",
-            str(output_path / "parameter_map_metrics.csv"),
+            str(default_path),
             "CSV Files (*.csv)"
         )
 
@@ -1648,51 +1690,30 @@ class ParameterMapResultsDialog(QDialog):
                 float(np.nanmax(valid)),
             ]
 
-        with open(filepath, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'roi_type', 'z_slice', 'parameter',
-                'n_pixels', 'mean', 'std', 'min', 'max',
-            ])
+        # Accumulate rows in memory so we can write them to BOTH the
+        # CSV and the table-style PNG companion.
+        all_rows = []
 
-            # ----- Fitting ROI: per slice, intersected with fit mask -----
-            if self.roi_mask is not None:
-                fit_mask = self.param_maps.get('mask')
-                for z in range(self.num_slices):
-                    if self.roi_mask.ndim == 2:
-                        roi_slice = self.roi_mask
+        # ----- Fitting ROI: per slice, intersected with fit mask -----
+        if self.roi_mask is not None:
+            fit_mask = self.param_maps.get('mask')
+            for z in range(self.num_slices):
+                if self.roi_mask.ndim == 2:
+                    roi_slice = self.roi_mask
+                else:
+                    roi_slice = self.roi_mask[:, :, z]
+
+                if fit_mask is not None:
+                    if fit_mask.ndim == 3:
+                        combined = roi_slice & fit_mask[:, :, z]
                     else:
-                        roi_slice = self.roi_mask[:, :, z]
+                        combined = roi_slice & fit_mask[:, :, 0]
+                else:
+                    combined = roi_slice
 
-                    if fit_mask is not None:
-                        if fit_mask.ndim == 3:
-                            combined = roi_slice & fit_mask[:, :, z]
-                        else:
-                            combined = roi_slice & fit_mask[:, :, 0]
-                    else:
-                        combined = roi_slice
+                if not combined.any():
+                    continue
 
-                    if not combined.any():
-                        continue
-
-                    for key, csv_name in param_names:
-                        map_data = self.param_maps.get(key)
-                        if map_data is None:
-                            continue
-                        if map_data.ndim == 3:
-                            slice_data = map_data[:, :, z]
-                        else:
-                            slice_data = map_data[:, :, 0]
-                        row = _stats_row('fitting', z, csv_name,
-                                         slice_data[combined])
-                        if row:
-                            writer.writerow(row)
-
-            # ----- Measurement ROI: single z-slice, NaN-filtered only -----
-            if self.measurement_roi_mask is not None:
-                z = self.measurement_roi_drawn_z
-                if z is None:
-                    z = self.current_z
                 for key, csv_name in param_names:
                     map_data = self.param_maps.get(key)
                     if map_data is None:
@@ -1701,27 +1722,100 @@ class ParameterMapResultsDialog(QDialog):
                         slice_data = map_data[:, :, z]
                     else:
                         slice_data = map_data[:, :, 0]
-                    row = _stats_row('measurement', z, csv_name,
-                                     slice_data[self.measurement_roi_mask])
+                    row = _stats_row('fitting', z, csv_name,
+                                     slice_data[combined])
                     if row:
-                        writer.writerow(row)
+                        all_rows.append(row)
 
-        # Companion PNG: snapshot of the currently-displayed figure (with
-        # whatever map, z-slice, and ROI contours are active). Lives next
-        # to the CSV so the data is self-documenting.
-        png_path = Path(filepath).with_suffix('.png')
+        # ----- Measurement ROI: single z-slice, NaN-filtered only -----
+        if self.measurement_roi_mask is not None:
+            z = self.measurement_roi_drawn_z
+            if z is None:
+                z = self.current_z
+            for key, csv_name in param_names:
+                map_data = self.param_maps.get(key)
+                if map_data is None:
+                    continue
+                if map_data.ndim == 3:
+                    slice_data = map_data[:, :, z]
+                else:
+                    slice_data = map_data[:, :, 0]
+                row = _stats_row('measurement', z, csv_name,
+                                 slice_data[self.measurement_roi_mask])
+                if row:
+                    all_rows.append(row)
+
+        headers = [
+            'roi_type', 'z_slice', 'parameter',
+            'n_pixels', 'mean', 'std', 'min', 'max',
+        ]
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            for row in all_rows:
+                writer.writerow(row)
+
+        # Companion files share the CSV's index N. Two PNGs are saved:
+        #
+        #   parameter_map_metric_roi_<N>.png   — snapshot of the dialog
+        #         figure with active ROI contour overlay (map context).
+        #   parameter_map_metric_<N>.png       — table render of the
+        #         numeric data so the metrics are presentation-ready.
+        csv_path = Path(filepath)
+        n = index_from_filename(csv_path, "parameter_map_metric", ".csv")
+        if n is not None:
+            roi_png_path = csv_path.parent / f"parameter_map_metric_roi_{n}.png"
+            table_png_path = csv_path.parent / f"parameter_map_metric_{n}.png"
+        else:
+            roi_png_path = next_indexed_path(
+                csv_path.parent, "parameter_map_metric_roi", ".png"
+            )
+            # When the CSV got renamed off-pattern, fall back to next
+            # free pattern slot for the table PNG too.
+            table_png_path = next_indexed_path(
+                csv_path.parent, "parameter_map_metric", ".png"
+            )
+
+        # 1) ROI overlay PNG (figure snapshot)
         try:
             self.figure.savefig(
-                str(png_path), dpi=150, bbox_inches='tight',
+                str(roi_png_path), dpi=150, bbox_inches='tight',
                 facecolor='white', edgecolor='none',
             )
-            png_msg = f"\nROI overlay PNG: {png_path}"
+            roi_png_msg = f"\nROI overlay PNG: {roi_png_path}"
         except Exception as e:
-            png_msg = f"\n(PNG companion failed: {e})"
+            roi_png_msg = f"\n(ROI overlay PNG failed: {e})"
+
+        # 2) Metrics table PNG (numeric data rendered as a table)
+        from ..roi_selection import save_table_as_png
+
+        def _fmt(v, fmt='.4f'):
+            if v == '' or v is None:
+                return ''
+            try:
+                return format(float(v), fmt)
+            except (TypeError, ValueError):
+                return str(v)
+
+        # Format mean/std/min/max with 4 decimal places; counts and
+        # categorical columns pass through.
+        png_rows = [[
+            r[0], r[1], r[2], r[3],
+            _fmt(r[4]), _fmt(r[5]), _fmt(r[6]), _fmt(r[7]),
+        ] for r in all_rows]
+        try:
+            save_table_as_png(
+                png_rows, headers, str(table_png_path),
+                title=f"Parameter map metrics (N={n})"
+                      if n is not None else "Parameter map metrics",
+            )
+            table_png_msg = f"\nMetrics table PNG: {table_png_path}"
+        except Exception as e:
+            table_png_msg = f"\n(metrics table PNG failed: {e})"
 
         QMessageBox.information(
             self, "Exported",
-            f"Metrics CSV: {filepath}{png_msg}",
+            f"Metrics CSV: {filepath}{roi_png_msg}{table_png_msg}",
         )
 
 
