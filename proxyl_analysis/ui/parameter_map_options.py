@@ -35,13 +35,14 @@ from .components import HeaderWidget
 # narrow band. Edit if you want tighter or looser auto-range.
 PERCENT_RANGE_PERCENTILE = 99.0
 
-# Hard cap on the %NTE LUT extent. Even after the percentile clip, real
-# datasets can show p99(|NTE|) values > 15% from a few noisy voxels — wide
-# enough to mask the ±15% band where the meaningful non-tracer effect lives.
-# Capping at ±15 keeps the colormap focused on that band; voxels beyond it
-# saturate at the green/magenta extremes. Set to None to disable the cap and
-# let the auto-range run free. Symmetric, so the black midpoint stays on 0.
-NTE_RANGE_MAX = 15.0
+# Hard cap on the %NTE / %NTE_est LUT extent. Used for both maps so they
+# display on the same color scale. Bumped from 15% → 20% after pinning A0
+# to the pre-injection baseline — without A0 absorbing kinetic-term mismatch
+# the recovered %NTE values are larger in magnitude and a 15% cap clipped
+# real signal at the extremes. Voxels outside ±20% still saturate at the
+# green / magenta ends. Set to None to disable the cap entirely; symmetric
+# so the black midpoint of the diverging LUT stays exactly on 0.
+NTE_RANGE_MAX = 20.0
 
 # Display range for the kd (decay rate) map. kd is non-negative; values
 # above the upper bound saturate at the brightest LUT color. Adjust if your
