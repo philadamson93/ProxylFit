@@ -571,6 +571,15 @@ def main():
 
             # ROI state preserved across menu returns
             roi_state = None
+            # Parameter maps preserved across menu returns until the
+            # user explicitly requests a recalculation. Lets the user
+            # close the parameter-map results dialog, do other things
+            # (e.g., draw a different ROI for kinetic fitting), then
+            # come back and view / measure on the same maps without
+            # re-running parameter mapping. Reset when a new dataset
+            # is loaded or registration is redone (matches how
+            # roi_state is invalidated below).
+            param_maps_cache = None
             registered_t2 = loaded_t2  # Use previously loaded T2 if available
 
             # If T2 was specified via args (e.g., from scan dialog) but not yet loaded, load it now
@@ -655,6 +664,7 @@ def main():
                                 temporal_res = extract_temporal_resolution(args.dicom) if args.dicom else None
                                 time_array = create_time_array(registered_4d.shape[3], args.time_units, temporal_resolution_s=temporal_res)
                                 roi_state = None
+                                param_maps_cache = None  # different dataset → invalidate cached maps
 
                                 # Load T2 if available in session
                                 loaded_t2, _ = load_registered_t2(session_path)
@@ -738,6 +748,7 @@ def main():
 
                         # Reset ROI state
                         roi_state = None
+                        param_maps_cache = None  # re-registration → maps invalid
                         registered_t2 = None
 
                         # Step 3: Load T2 if selected
@@ -982,6 +993,61 @@ def main():
                     continue  # Return to menu
 
                 elif action == 'parameter_maps':
+                    # If parameter maps from a previous calculation are
+                    # still cached, offer to view them instead of going
+                    # through the full pipeline again. The maps stay
+                    # available across menu returns until the user
+                    # explicitly recalculates, so they can come back
+                    # for further ROI measurement on the same maps
+                    # without paying the parameter-mapping cost.
+                    if param_maps_cache is not None:
+                        from PySide6.QtWidgets import QMessageBox
+
+                        box = QMessageBox()
+                        box.setWindowTitle("Parameter maps available")
+                        box.setText(
+                            "Parameter maps from a previous calculation "
+                            "are still in memory."
+                        )
+                        box.setInformativeText(
+                            "View the existing maps, or recalculate "
+                            "from scratch?"
+                        )
+                        view_btn = box.addButton(
+                            "View existing", QMessageBox.AcceptRole
+                        )
+                        recalc_btn = box.addButton(
+                            "Recalculate", QMessageBox.DestructiveRole
+                        )
+                        cancel_btn = box.addButton(QMessageBox.Cancel)
+                        box.setDefaultButton(view_btn)
+                        box.exec()
+
+                        clicked = box.clickedButton()
+                        if clicked is cancel_btn:
+                            print("Parameter mapping cancelled.")
+                            continue
+                        if clicked is view_btn:
+                            # Skip the options dialog and the calculation;
+                            # show the cached maps directly.
+                            print("Showing cached parameter maps...")
+                            show_parameter_map_results(
+                                param_maps=param_maps_cache,
+                                spacing=spacing,
+                                roi_mask=param_maps_cache.get('roi_mask'),
+                                output_dir=str(auto_registration_dir),
+                                source_dicom=args.dicom,
+                                registered_4d=registered_4d,
+                                registered_t2=registered_t2,
+                                time_array=time_array,
+                                dataset_dir=str(auto_registration_dir),
+                            )
+                            print("Returning to menu.")
+                            continue
+                        # Else (recalc_btn): fall through to the full
+                        # pipeline below; the cache will be replaced
+                        # with the new result on success.
+
                     # Show parameter map options dialog (T014)
                     print("Opening parameter map options...")
 
@@ -1085,6 +1151,16 @@ def main():
                         # Store entire 3D reference for z-slice navigation
                         param_maps['reference_slice'] = registered_4d[:, :, :, 0]
 
+                    # Cache so the user can revisit the results dialog
+                    # later without re-running parameter mapping. The
+                    # ROI mask used for fitting is already stored
+                    # inside param_maps under the 'roi_mask' key (set
+                    # by create_parameter_maps when an roi_mask was
+                    # provided), so a re-open later can recover it.
+                    if param_roi_mask is not None and 'roi_mask' not in param_maps:
+                        param_maps['roi_mask'] = param_roi_mask
+                    param_maps_cache = param_maps
+
                     # Show results viewer (T014). Pass registered_4d and
                     # registered_t2 so the Save-as-DICOM export can offer
                     # "Include T1 baseline" / "Include T2 anatomical"
@@ -1098,6 +1174,8 @@ def main():
                         source_dicom=args.dicom,
                         registered_4d=registered_4d,
                         registered_t2=registered_t2,
+                        time_array=time_array,
+                        dataset_dir=str(auto_registration_dir),
                     )
 
                     # Save parameter maps
