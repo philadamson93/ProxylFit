@@ -9,7 +9,7 @@ import numpy as np
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox, QStatusBar,
-    QMessageBox, QFileDialog,
+    QMessageBox, QFileDialog, QSpinBox, QPushButton,
 )
 from PySide6.QtCore import Signal
 
@@ -29,6 +29,8 @@ class InjectionTimeSelectorDialog(QDialog):
                  roi_mask: Optional[np.ndarray] = None,
                  reference_image: Optional[np.ndarray] = None,
                  roi_z_slice: Optional[int] = None,
+                 steady_state_default: float = 100.0,
+                 excluded_default: Optional[set] = None,
                  parent=None):
         super().__init__(parent)
         self.time = time
@@ -36,6 +38,16 @@ class InjectionTimeSelectorDialog(QDialog):
         self.time_units = time_units
         self.output_dir = output_dir
         self.injection_index = 0
+        # Default value (in time_units) for the NTE steady-state-time
+        # spinbox. Mirrors the same control on the parameter map
+        # options dialog so users can pick once on the injection
+        # page and have the kinetic fit honour it.
+        self._steady_state_default = float(steady_state_default)
+        # Indices flagged as excluded from the kinetic fit. Right-
+        # clicking a data point toggles its membership; the upcoming
+        # fit ignores these points (typically bolus-passage indices
+        # 6–7 that aren't well described by the kb/kd/knt processes).
+        self.excluded_indices = set(int(i) for i in (excluded_default or ()))
         # Optional ROI context for the Export CSV companion PNG. When
         # roi_mask + reference_image are both supplied, the timecourse
         # CSV is accompanied by a same-basename .png showing the
@@ -64,10 +76,11 @@ class InjectionTimeSelectorDialog(QDialog):
         # Instructions
         instructions = InstructionWidget(
             "Instructions:\n"
-            "- Click on the plot to select the injection time point\n"
-            "- The red vertical line shows the current selection\n"
-            "- Timecourse data is saved later from the kinetic fit "
-            "page so the per-ROI bundle stays consistent."
+            "- Left-click on the plot to set the injection time point\n"
+            "- Right-click on a data point to exclude it from the kinetic "
+            "fit (e.g. bolus-passage points 6–7); right-click again to "
+            "restore. Excluded points are shown with a red ×.\n"
+            "- The red vertical line shows the current injection selection."
         )
         layout.addWidget(instructions)
 
@@ -103,6 +116,55 @@ class InjectionTimeSelectorDialog(QDialog):
         stats_label = QLabel(stats_text)
         stats_layout.addWidget(stats_label)
         info_layout.addWidget(stats_group)
+
+        # Fit options — NTE steady-state time. Sets the lower bound
+        # on knt so the non-tracer term reaches ~95% of A2 within the
+        # user-specified window. Default 100 (in time_units); mirrors
+        # the same spinbox on the parameter map options dialog so the
+        # user can pick once and have both the kinetic fit and any
+        # subsequent parameter map honour it.
+        fit_options_group = QGroupBox("Fit Options")
+        fit_options_layout = QVBoxLayout(fit_options_group)
+
+        ss_row = QHBoxLayout()
+        ss_label = QLabel("NTE steady-state time:")
+        ss_row.addWidget(ss_label)
+        self.steady_state_spin = QSpinBox()
+        self.steady_state_spin.setRange(10, 500)
+        self.steady_state_spin.setValue(int(round(self._steady_state_default)))
+        self.steady_state_spin.setSingleStep(5)
+        self.steady_state_spin.setSuffix(f" {self.time_units}")
+        self.steady_state_spin.setToolTip(
+            "Maximum time after the signal peak at which the non-tracer\n"
+            "effect should reach steady state (within ~5% of A2). Sets\n"
+            "the lower bound on knt: knt ≥ ln(20)/t_steady. Typical\n"
+            "values for in-vivo PROXYL data: 70–100 minutes. Without\n"
+            "this constraint, knt can drift toward 0 and inflate A2\n"
+            "to absorb residuals even when the tail isn't saturating."
+        )
+        ss_row.addWidget(self.steady_state_spin)
+        ss_row.addStretch()
+        fit_options_layout.addLayout(ss_row)
+
+        ss_hint = QLabel("knt lower bound = ln(20)/t_steady")
+        ss_hint.setStyleSheet("color: #666; font-size: 11px;")
+        fit_options_layout.addWidget(ss_hint)
+
+        info_layout.addWidget(fit_options_group)
+
+        # Excluded-points panel — live readout of which indices are
+        # currently flagged for exclusion plus a one-click reset. The
+        # actual toggling happens on the plot via right-click.
+        excl_group = QGroupBox("Excluded points (right-click on plot)")
+        excl_layout = QVBoxLayout(excl_group)
+        self.excluded_label = QLabel(self._format_excluded_text())
+        self.excluded_label.setWordWrap(True)
+        self.excluded_label.setStyleSheet("padding: 4px;")
+        excl_layout.addWidget(self.excluded_label)
+        clear_btn = QPushButton("Clear all exclusions")
+        clear_btn.clicked.connect(self._clear_exclusions)
+        excl_layout.addWidget(clear_btn)
+        info_layout.addWidget(excl_group)
 
         info_layout.addStretch()
         content_layout.addLayout(info_layout, stretch=1)
@@ -149,18 +211,38 @@ class InjectionTimeSelectorDialog(QDialog):
         self.injection_marker = self.ax.axvline(x=self.time[0], color='red',
                                                 linewidth=3, label='Injection time')
 
-        # Connect click event
+        # Excluded-points overlay (red ×). Updated whenever the user
+        # right-clicks to toggle a point. Empty (x=[], y=[]) until
+        # the first toggle so it's never visible until needed.
+        self.excluded_scatter = self.ax.scatter(
+            [], [], marker='x', color='red', s=80, linewidths=2.5,
+            zorder=5, label='Excluded'
+        )
+        self._refresh_excluded_marks()
+
+        # Connect mouse-click events. Left = injection time,
+        # right = toggle exclude.
         self.canvas.mpl_connect('button_press_event', self._on_click)
 
         self.canvas.draw()
 
     def _on_click(self, event):
-        """Handle click to select injection time."""
-        if event.inaxes != self.ax or event.button != 1:
+        """Handle click events on the plot.
+
+        Left-click sets the injection time; right-click toggles the
+        nearest data point's exclusion from the kinetic fit.
+        """
+        if event.inaxes != self.ax:
             return
 
-        # Find closest time point
-        closest_idx = np.argmin(np.abs(self.time - event.xdata))
+        if event.button == 1:
+            self._on_left_click(event)
+        elif event.button == 3:
+            self._on_right_click(event)
+
+    def _on_left_click(self, event):
+        """Pick injection time from the closest time point."""
+        closest_idx = int(np.argmin(np.abs(self.time - event.xdata)))
         self.injection_index = closest_idx
 
         # Update marker
@@ -179,6 +261,76 @@ class InjectionTimeSelectorDialog(QDialog):
         self.status_bar.showMessage(
             f"Selected: {self.time[closest_idx]:.2f} {self.time_units} (index {closest_idx})"
         )
+
+    def _on_right_click(self, event):
+        """Toggle the nearest data point's exclusion flag.
+
+        Distance is measured in display (pixel) coordinates so the
+        click feels right regardless of axis aspect ratio. A small
+        radius cap prevents accidental toggles when the user clicks
+        far from any actual point.
+        """
+        if event.x is None or event.y is None:
+            return
+
+        # Convert each (time, signal) pair to display coords and find
+        # the closest one to the click.
+        xdata = np.asarray(self.time)
+        ydata = np.asarray(self.signal)
+        xy_pix = self.ax.transData.transform(np.column_stack([xdata, ydata]))
+        dx = xy_pix[:, 0] - event.x
+        dy = xy_pix[:, 1] - event.y
+        dist = np.hypot(dx, dy)
+        nearest = int(np.argmin(dist))
+
+        # Only toggle when the click is reasonably close to a point.
+        # 14 px ≈ marker size + a little slack.
+        if dist[nearest] > 14:
+            self.status_bar.showMessage(
+                "Right-click closer to a data point to toggle exclude."
+            )
+            return
+
+        if nearest in self.excluded_indices:
+            self.excluded_indices.discard(nearest)
+            self.status_bar.showMessage(
+                f"Restored point at index {nearest} (will be fit)."
+            )
+        else:
+            self.excluded_indices.add(nearest)
+            self.status_bar.showMessage(
+                f"Excluded point at index {nearest} from fit."
+            )
+
+        self._refresh_excluded_marks()
+        self.excluded_label.setText(self._format_excluded_text())
+        self.canvas.draw()
+
+    def _refresh_excluded_marks(self):
+        """Update the red-× scatter overlay to match excluded_indices."""
+        if not self.excluded_indices:
+            self.excluded_scatter.set_offsets(np.empty((0, 2)))
+            return
+        idx = sorted(self.excluded_indices)
+        pts = np.column_stack([self.time[idx], self.signal[idx]])
+        self.excluded_scatter.set_offsets(pts)
+
+    def _format_excluded_text(self) -> str:
+        """Render the excluded-indices summary for the side panel."""
+        if not self.excluded_indices:
+            return "(none — right-click data points on the plot to exclude)"
+        idx_str = ", ".join(str(i) for i in sorted(self.excluded_indices))
+        return f"Indices: {idx_str}\nCount: {len(self.excluded_indices)}"
+
+    def _clear_exclusions(self):
+        """Reset the excluded-indices set and redraw the plot."""
+        if not self.excluded_indices:
+            return
+        self.excluded_indices.clear()
+        self._refresh_excluded_marks()
+        self.excluded_label.setText(self._format_excluded_text())
+        self.canvas.draw()
+        self.status_bar.showMessage("Cleared all point exclusions.")
 
     def _export_csv(self):
         """Export timecourse data to CSV with a companion ROI overlay PNG.
@@ -259,13 +411,29 @@ class InjectionTimeSelectorDialog(QDialog):
         """Get the selected injection index."""
         return self.injection_index
 
+    def get_steady_state_time(self) -> float:
+        """Return the user-set NTE steady-state time (in time_units)."""
+        try:
+            return float(self.steady_state_spin.value())
+        except RuntimeError:
+            # Widget already destroyed (e.g. dialog closed) — fall
+            # back to the default that was passed in.
+            return float(self._steady_state_default)
+
+    def get_excluded_indices(self) -> list:
+        """Return the sorted list of indices flagged for exclusion."""
+        return sorted(int(i) for i in self.excluded_indices)
+
 
 def select_injection_time_qt(time: np.ndarray, signal: np.ndarray,
                             time_units: str = 'minutes',
                             output_dir: str = './output',
                             roi_mask: Optional[np.ndarray] = None,
                             reference_image: Optional[np.ndarray] = None,
-                            roi_z_slice: Optional[int] = None) -> int:
+                            roi_z_slice: Optional[int] = None,
+                            steady_state_default: float = 100.0,
+                            excluded_default: Optional[set] = None,
+                            return_steady_state: bool = False):
     """
     Qt-based interactive injection time selection.
 
@@ -273,6 +441,16 @@ def select_injection_time_qt(time: np.ndarray, signal: np.ndarray,
     reference_image / roi_z_slice arguments are forwarded to the dialog so
     its Export CSV button can drop a companion ROI overlay PNG next to the
     saved timecourse.
+
+    The dialog also carries an NTE steady-state-time spinbox (default 100
+    in time_units) that the upcoming kinetic fit uses to bound knt from
+    below: ``knt_lower = ln(20) / t_steady``. Right-clicking points on
+    the plot toggles them as excluded from the fit (typically bolus-
+    passage points 6–7).
+
+    Pass ``return_steady_state=True`` to receive a
+    ``(injection_index, steady_state_time, excluded_indices)`` triple
+    instead of just the index.
     """
     app = init_qt_app()
 
@@ -281,14 +459,29 @@ def select_injection_time_qt(time: np.ndarray, signal: np.ndarray,
         roi_mask=roi_mask,
         reference_image=reference_image,
         roi_z_slice=roi_z_slice,
+        steady_state_default=steady_state_default,
+        excluded_default=excluded_default,
     )
     result = dialog.exec()
 
     injection_index = dialog.get_injection_index()
+    steady_state = dialog.get_steady_state_time()
+    excluded = dialog.get_excluded_indices()
 
     if result == QDialog.Accepted:
         print(f"Injection time set: {time[injection_index]:.1f} {time_units}")
+        print(
+            f"Fit option: NTE steady-state time = {steady_state:.0f} {time_units} "
+            f"(knt ≥ {np.log(20.0) / steady_state:.4f}/{time_units})"
+        )
+        if excluded:
+            print(
+                f"Fit option: {len(excluded)} point(s) excluded from fit "
+                f"(indices {excluded})"
+            )
     else:
         print(f"Selection cancelled, using default: {time[injection_index]:.1f} {time_units}")
 
+    if return_steady_state:
+        return injection_index, steady_state, excluded
     return injection_index

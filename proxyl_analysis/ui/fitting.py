@@ -110,7 +110,7 @@ class FitResultsDialog(QDialog):
             ("A1 (amplitude)", f"{self.fit_results['A1']:.3f} ± {self.fit_results['A1_error']:.3f}"),
             ("A2 (non-tracer)", f"{self.fit_results['A2']:.3f} ± {self.fit_results['A2_error']:.3f}{a2_init}"),
             ("t0 (onset)", f"{self.fit_results['t0']:.2f} ± {self.fit_results['t0_error']:.2f}"),
-            ("tmax (NTE onset)", f"{self.fit_results['tmax']:.2f} ± {self.fit_results['tmax_error']:.2f}"),
+            ("tmax (NTE onset)", f"{self.fit_results['tmax']:.2f}  [fixed = argmax(signal)]"),
         ]
 
         for i, (name, value) in enumerate(params):
@@ -227,6 +227,21 @@ class FitResultsDialog(QDialog):
                      linewidth=2, label='Data')
         self.ax1.plot(self.time, self.fitted_signal, 'r-',
                      linewidth=2, label='Fitted Model')
+
+        # Excluded points: overlay red × marks at any post-injection
+        # indices the optimizer skipped. fit_results carries the
+        # post-injection-space indices as fed into fit_proxyl_kinetics.
+        excluded_post = self.fit_results.get('excluded_indices') or []
+        excluded_post = [int(i) for i in excluded_post
+                         if 0 <= int(i) < len(self.time)]
+        if excluded_post:
+            self.ax1.scatter(
+                np.asarray(self.time)[excluded_post],
+                np.asarray(self.signal)[excluded_post],
+                marker='x', color='red', s=80, linewidths=2.5,
+                zorder=5, label='Excluded from fit',
+            )
+
         self.ax1.set_ylabel('Signal Intensity')
         self.ax1.legend()
         self.ax1.grid(True, alpha=0.3)
@@ -353,7 +368,7 @@ class FitResultsDialog(QDialog):
             ('kd', 'decay rate', r['kd'], r['kd_error'], f'1/{time_units}'),
             ('knt', 'non-tracer rate', r['knt'], r['knt_error'], f'1/{time_units}'),
             ('t0', 'tracer onset', r['t0'], r['t0_error'], time_units),
-            ('tmax', 'NTE onset', r['tmax'], r['tmax_error'], time_units),
+            ('tmax', 'NTE onset (fixed = argmax(signal))', r['tmax'], '', time_units),
             ('%Enhancement', 'A1/A0 * 100', self.pct_enhancement, '', '%'),
             ('%NTE', 'A2/A0 * 100', self.pct_nte, '', '%'),
             ('%NTE_est', 'A2_est/A0_est * 100', pct_nte_est_cell, '', '%'),
@@ -503,7 +518,7 @@ class FitResultsDialog(QDialog):
             ('kd', 'decay rate', r['kd'], r['kd_error'], f'1/{time_units}'),
             ('knt', 'non-tracer rate', r['knt'], r['knt_error'], f'1/{time_units}'),
             ('t0', 'tracer onset', r['t0'], r['t0_error'], time_units),
-            ('tmax', 'NTE onset', r['tmax'], r['tmax_error'], time_units),
+            ('tmax', 'NTE onset (fixed = argmax(signal))', r['tmax'], '', time_units),
             ('%Enhancement', 'A1/A0 * 100', self.pct_enhancement, '', '%'),
             ('%NTE', 'A2/A0 * 100', self.pct_nte, '', '%'),
             ('%NTE_est', 'A2_est/A0_est * 100', pct_nte_est_cell, '', '%'),

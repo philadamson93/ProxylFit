@@ -14,9 +14,10 @@ from typing import Optional, Tuple, Dict, Any
 import numpy as np
 
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGroupBox,
-    QSpinBox, QSlider, QMessageBox, QWidget, QCheckBox, QFileDialog,
-    QComboBox, QRadioButton, QButtonGroup, QFrame, QProgressBar
+    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QPushButton, QLabel,
+    QGroupBox, QSpinBox, QSlider, QMessageBox, QWidget, QCheckBox,
+    QFileDialog, QComboBox, QRadioButton, QButtonGroup, QFrame,
+    QProgressBar,
 )
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QFont
@@ -74,6 +75,20 @@ class ParameterMappingWorker(QThread):
         try:
             from ..parameter_mapping import create_parameter_maps
 
+            # Translate user-marked exclusions (FULL-array indices —
+            # what the user clicked on the injection-time plot) to
+            # post-injection-array space for create_parameter_maps,
+            # which slices off the pre-injection portion internally.
+            full_excl = self.options.get('excluded_indices') or []
+            if self.injection_idx is not None and full_excl:
+                excl_post = [
+                    int(i) - int(self.injection_idx)
+                    for i in full_excl
+                    if int(i) >= int(self.injection_idx)
+                ]
+            else:
+                excl_post = list(full_excl)
+
             param_maps = create_parameter_maps(
                 registered_4d=self.registered_4d,
                 time_array=self.time_array,
@@ -84,8 +99,17 @@ class ParameterMappingWorker(QThread):
                 roi_mask=self.roi_mask,
                 kernel_type=self.options['kernel_type'],
                 injection_time_index=self.injection_idx,
-                stride=self.options.get('stride', 1)
+                stride=self.options.get('stride', 1),
+                steady_state_time=self.options.get('steady_state_time'),
+                excluded_indices=excl_post,
             )
+
+            # Tag the metadata with the FULL-array indices too so the
+            # measurement-ROI fit can re-use the same exclusion list
+            # without having to re-translate from post space.
+            if param_maps is not None:
+                meta = param_maps.setdefault('metadata', {})
+                meta['excluded_indices_full'] = list(full_excl)
 
             if not self._is_cancelled:
                 self.finished.emit(param_maps)
@@ -241,6 +265,8 @@ class ParameterMapOptionsDialog(QDialog):
                  existing_roi: Optional[np.ndarray] = None,
                  existing_injection_idx: Optional[int] = None,
                  default_window_size: Tuple[int, int, int] = (15, 15, 1),
+                 default_steady_state_time: float = 100.0,
+                 time_units: str = 'minutes',
                  parent=None):
         super().__init__(parent)
         self.max_z = max_z
@@ -248,12 +274,21 @@ class ParameterMapOptionsDialog(QDialog):
         self.existing_roi = existing_roi
         self.existing_injection_idx = existing_injection_idx
         self.default_window_size = default_window_size
+        # Default value (in time_units) for the NTE steady-state-time
+        # spinbox. Mirrors the same control on the injection time
+        # dialog so the user's prior choice carries forward.
+        self._default_steady_state_time = float(default_steady_state_time)
+        self._time_units = time_units
 
         self.result = None
 
         self.setWindowTitle("Parameter Map Options")
-        self.setMinimumSize(500, 550)
-        self.resize(550, 600)
+        # Bumped from 500×550 / 550×600 — adding the Fit Options group
+        # plus the kernel section's three rows (type / size / stride)
+        # made the original size cramped, especially on macOS where
+        # QGroupBox titles eat ~14 px of vertical space per group.
+        self.setMinimumSize(600, 720)
+        self.resize(640, 780)
 
         self._setup_ui()
 
@@ -274,6 +309,10 @@ class ParameterMapOptionsDialog(QDialog):
 
         # Kernel configuration
         self._create_kernel_section(layout)
+
+        # Fit options (separate group so model-fit toggles don't crowd
+        # the kernel-geometry section)
+        self._create_fit_options_section(layout)
 
         # Injection time
         self._create_injection_section(layout)
@@ -368,74 +407,158 @@ class ParameterMapOptionsDialog(QDialog):
         parent_layout.addWidget(group)
 
     def _create_kernel_section(self, parent_layout):
-        """Create kernel configuration section."""
+        """Create kernel configuration section.
+
+        Uses QFormLayout so the label column ("Kernel type:" / "Window
+        size:" / "Pixel stride:") and the value widgets line up
+        automatically — Qt handles label/value alignment, vertical
+        spacing, and label-column width without any manual fiddling.
+        Multi-widget rows (the W×H×D window-size triplet and the
+        stride row with its hint) are wrapped in a small QHBoxLayout
+        and added with addRow(label, layout).
+        """
         group = QGroupBox("Kernel Configuration")
-        layout = QVBoxLayout(group)
+        outer = QVBoxLayout(group)
+        outer.setContentsMargins(12, 14, 12, 12)
+        outer.setSpacing(8)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
 
         # Kernel type
-        type_layout = QHBoxLayout()
-        type_layout.addWidget(QLabel("Kernel type:"))
-
         self.kernel_type_combo = QComboBox()
         self.kernel_type_combo.addItems(["sliding_window", "gaussian", "uniform", "box"])
         self.kernel_type_combo.setCurrentText("sliding_window")
-        type_layout.addWidget(self.kernel_type_combo)
-        type_layout.addStretch()
+        self.kernel_type_combo.setMinimumWidth(160)
+        form.addRow("Kernel type:", self.kernel_type_combo)
 
-        layout.addLayout(type_layout)
-
-        # Kernel size
-        size_layout = QHBoxLayout()
-        size_layout.addWidget(QLabel("Window size:"))
+        # Window size — three spinboxes joined by × characters, all in a
+        # single horizontal sub-row. Wrapping them in a QWidget gives
+        # QFormLayout one widget to align against the label.
+        size_widget = QWidget()
+        size_row = QHBoxLayout(size_widget)
+        size_row.setContentsMargins(0, 0, 0, 0)
+        size_row.setSpacing(6)
 
         self.window_x_spin = QSpinBox()
         self.window_x_spin.setRange(3, 31)
         self.window_x_spin.setValue(self.default_window_size[0])
         self.window_x_spin.setSingleStep(2)
-        size_layout.addWidget(self.window_x_spin)
-
-        size_layout.addWidget(QLabel("x"))
+        self.window_x_spin.setFixedWidth(70)
+        size_row.addWidget(self.window_x_spin)
+        size_row.addWidget(QLabel("×"))
 
         self.window_y_spin = QSpinBox()
         self.window_y_spin.setRange(3, 31)
         self.window_y_spin.setValue(self.default_window_size[1])
         self.window_y_spin.setSingleStep(2)
-        size_layout.addWidget(self.window_y_spin)
-
-        size_layout.addWidget(QLabel("x"))
+        self.window_y_spin.setFixedWidth(70)
+        size_row.addWidget(self.window_y_spin)
+        size_row.addWidget(QLabel("×"))
 
         self.window_z_spin = QSpinBox()
         self.window_z_spin.setRange(1, 9)
         self.window_z_spin.setValue(self.default_window_size[2])
-        size_layout.addWidget(self.window_z_spin)
+        self.window_z_spin.setFixedWidth(70)
+        size_row.addWidget(self.window_z_spin)
+        size_row.addSpacing(4)
+        size_row.addWidget(QLabel("voxels"))
+        size_row.addStretch()
 
-        size_layout.addWidget(QLabel("voxels"))
-        size_layout.addStretch()
+        form.addRow("Window size:", size_widget)
 
-        layout.addLayout(size_layout)
-
-        # Stride (downsampling step)
-        stride_layout = QHBoxLayout()
-        stride_layout.addWidget(QLabel("Pixel stride:"))
+        # Stride (downsampling step) — spinbox + inline hint.
+        stride_widget = QWidget()
+        stride_row = QHBoxLayout(stride_widget)
+        stride_row.setContentsMargins(0, 0, 0, 0)
+        stride_row.setSpacing(8)
 
         self.stride_spin = QSpinBox()
         self.stride_spin.setRange(1, 32)
         self.stride_spin.setValue(1)
         self.stride_spin.setSingleStep(1)
+        self.stride_spin.setFixedWidth(70)
         self.stride_spin.setToolTip(
             "Skip pixels to trade resolution for speed.\n"
             "Stride=1: fit every pixel (full resolution)\n"
             "Stride=8: fit every 8th pixel (~64× faster)"
         )
-        stride_layout.addWidget(self.stride_spin)
+        stride_row.addWidget(self.stride_spin)
 
-        stride_info = QLabel("(1 = full resolution, higher = faster/coarser)")
-        stride_info.setStyleSheet("color: #666; font-size: 11px;")
-        stride_layout.addWidget(stride_info)
-        stride_layout.addStretch()
+        stride_hint = QLabel("(1 = full resolution, higher = faster / coarser)")
+        stride_hint.setStyleSheet("color: #666; font-size: 11px;")
+        stride_row.addWidget(stride_hint)
+        stride_row.addStretch()
 
-        layout.addLayout(stride_layout)
+        form.addRow("Pixel stride:", stride_widget)
 
+        outer.addLayout(form)
+        parent_layout.addWidget(group)
+
+    def _create_fit_options_section(self, parent_layout):
+        """Create fit options section (model-fitting constraints).
+
+        Kept separate from Kernel Configuration so per-pixel kernel
+        geometry (size, stride, type) doesn't crowd the model-fit
+        controls. Currently one input: NTE steady-state time. Sets
+        the lower bound on the non-tracer rate constant knt so the
+        fitted (1−exp(−knt·t)) term reaches ~95% of A2 within the
+        user-specified window. Without this, knt can drift to ~0
+        and inflate the reported A2 to absorb residuals — even
+        though the tail of the signal is nowhere near saturation.
+        The same value flows to the per-voxel parameter map fits
+        and to the "Kinetic Fit on this ROI" button in the
+        param-map dialog so all three views stay consistent.
+        """
+        group = QGroupBox("Fit Options")
+        outer = QVBoxLayout(group)
+        outer.setContentsMargins(12, 14, 12, 12)
+        outer.setSpacing(8)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        # NTE steady-state time spinbox. Range 10–500 in time_units;
+        # default 100 (typical PROXYL upper bound for steady-state).
+        # Bounds knt from below at ln(20)/t_steady so a 100-min
+        # setting forces knt ≥ ~0.030/min.
+        ss_widget = QWidget()
+        ss_row = QHBoxLayout(ss_widget)
+        ss_row.setContentsMargins(0, 0, 0, 0)
+        ss_row.setSpacing(8)
+
+        self.steady_state_spin = QSpinBox()
+        self.steady_state_spin.setRange(10, 500)
+        self.steady_state_spin.setValue(int(round(self._default_steady_state_time)))
+        self.steady_state_spin.setSingleStep(5)
+        self.steady_state_spin.setFixedWidth(110)
+        self.steady_state_spin.setSuffix(f" {self._time_units}")
+        self.steady_state_spin.setToolTip(
+            "Maximum time after the signal peak at which the non-tracer\n"
+            "effect should reach steady state (within ~5% of A2). Sets\n"
+            "the lower bound on knt: knt ≥ ln(20)/t_steady. Typical\n"
+            "values for in-vivo PROXYL data: 70–100 minutes. Without\n"
+            "this constraint, knt can drift toward 0, inflating A2 to\n"
+            "absorb residuals even when the tail isn't saturating."
+        )
+        ss_row.addWidget(self.steady_state_spin)
+
+        ss_hint = QLabel("(knt ≥ ln(20)/t_steady — 95% of A2 by t_steady)")
+        ss_hint.setStyleSheet("color: #666; font-size: 11px;")
+        ss_row.addWidget(ss_hint)
+        ss_row.addStretch()
+
+        form.addRow("NTE steady-state time:", ss_widget)
+
+        outer.addLayout(form)
         parent_layout.addWidget(group)
 
     def _create_injection_section(self, parent_layout):
@@ -519,6 +642,9 @@ class ParameterMapOptionsDialog(QDialog):
             # Stride (downsampling)
             'stride': self.stride_spin.value(),
 
+            # Fit options
+            'steady_state_time': float(self.steady_state_spin.value()),
+
             # Injection time
             'reuse_injection': self.reuse_injection_radio.isChecked(),
             'select_injection': self.select_injection_radio.isChecked()
@@ -551,6 +677,8 @@ class ParameterMapResultsDialog(QDialog):
                  source_dicom: Optional[str] = None,
                  registered_4d: Optional[np.ndarray] = None,
                  registered_t2: Optional[np.ndarray] = None,
+                 time_array: Optional[np.ndarray] = None,
+                 dataset_dir: Optional[str] = None,
                  parent=None):
         super().__init__(parent)
         self.param_maps = param_maps
@@ -564,6 +692,13 @@ class ParameterMapResultsDialog(QDialog):
         # alongside the parameter maps. Either may be None if not available.
         self.registered_4d = registered_4d
         self.registered_t2 = registered_t2
+        # Time array + dataset directory let the Measurement ROI panel's
+        # "Kinetic Fit" button extract a per-ROI signal from registered_4d
+        # and run fit_proxyl_kinetics in-place — same dialog the main
+        # menu's kinetic_fit action opens. Both optional: the button is
+        # only enabled when registered_4d AND time_array are present.
+        self.time_array = time_array
+        self.dataset_dir = dataset_dir
 
         # Get map dimensions
         self.kb_map = param_maps.get('kb_map', np.array([]))
@@ -742,6 +877,16 @@ class ParameterMapResultsDialog(QDialog):
         self.clear_measure_btn.setEnabled(False)
         measure_btn_row.addWidget(self.clear_measure_btn)
         measure_layout.addLayout(measure_btn_row)
+
+        # Kinetic Fit button — runs fit_proxyl_kinetics on the signal
+        # extracted from the drawn measurement ROI and opens the fit
+        # results dialog modally. Disabled until both an ROI is drawn
+        # AND the dialog was given the data needed to do the fit
+        # (registered_4d + time_array).
+        self.kinetic_fit_btn = QPushButton("Kinetic Fit on this ROI")
+        self.kinetic_fit_btn.clicked.connect(self._run_kinetic_fit_on_measurement_roi)
+        self.kinetic_fit_btn.setEnabled(False)
+        measure_layout.addWidget(self.kinetic_fit_btn)
 
         right_layout.addWidget(measure_group)
 
@@ -993,6 +1138,14 @@ class ParameterMapResultsDialog(QDialog):
         self.measurement_roi_mask = inside
         self.measurement_roi_drawn_z = self.current_z
         self.clear_measure_btn.setEnabled(True)
+        # Only enable the kinetic-fit button when we actually have the
+        # data needed to do the fit (registered_4d for signal extraction,
+        # time_array for the time axis). Otherwise the click would just
+        # error out, so keep it disabled.
+        self.kinetic_fit_btn.setEnabled(
+            self.registered_4d is not None
+            and self.time_array is not None
+        )
         n_pixels = int(inside.sum())
         self.measure_status_label.setText(
             f"ROI active: {n_pixels} pixels. Stats below; "
@@ -1007,6 +1160,116 @@ class ParameterMapResultsDialog(QDialog):
         self.measurement_roi_mask = None
         self.measurement_roi_drawn_z = None
         self.clear_measure_btn.setEnabled(False)
+        self.kinetic_fit_btn.setEnabled(False)
+        self.measure_status_label.setText(
+            "Click 'Draw' then drag-and-release on the map."
+        )
+        self._update_display()
+
+    def _run_kinetic_fit_on_measurement_roi(self):
+        """Run kinetic fit on the drawn measurement ROI's signal.
+
+        Pulls the signal time-series from registered_4d using the same
+        single-slice-mean convention as the menu's kinetic_fit action,
+        applies the same A0-pinning + pre-injection trimming, then
+        opens FitResultsDialog modally. The dialog inherits the dataset
+        directory so its Save button writes the per-ROI bundle into the
+        same kinetic_fits/ subfolder as fits launched from the menu.
+        """
+        from PySide6.QtWidgets import QMessageBox
+        from ..roi_selection import compute_roi_timeseries
+        from ..model import fit_proxyl_kinetics
+        from .fitting import plot_fit_results_qt
+
+        if self.measurement_roi_mask is None:
+            return  # button shouldn't be clickable, but defensive
+
+        # Need the injection time index from when the parameter maps
+        # were computed. It's stored in metadata; if absent the maps
+        # were fit on the full curve and pinning A0 doesn't apply
+        # cleanly. Fall back to fitting without pre-injection in that
+        # case.
+        metadata = self.param_maps.get('metadata', {}) or {}
+        injection_idx = metadata.get('injection_time_index')
+        time_units = metadata.get('time_units', 'minutes')
+        steady_state_time = metadata.get('steady_state_time')
+        # FULL-array exclusion list, mirrored from the parameter-map
+        # options dialog. Translated below to post-injection space
+        # before being handed to fit_proxyl_kinetics.
+        excluded_full = metadata.get('excluded_indices_full') or []
+
+        z = self.measurement_roi_drawn_z
+        if z is None:
+            z = self.current_z
+
+        # Extract the time series for the drawn ROI.
+        try:
+            roi_signal = compute_roi_timeseries(
+                self.registered_4d, self.measurement_roi_mask, z_slice=z,
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Kinetic fit failed",
+                f"Could not extract ROI signal:\n{e}",
+            )
+            return
+
+        # Trim to post-injection for the fit; keep pre-injection slice
+        # for A0 pinning + display.
+        if injection_idx is not None and injection_idx > 0:
+            time_fit = self.time_array[injection_idx:]
+            signal_fit = roi_signal[injection_idx:]
+            pre_time = self.time_array[:injection_idx]
+            pre_signal = roi_signal[:injection_idx]
+        else:
+            time_fit = self.time_array
+            signal_fit = roi_signal
+            pre_time = None
+            pre_signal = None
+
+        if len(signal_fit) < 8:
+            QMessageBox.warning(
+                self, "Kinetic fit failed",
+                "Need at least 8 timepoints after injection for the fit.",
+            )
+            return
+
+        # Run the fit.
+        try:
+            # Translate FULL-array exclusion indices to the
+            # post-injection-array space the kinetic fit sees.
+            if injection_idx is not None and excluded_full:
+                excluded_post = [
+                    int(i) - int(injection_idx)
+                    for i in excluded_full
+                    if int(i) >= int(injection_idx)
+                ]
+            else:
+                excluded_post = list(excluded_full)
+            kb, kd, knt, fitted_signal, fit_results = fit_proxyl_kinetics(
+                time_fit, signal_fit, time_units,
+                pre_injection_signal=pre_signal,
+                steady_state_time=steady_state_time,
+                excluded_indices=excluded_post,
+            )
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Kinetic fit failed",
+                f"fit_proxyl_kinetics raised:\n{e}",
+            )
+            return
+
+        # Open the kinetic fit results dialog (modal).
+        plot_fit_results_qt(
+            time_fit, signal_fit, fitted_signal, fit_results,
+            roi_mask=self.measurement_roi_mask,
+            reference_image=(self.registered_4d[:, :, :, 0]
+                             if self.registered_4d is not None else None),
+            roi_z_slice=z,
+            dataset_dir=self.dataset_dir,
+            pre_injection_time=pre_time,
+            pre_injection_signal=pre_signal,
+        )
         self.measure_status_label.setText(
             "Click 'Draw' then drag-and-release on the map."
         )
@@ -1824,7 +2087,9 @@ def show_parameter_map_options(max_z: int = 8,
                                 current_z: int = 4,
                                 existing_roi: Optional[np.ndarray] = None,
                                 existing_injection_idx: Optional[int] = None,
-                                default_window_size: Tuple[int, int, int] = (15, 15, 1)) -> Optional[dict]:
+                                default_window_size: Tuple[int, int, int] = (15, 15, 1),
+                                default_steady_state_time: float = 100.0,
+                                time_units: str = 'minutes') -> Optional[dict]:
     """
     Show the parameter map options dialog.
 
@@ -1840,6 +2105,10 @@ def show_parameter_map_options(max_z: int = 8,
         Existing injection time index
     default_window_size : tuple
         Default window size (x, y, z)
+    default_steady_state_time : float
+        Pre-fill for the NTE steady-state-time spinbox (in time_units).
+    time_units : str
+        Unit suffix for the NTE steady-state-time spinbox.
 
     Returns
     -------
@@ -1853,7 +2122,9 @@ def show_parameter_map_options(max_z: int = 8,
         current_z=current_z,
         existing_roi=existing_roi,
         existing_injection_idx=existing_injection_idx,
-        default_window_size=default_window_size
+        default_window_size=default_window_size,
+        default_steady_state_time=default_steady_state_time,
+        time_units=time_units,
     )
 
     result = dialog.exec()
@@ -1869,7 +2140,9 @@ def show_parameter_map_results(param_maps: Dict[str, np.ndarray],
                                 output_dir: str = './output',
                                 source_dicom: Optional[str] = None,
                                 registered_4d: Optional[np.ndarray] = None,
-                                registered_t2: Optional[np.ndarray] = None) -> None:
+                                registered_t2: Optional[np.ndarray] = None,
+                                time_array: Optional[np.ndarray] = None,
+                                dataset_dir: Optional[str] = None) -> None:
     """
     Show the parameter map results viewer.
 
@@ -1903,6 +2176,8 @@ def show_parameter_map_results(param_maps: Dict[str, np.ndarray],
         source_dicom=source_dicom,
         registered_4d=registered_4d,
         registered_t2=registered_t2,
+        time_array=time_array,
+        dataset_dir=dataset_dir,
     )
 
     dialog.exec()

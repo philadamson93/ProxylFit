@@ -30,7 +30,9 @@ _PIXEL_WORKER_CTX: Dict[str, Any] = {}
 
 def _init_pixel_worker(registered_4d, time_array, kernel_type, window_size,
                        signal_threshold, time_units,
-                       pre_injection_4d=None):
+                       pre_injection_4d=None,
+                       steady_state_time=None,
+                       excluded_indices=None):
     """Pool initializer — stash the read-only fitting inputs as worker globals.
 
     ``pre_injection_4d`` is the slice of the original 4D volume *before*
@@ -39,7 +41,18 @@ def _init_pixel_worker(registered_4d, time_array, kernel_type, window_size,
     per-voxel baseline signal to ``fit_proxyl_kinetics`` so A0 is
     pinned to the pre-injection mean — same behavior as the kinetic
     fit page. When None (no injection time, or all timepoints used),
-    the per-voxel fit falls back to the 8-param free-A0 mode.
+    the per-voxel fit falls back to the 7-param free-A0 mode.
+
+    ``steady_state_time`` (in time_units) is forwarded to every voxel's
+    fit so the knt lower bound = ln(20)/t_steady applies uniformly,
+    keeping the parameter map consistent with the curve-fit page's
+    NTE constraint. None falls back to the legacy 0.001/min floor.
+
+    ``excluded_indices`` (a sequence of int) is forwarded to every
+    voxel's fit so the same bolus / artefact points masked on the
+    kinetic-fit page are masked here too. Indices are interpreted in
+    the **post-injection** array (after create_parameter_maps slices
+    off the pre-injection portion). None means no exclusions.
     """
     _PIXEL_WORKER_CTX['registered_4d'] = registered_4d
     _PIXEL_WORKER_CTX['time_array'] = time_array
@@ -48,6 +61,10 @@ def _init_pixel_worker(registered_4d, time_array, kernel_type, window_size,
     _PIXEL_WORKER_CTX['signal_threshold'] = signal_threshold
     _PIXEL_WORKER_CTX['time_units'] = time_units
     _PIXEL_WORKER_CTX['pre_injection_4d'] = pre_injection_4d
+    _PIXEL_WORKER_CTX['steady_state_time'] = steady_state_time
+    _PIXEL_WORKER_CTX['excluded_indices'] = (
+        list(excluded_indices) if excluded_indices else None
+    )
 
 
 def _fit_pixel(pos):
@@ -71,6 +88,8 @@ def _fit_pixel(pos):
     signal_threshold = ctx['signal_threshold']
     time_units = ctx['time_units']
     pre_injection_4d = ctx.get('pre_injection_4d')
+    steady_state_time = ctx.get('steady_state_time')
+    excluded_indices = ctx.get('excluded_indices')
 
     # Extract signal using the configured kernel
     if kernel_type == 'sliding_window':
@@ -119,6 +138,8 @@ def _fit_pixel(pos):
         kb, kd, knt, _fitted, fit_results = fit_proxyl_kinetics(
             time_array, window_signal, time_units, verbose=False,
             pre_injection_signal=pre_injection_signal,
+            steady_state_time=steady_state_time,
+            excluded_indices=excluded_indices,
         )
     except Exception:
         return None
@@ -152,7 +173,9 @@ def create_parameter_maps(registered_4d: np.ndarray,
                          kernel_type: str = 'sliding_window',
                          injection_time_index: Optional[int] = None,
                          stride: int = 1,
-                         n_workers: Optional[int] = None) -> Dict[str, np.ndarray]:
+                         n_workers: Optional[int] = None,
+                         steady_state_time: Optional[float] = None,
+                         excluded_indices: Optional[list] = None) -> Dict[str, np.ndarray]:
     """
     Create spatial parameter maps using sliding window or convolution approach.
     
@@ -300,6 +323,8 @@ def create_parameter_maps(registered_4d: np.ndarray,
         registered_4d, time_array, kernel_type,
         (window_x, window_y, window_z), signal_threshold, time_units,
         pre_injection_4d=pre_injection_4d,
+        steady_state_time=steady_state_time,
+        excluded_indices=excluded_indices,
     )
 
     # Counter incremented inside _store on every non-None fit result.
@@ -341,13 +366,15 @@ def create_parameter_maps(registered_4d: np.ndarray,
         # ~16 chunks per worker keeps progress updates smooth without much
         # IPC overhead.
         chunksize = max(1, total_positions // (n_workers * 16))
-        # Note: pre_injection_4d is positional-7 in _init_pixel_worker's
-        # signature; we pass it here so each Pool subprocess gets the
-        # same volume slice as the main process for per-voxel A0 pinning.
+        # Note: pre_injection_4d (positional-7), steady_state_time
+        # (positional-8), and excluded_indices (positional-9) passed
+        # here so each Pool subprocess gets the same per-voxel
+        # A0-pinning data, knt-floor, and bolus-mask as the main
+        # process.
         init_args = (
             registered_4d, time_array, kernel_type,
             (window_x, window_y, window_z), signal_threshold, time_units,
-            pre_injection_4d,
+            pre_injection_4d, steady_state_time, excluded_indices,
         )
 
         with Pool(n_workers, initializer=_init_pixel_worker, initargs=init_args) as pool:
@@ -432,7 +459,9 @@ def create_parameter_maps(registered_4d: np.ndarray,
             'successful_fits': successful_fits,
             'kernel_type': kernel_type,
             'injection_time_index': injection_time_index,
-            'stride': stride
+            'stride': stride,
+            'steady_state_time': steady_state_time,
+            'excluded_indices': list(excluded_indices) if excluded_indices else [],
         }
     }
     
