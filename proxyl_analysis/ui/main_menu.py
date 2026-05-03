@@ -511,6 +511,30 @@ class MainMenuDialog(QDialog):
 
         btn_layout.addSpacing(15)
 
+        # Set/Change Injection Time button — reopens the injection
+        # time selector with the existing ROI signal so the user can
+        # adjust the injection index or toggle the Fix A2 fit option
+        # and re-run the kinetic fit on the same ROI for comparison.
+        # Disabled until an ROI has been drawn.
+        self.set_injection_btn = QPushButton("Set Injection Time")
+        self.set_injection_btn.setMinimumSize(160, 40)
+        self.set_injection_btn.setStyleSheet(
+            "QPushButton { background-color: #607D8B; color: white; font-weight: bold; "
+            "padding: 8px 20px; font-size: 13px; border-radius: 5px; border: none; }"
+            "QPushButton:hover { background-color: #455A64; }"
+            "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
+        )
+        self.set_injection_btn.clicked.connect(self._set_injection_time)
+        self.set_injection_btn.setEnabled(False)
+        self.set_injection_btn.setToolTip(
+            "Reopen the injection time dialog with the current ROI's "
+            "signal. Lets you change injection index or toggle Fix A2 "
+            "and re-run the kinetic fit on the same ROI."
+        )
+        btn_layout.addWidget(self.set_injection_btn)
+
+        btn_layout.addSpacing(15)
+
         # Run Kinetic Fit button - orange, requires ROI + injection time
         self.kinetic_fit_btn = QPushButton("Run Kinetic Fit")
         self.kinetic_fit_btn.setMinimumSize(140, 40)
@@ -686,12 +710,23 @@ class MainMenuDialog(QDialog):
         if not folder_path:
             return
 
-        # Check if valid registration data exists (2D DICOM slice format)
+        # Check if valid registration data exists. Accept the current
+        # T1-nested per-slice layout (`T1/z00/t000.dcm`), the
+        # transitional per-slice layout (`z00/t000.dcm`), and the
+        # legacy flat layout (`z00_t000.dcm`). The first two updates
+        # to the registration output folder broke this check, forcing
+        # users to redo registration on every load.
         p = Path(folder_path)
         dicom_dir = p / "registered" / "dicoms"
 
-        # Check for 2D slice format: z00_t000.dcm
-        if dicom_dir.exists() and (dicom_dir / "z00_t000.dcm").exists():
+        def _has_dicoms(d):
+            return d.exists() and (
+                (d / "T1" / "z00" / "t000.dcm").exists()
+                or (d / "z00" / "t000.dcm").exists()
+                or (d / "z00_t000.dcm").exists()
+            )
+
+        if _has_dicoms(dicom_dir):
             # Valid session found
             self.result = {
                 'action': 'load_previous',
@@ -706,22 +741,25 @@ class MainMenuDialog(QDialog):
         # Check if user selected the parent of a valid session
         for child in p.iterdir():
             if child.is_dir():
-                candidate = child / "registered" / "dicoms" / "z00_t000.dcm"
-                if candidate.exists():
+                if _has_dicoms(child / "registered" / "dicoms"):
                     hints.append(f"  • {child.name}/")
 
         # Check if the selected folder itself contains "registered" but wrong structure
         if (p / "registered").exists() and not dicom_dir.exists():
             hints.append("  • Found 'registered/' folder but no 'dicoms/' subfolder inside it.")
         elif dicom_dir.exists():
-            dcm_files = list(dicom_dir.glob("*.dcm"))
+            dcm_files = list(dicom_dir.rglob("*.dcm"))
             if dcm_files:
-                hints.append(f"  • Found {len(dcm_files)} DICOM files in registered/dicoms/ "
-                           "but missing z00_t000.dcm (may be incompatible format).")
+                hints.append(
+                    f"  • Found {len(dcm_files)} DICOM files in registered/dicoms/ "
+                    "but no T1/z00/t000.dcm, z00/t000.dcm, or z00_t000.dcm was present."
+                )
 
         msg = f"No valid session found in:\n{folder_path}\n\n"
-        msg += "A valid session folder should contain:\n"
-        msg += "  registered/dicoms/z00_t000.dcm\n\n"
+        msg += "A valid session folder should contain one of:\n"
+        msg += "  registered/dicoms/T1/z00/t000.dcm  (current layout)\n"
+        msg += "  registered/dicoms/z00/t000.dcm     (transitional)\n"
+        msg += "  registered/dicoms/z00_t000.dcm     (legacy)\n\n"
 
         if hints:
             msg += "Possible issues:\n" + "\n".join(hints) + "\n\n"
@@ -819,6 +857,27 @@ class MainMenuDialog(QDialog):
         }
         self.accept()
 
+    def _set_injection_time(self):
+        """Reopen the injection time dialog on the current ROI signal.
+
+        Emits a 'reopen_injection' action so run_analysis.py can launch
+        select_injection_time_qt with the existing roi_state. Lets the
+        user adjust injection index or the Fix A2 fit option and then
+        re-run the kinetic fit on the same ROI for comparison without
+        having to redraw it.
+        """
+        if self.roi_mask is None or self.roi_signal is None:
+            QMessageBox.warning(
+                self, "Missing ROI",
+                "Please draw an ROI first."
+            )
+            return
+
+        self.result = {
+            'action': 'reopen_injection',
+        }
+        self.accept()
+
     def set_roi_data(self, roi_mask: np.ndarray, roi_signal: np.ndarray,
                      injection_idx: int, injection_time: float):
         """Set ROI data after drawing (called by run_analysis.py)."""
@@ -839,6 +898,14 @@ class MainMenuDialog(QDialog):
             # Enable kinetic fit button
             self.kinetic_fit_btn.setEnabled(True)
             self.kinetic_fit_btn.setToolTip("")
+            # Enable Set Injection Time (revisit) — needs ROI signal,
+            # which is always set alongside roi_mask in this branch.
+            self.set_injection_btn.setEnabled(True)
+            self.set_injection_btn.setToolTip(
+                "Reopen the injection time dialog with the current "
+                "ROI's signal. Adjust injection index or toggle "
+                "Fix A2, then re-run the kinetic fit for comparison."
+            )
             # Enable image tools
             self.averaged_btn.setEnabled(True)
             self.averaged_btn.setToolTip("")
@@ -850,6 +917,9 @@ class MainMenuDialog(QDialog):
             num_pixels = int(np.sum(self.roi_mask))
             self.roi_status_label.setText(f"ROI: {num_pixels} pixels | Injection: Not set")
             self.roi_status_label.setStyleSheet("color: #FF9800;")
+            # ROI exists but no injection yet — let the user set it
+            # without redrawing.
+            self.set_injection_btn.setEnabled(True)
         else:
             self.roi_status_label.setText("ROI: Not drawn")
             self.roi_status_label.setStyleSheet("color: #666; font-style: italic;")

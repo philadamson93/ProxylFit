@@ -72,6 +72,40 @@ def create_time_array(num_timepoints: int, time_units: str = 'minutes',
     return time_array
 
 
+def _has_registered_dicoms(session_root):
+    """Return True if registration DICOMs are present at session_root.
+
+    Walks every layout the project has used so a previously-registered
+    dataset is always found, regardless of which point in the codebase's
+    history wrote the directory:
+
+    * ``registered/dicoms/T1/z00/t000.dcm`` — current layout. T1/T2
+      anatomical maps got their own subfolders, then per-slice subdirs
+      hold each slice's time series.
+    * ``registered/dicoms/z00/t000.dcm`` — transitional layout from
+      the per-slice reorg before the T1/T2 split.
+    * ``registered/dicoms/z00_t000.dcm`` — legacy flat layout (pre-
+      registration speedup work).
+
+    Without this dual/triple-format probe, every previous-registration
+    check fell back to "no data" and the user was forced to redo
+    registration each session.
+    """
+    dicoms = Path(session_root) / "registered" / "dicoms"
+    if not dicoms.exists():
+        return False
+    # Current layout: registered/dicoms/T1/z00/t000.dcm
+    if (dicoms / "T1" / "z00" / "t000.dcm").exists():
+        return True
+    # Transitional: registered/dicoms/z00/t000.dcm
+    if (dicoms / "z00" / "t000.dcm").exists():
+        return True
+    # Legacy flat: registered/dicoms/z00_t000.dcm
+    if (dicoms / "z00_t000.dcm").exists():
+        return True
+    return False
+
+
 def _detect_registered_session(dicom_path):
     """Check if a DICOM file path is inside a registered output directory.
 
@@ -81,7 +115,7 @@ def _detect_registered_session(dicom_path):
     for parent in p.parents:
         if parent.name == 'dicoms' and parent.parent.name == 'registered':
             session_root = parent.parent.parent
-            if (session_root / "registered" / "dicoms" / "z00_t000.dcm").exists():
+            if _has_registered_dicoms(session_root):
                 return str(session_root)
     return None
 
@@ -373,18 +407,22 @@ def main():
     # Override when loading registered data from scan
     if args.load_registration:
         reg_path = Path(args.load_registration)
-        if (reg_path / "registered" / "dicoms" / "z00_t000.dcm").exists():
+        if _has_registered_dicoms(reg_path):
             auto_registration_dir = reg_path
 
     # Check if we should automatically load registration data
     auto_load = False
 
     def _find_registration_data(dir_path):
-        """Check if registration data exists in directory (2D DICOM slice format)."""
+        """Check if registration data exists in directory.
+
+        Accepts both the current per-slice layout (``z00/t000.dcm``) and
+        the legacy flat layout (``z00_t000.dcm``) — the registration
+        speedup work moved to the per-slice format and the old probe
+        was missing the new files entirely.
+        """
         p = Path(dir_path)
-        dicom_dir = p / "registered" / "dicoms"
-        # Check for 2D slice format: z00_t000.dcm (3 digits for time index)
-        if dicom_dir.exists() and (dicom_dir / "z00_t000.dcm").exists():
+        if _has_registered_dicoms(p):
             return p / "registered" / "registration_metrics.json"
         return None
 
@@ -868,14 +906,18 @@ def main():
 
                     # Select injection time. Pass ROI context so the
                     # Export CSV button in the dialog can drop a
-                    # companion ROI overlay PNG.
+                    # companion ROI overlay PNG. Also collects the
+                    # NTE steady-state-time fit option and any user-
+                    # right-clicked excluded-point indices so the
+                    # kinetic_fit menu action can honour them.
                     print("Select injection time point...")
-                    injection_idx = select_injection_time_qt(
+                    injection_idx, steady_state_time, excluded_full = select_injection_time_qt(
                         time_array, roi_signal, args.time_units,
                         str(auto_registration_dir),
                         roi_mask=roi_mask,
                         reference_image=registered_4d[:, :, :, 0],
                         roi_z_slice=args.z,
+                        return_steady_state=True,
                     )
                     injection_time = time_array[injection_idx]
                     print(f"  Injection time: {injection_time:.1f} {args.time_units} (index {injection_idx})")
@@ -884,15 +926,62 @@ def main():
                     # menu actions (kinetic fit, parameter mapping injection
                     # time, exports) can recompute single-slice signals
                     # against the same slice the ROI was drawn on.
+                    # steady_state_time and excluded_indices ride along
+                    # so the kinetic_fit action and any later parameter
+                    # mapping kicked off from this menu can pre-fill
+                    # the matching controls. excluded_indices are kept
+                    # in FULL-array (pre+post) space — what the user
+                    # sees on the injection plot — and translated to
+                    # post-injection space at each fit call site.
                     roi_state = {
                         'roi_mask': roi_mask,
                         'roi_signal': roi_signal,
                         'injection_idx': injection_idx,
                         'injection_time': injection_time,
                         'z_slice': args.z,
+                        'steady_state_time': steady_state_time,
+                        'excluded_indices': list(excluded_full or []),
                     }
                     print("ROI and injection time set. Returning to menu.")
                     continue  # Return to menu with ROI state
+
+                elif action == 'reopen_injection':
+                    # Reopen the injection time dialog with the existing
+                    # ROI signal so the user can change the injection
+                    # index and/or toggle Fix A2 without redrawing the
+                    # ROI. Updates roi_state in place; the same ROI is
+                    # used for the next kinetic fit, so the user can
+                    # compare fits with different settings on identical
+                    # input.
+                    if roi_state is None or roi_state.get('roi_signal') is None:
+                        print("No ROI / signal available. Draw an ROI first.")
+                        continue
+
+                    print("Reopening injection time selector...")
+                    roi_z_existing = roi_state.get('z_slice')
+                    new_idx, new_steady_state, new_excluded = select_injection_time_qt(
+                        time_array, roi_state['roi_signal'], args.time_units,
+                        str(auto_registration_dir),
+                        roi_mask=roi_state.get('roi_mask'),
+                        reference_image=registered_4d[:, :, :, 0],
+                        roi_z_slice=roi_z_existing,
+                        steady_state_default=float(
+                            roi_state.get('steady_state_time', 100.0)
+                        ),
+                        excluded_default=set(roi_state.get('excluded_indices') or []),
+                        return_steady_state=True,
+                    )
+                    roi_state['injection_idx'] = new_idx
+                    roi_state['injection_time'] = time_array[new_idx]
+                    roi_state['steady_state_time'] = new_steady_state
+                    roi_state['excluded_indices'] = list(new_excluded or [])
+                    print(f"  Injection time: {roi_state['injection_time']:.1f} "
+                          f"{args.time_units} (index {new_idx})")
+                    print(f"  NTE steady-state time: {new_steady_state:.0f} {args.time_units}")
+                    if new_excluded:
+                        print(f"  Excluded indices: {new_excluded}")
+                    print("Returning to menu — re-run kinetic fit to see updated results.")
+                    continue
 
                 elif action == 'kinetic_fit':
                     # Run kinetic fitting on existing ROI data
@@ -922,10 +1011,36 @@ def main():
                         # comes from the actual baseline (mean of pre-
                         # injection points) instead of the first few
                         # post-injection samples — those are already on
-                        # the buildup curve and overestimate A0.
+                        # the buildup curve and overestimate A0. The
+                        # NTE steady-state time mirrors the user's
+                        # choice from the injection time dialog (or
+                        # any later parameter map run) — bounds knt
+                        # from below so it doesn't drift to ~0.
+                        ss_time_for_fit = roi_state.get('steady_state_time')
+                        if ss_time_for_fit:
+                            print(
+                                f"  Fit option: NTE steady-state time = "
+                                f"{ss_time_for_fit:.0f} {args.time_units}"
+                            )
+                        # Translate FULL-array exclusion indices to
+                        # post-injection-array space (where the fit
+                        # operates after the [injection_idx:] slice).
+                        full_excluded = roi_state.get('excluded_indices') or []
+                        excluded_post = [
+                            int(i) - int(injection_idx)
+                            for i in full_excluded
+                            if int(i) >= int(injection_idx)
+                        ]
+                        if excluded_post:
+                            print(
+                                f"  Fit option: excluding {len(excluded_post)} point(s) "
+                                f"(post-injection indices {excluded_post})"
+                            )
                         kb, kd, knt, fitted_signal, fit_results = fit_proxyl_kinetics(
                             time_array_fit, signal_fit, args.time_units,
                             pre_injection_signal=roi_signal[:injection_idx],
+                            steady_state_time=ss_time_for_fit,
+                            excluded_indices=excluded_post,
                         )
 
                         # Print results
@@ -1056,8 +1171,21 @@ def main():
                         current_z=roi_state.get('z_slice', 4) if roi_state else 4,
                         existing_roi=roi_state.get('roi_mask') if roi_state else None,
                         existing_injection_idx=roi_state.get('injection_idx') if roi_state else None,
-                        default_window_size=menu_result.get('window_size', (15, 15, 1))
+                        default_window_size=menu_result.get('window_size', (15, 15, 1)),
+                        default_steady_state_time=float(
+                            roi_state.get('steady_state_time', 100.0)
+                            if roi_state else 100.0
+                        ),
+                        time_units=args.time_units,
                     )
+                    # Carry the user's right-clicked exclusions
+                    # forward into options so the worker thread can
+                    # forward them to create_parameter_maps. Stored
+                    # in FULL-array space (the worker translates).
+                    if options is not None and roi_state is not None:
+                        options['excluded_indices'] = list(
+                            roi_state.get('excluded_indices') or []
+                        )
 
                     if options is None:
                         print("Parameter mapping cancelled.")
@@ -1116,14 +1244,32 @@ def main():
                             rep_signal = registered_4d[cx-5:cx+5, cy-5:cy+5, cz, :].mean(axis=(0, 1))
 
                         print("Select injection time...")
-                        injection_idx = select_injection_time_qt(
+                        # Pre-fill the dialog's NTE steady-state-time
+                        # spinbox AND the excluded-points list from
+                        # whatever was set on the parameter-map options
+                        # page (which itself came from roi_state). If
+                        # the user changes either here, propagate the
+                        # new values back into options so the worker
+                        # uses the on-screen state.
+                        injection_idx, steady_state_time, excluded_full = select_injection_time_qt(
                             time_array, rep_signal, args.time_units,
                             str(auto_registration_dir),
                             roi_mask=param_roi_mask,
                             reference_image=registered_4d[:, :, :, 0],
                             roi_z_slice=param_roi_z,
+                            steady_state_default=float(options.get('steady_state_time', 100.0)),
+                            excluded_default=set(options.get('excluded_indices') or []),
+                            return_steady_state=True,
                         )
+                        options['steady_state_time'] = steady_state_time
+                        options['excluded_indices'] = list(excluded_full or [])
                         print(f"Selected injection time index: {injection_idx}")
+                        print(
+                            f"  Fit option: NTE steady-state time = "
+                            f"{steady_state_time:.0f} {args.time_units}"
+                        )
+                        if excluded_full:
+                            print(f"  Excluded indices: {excluded_full}")
 
                     # Run parameter mapping with progress dialog
                     print("Creating parameter maps...")
@@ -1494,12 +1640,15 @@ def main():
             print("  Please click on the time point when contrast was injected.")
             print("  Using Qt-based UI with proper layout management.")
             # Pass ROI context so the dialog's Export CSV button can
-            # drop a companion ROI overlay PNG.
-            injection_index = select_injection_time_qt(
+            # drop a companion ROI overlay PNG. Capture the NTE
+            # steady-state time and excluded-point list so the
+            # kinetic fit below can honour them.
+            injection_index, steady_state_time, excluded_full = select_injection_time_qt(
                 time_array, signal_timeseries, args.time_units, str(output_dir),
                 roi_mask=roi_mask,
                 reference_image=registered_4d[:, :, :, 0],
                 roi_z_slice=args.z,
+                return_steady_state=True,
             )
             
             # Trim data to start from injection time
@@ -1520,9 +1669,29 @@ def main():
                 # Pass pre-injection signal for a true-baseline A0
                 # initial estimate — see model.py's
                 # estimate_initial_parameters_extended docstring.
+                # steady_state_time mirrors the user's spinbox choice
+                # from the injection time dialog (knt lower bound).
+                # excluded_indices: translate FULL-array indices →
+                # post-injection space.
+                print(
+                    f"  Fit option: NTE steady-state time = "
+                    f"{steady_state_time:.0f} {args.time_units}"
+                )
+                excluded_post = [
+                    int(i) - int(injection_index)
+                    for i in (excluded_full or [])
+                    if int(i) >= int(injection_index)
+                ]
+                if excluded_post:
+                    print(
+                        f"  Fit option: excluding {len(excluded_post)} point(s) "
+                        f"(post-injection indices {excluded_post})"
+                    )
                 kb, kd, knt, fitted_signal, fit_results = fit_proxyl_kinetics(
                     time_array_fit, signal_timeseries_fit, args.time_units,
                     pre_injection_signal=signal_timeseries[:injection_index],
+                    steady_state_time=steady_state_time,
+                    excluded_indices=excluded_post,
                 )
                 
                 # Print results
