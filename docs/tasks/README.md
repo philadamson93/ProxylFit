@@ -40,8 +40,12 @@ This folder tracks planned features, enhancements, and bug fixes.
 | T021 | [Session Loading UX](T021-session-loading-ux.md) | completed | medium |
 | T022 | [Deferred User Feedback](T022-deferred-user-feedback.md) | deferred | medium |
 | T023 | [Scanner Registered Output](T023-scanner-registered-output.md) | completed | high |
+| T024 | [STEAM VOIs as ROI Source](T024-steam-voi-roi.md) | planned | high |
 
 ## Quick Overview
+
+### Planned (next up)
+- **T024**: STEAM VOIs as ROI source — auto-load tumor + contralateral voxels from the Bruker raw tree, expose as a one-click ROI option on the kinetics and parameter-map pages
 
 ### Backlog (not yet started)
 - **T004**: Running average (2-3 point) for noise reduction

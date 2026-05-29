@@ -31,6 +31,9 @@ class FitResultsDialog(QDialog):
                  dataset_dir: Optional[str] = None,
                  pre_injection_time: Optional[np.ndarray] = None,
                  pre_injection_signal: Optional[np.ndarray] = None,
+                 param_maps: Optional[Dict] = None,
+                 forced_n: Optional[int] = None,
+                 param_map_figure: Optional[object] = None,
                  parent=None):
         super().__init__(parent)
         self.time = time
@@ -60,6 +63,19 @@ class FitResultsDialog(QDialog):
         # default their auto-incremented filenames. When None, the
         # dialogs fall back to a reasonable cwd-relative default.
         self.dataset_dir = dataset_dir
+        # Parameter maps + forced N flow in only when this dialog was
+        # launched from the parameter-map measurement-ROI button. They
+        # let _save_all enrich the composite-summary row with per-voxel
+        # _pm mean/std for each map masked to the ROI, and reuse the
+        # same N as the matching parameter_map_metric_<N>.csv export
+        # so the two outputs share an ROI counter.
+        self.param_maps = param_maps
+        self.forced_n = forced_n
+        # Matplotlib Figure of the parameter-map dialog (when launched
+        # from the measurement-ROI button). Snapshotted in _save_all
+        # to produce parameter_map_metric_roi_<N>.png so the PM-side
+        # ROI overlay shares the bundle's N.
+        self.param_map_figure = param_map_figure
 
         self.setWindowTitle("ProxylFit - Kinetic Model Fitting Results")
         self.setMinimumSize(1000, 750)
@@ -110,7 +126,7 @@ class FitResultsDialog(QDialog):
             ("A1 (amplitude)", f"{self.fit_results['A1']:.3f} ± {self.fit_results['A1_error']:.3f}"),
             ("A2 (non-tracer)", f"{self.fit_results['A2']:.3f} ± {self.fit_results['A2_error']:.3f}{a2_init}"),
             ("t0 (onset)", f"{self.fit_results['t0']:.2f} ± {self.fit_results['t0_error']:.2f}"),
-            ("tmax (NTE onset)", f"{self.fit_results['tmax']:.2f}  [fixed = argmax(signal)]"),
+            ("tmax (NTE onset)", f"{self.fit_results['tmax']:.2f} ± {self.fit_results['tmax_error']:.2f}"),
         ]
 
         for i, (name, value) in enumerate(params):
@@ -298,13 +314,24 @@ class FitResultsDialog(QDialog):
             kinetic_dir = Path.cwd() / "kinetic_fits"
         kinetic_dir.mkdir(parents=True, exist_ok=True)
 
-        default_results_csv = next_indexed_path(
-            kinetic_dir, "kinetic_fit_results", ".csv"
-        )
-        # Extract N from the auto-suggested name.
+        # When the dialog was launched from the measurement-ROI button
+        # the caller pre-allocated an N to share with the matching
+        # parameter_map_metric_<N>.csv export. Use it to drive the
+        # default filename so the auto-suggested CSV name lands on
+        # that exact N.
         import re
-        m = re.match(r'kinetic_fit_results_(\d+)\.csv$', default_results_csv.name)
-        n_default = int(m.group(1)) if m else 1
+        if self.forced_n is not None:
+            default_results_csv = (
+                kinetic_dir / f"kinetic_fit_results_{int(self.forced_n)}.csv"
+            )
+            n_default = int(self.forced_n)
+        else:
+            default_results_csv = next_indexed_path(
+                kinetic_dir, "kinetic_fit_results", ".csv"
+            )
+            m = re.match(r'kinetic_fit_results_(\d+)\.csv$',
+                         default_results_csv.name)
+            n_default = int(m.group(1)) if m else 1
 
         # Let the user confirm/redirect by selecting the results CSV
         # path. Whatever directory and filename they choose drives the
@@ -368,16 +395,22 @@ class FitResultsDialog(QDialog):
             ('kd', 'decay rate', r['kd'], r['kd_error'], f'1/{time_units}'),
             ('knt', 'non-tracer rate', r['knt'], r['knt_error'], f'1/{time_units}'),
             ('t0', 'tracer onset', r['t0'], r['t0_error'], time_units),
-            ('tmax', 'NTE onset (fixed = argmax(signal))', r['tmax'], '', time_units),
+            ('tmax', 'NTE onset', r['tmax'], r['tmax_error'], time_units),
             ('%Enhancement', 'A1/A0 * 100', self.pct_enhancement, '', '%'),
             ('%NTE', 'A2/A0 * 100', self.pct_nte, '', '%'),
             ('%NTE_est', 'A2_est/A0_est * 100', pct_nte_est_cell, '', '%'),
             ('R_squared', 'goodness of fit', r['r_squared'], '', ''),
             ('RMSE', 'root mean square error', r['rmse'], '', ''),
         ]
+        # Unified column header: 'std' instead of 'error' so this CSV
+        # shares its schema with the parameter_map_metric_<N>.csv
+        # written from the same ROI. Both render to PNG with the
+        # same column layout so a Combined Metrics PNG can stack
+        # them seamlessly.
+        unified_header = ['parameter', 'description', 'value', 'std', 'units']
         with open(results_csv, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['parameter', 'description', 'value', 'error', 'units'])
+            writer.writerow(unified_header)
             for row in rows:
                 writer.writerow(row)
 
@@ -406,12 +439,20 @@ class FitResultsDialog(QDialog):
                 _fmt_value(perr, fmt) if perr != '' else '',
                 punits,
             ])
+        # Cap the description column at ~22 chars so the one or two
+        # really long rows ("non-tracer amplitude (initial estimate)")
+        # don't force the column wide enough to leave every other row
+        # swimming in blank space. The longer rows simply extend a
+        # touch past the cell — still readable, and the rest of the
+        # table reads tighter.
+        unified_col_caps = [None, 22, None, None, None]
         try:
             save_table_as_png(
                 png_rows,
-                ['parameter', 'description', 'value', 'error', 'units'],
+                unified_header,
                 str(results_png),
                 title=f"Kinetic fit results (N={n})",
+                max_col_chars=unified_col_caps,
             )
             results_png_msg = f"\n  {results_png.name}"
         except Exception as e:
@@ -457,6 +498,212 @@ class FitResultsDialog(QDialog):
         else:
             roi_msg = "\n  (no ROI context — overlay PNG skipped)"
 
+        # ---- 5. Composite per-ROI summary CSV ----
+        # One row per saved ROI fit, accumulated across all bundles
+        # written to this dataset's kinetic_fits/ folder. Rows keyed
+        # by roi_N so re-saving an existing N updates that row in
+        # place; new N appends. Lets the operator review every fit
+        # this session has produced as a single tabular summary.
+        composite_msg = ""
+        try:
+            composite_path = target_dir / "composite_summary.csv"
+            n_pixels = (int(np.sum(self.roi_mask))
+                        if self.roi_mask is not None else '')
+
+            def _pct_std(amp, amp_std, base, base_std):
+                """σ(amp/base · 100) via error propagation. When base is
+                pinned (base_std == 0, e.g. A0 from pre-injection mean)
+                this reduces to (amp_std / base) · 100 — the dominant
+                term. Returns '' when base is zero."""
+                try:
+                    base_f = float(base)
+                    if base_f == 0:
+                        return ''
+                    amp_f = float(amp)
+                    amp_std_f = float(amp_std) if amp_std not in ('', None) else 0.0
+                    base_std_f = float(base_std) if base_std not in ('', None) else 0.0
+                    if base_std_f == 0:
+                        return abs(amp_std_f) / abs(base_f) * 100.0
+                    if amp_f == 0:
+                        return abs(base_std_f / base_f) * 100.0
+                    rel = ((amp_std_f / amp_f) ** 2
+                           + (base_std_f / base_f) ** 2) ** 0.5
+                    return abs(amp_f / base_f) * rel * 100.0
+                except (TypeError, ValueError, ZeroDivisionError):
+                    return ''
+
+            pct_enh_std = _pct_std(
+                r['A1'], r['A1_error'], r['A0'], r['A0_error']
+            )
+            pct_nte_std = _pct_std(
+                r['A2'], r['A2_error'], r['A0'], r['A0_error']
+            )
+
+            new_row = {
+                'roi_N': n,
+                'z_slice': (self.roi_z_slice if self.roi_z_slice is not None else ''),
+                'n_pixels': n_pixels,
+                'A0': r['A0'],
+                'A1': r['A1'],
+                'A1_std': r['A1_error'],
+                'A2': r['A2'],
+                'A2_std': r['A2_error'],
+                'kb': r['kb'],
+                'kb_std': r['kb_error'],
+                'kd': r['kd'],
+                'kd_std': r['kd_error'],
+                'knt': r['knt'],
+                'knt_std': r['knt_error'],
+                't0': r['t0'],
+                't0_std': r['t0_error'],
+                'tmax': r['tmax'],
+                'tmax_std': r['tmax_error'],
+                'pct_enhancement': self.pct_enhancement,
+                'pct_enh_std': pct_enh_std,
+                'pct_nte': self.pct_nte,
+                'pct_nte_std': pct_nte_std,
+                'pct_nte_est': (self.pct_nte_est
+                                if not np.isnan(self.pct_nte_est) else ''),
+                'R_squared': r['r_squared'],
+            }
+
+            # Per-voxel parameter-map statistics, computed by masking
+            # each map with the measurement ROI at the relevant z-slice.
+            # Suffix '_pm' distinguishes these from the ROI-mean curve
+            # fit values above (e.g. kb_pm vs kb). Only populated when
+            # this dialog was launched from the parameter-map measurement
+            # ROI button — regular main-menu kinetic fits leave the
+            # columns blank.
+            pm_columns = [
+                ('A0_pm', 'A0_pm_std', 'baseline_map'),
+                ('A1_pm', 'A1_pm_std', 'a1_amplitude_map'),
+                ('A2_pm', 'A2_pm_std', 'a2_amplitude_map'),
+                ('kb_pm', 'kb_pm_std', 'kb_map'),
+                ('kd_pm', 'kd_pm_std', 'kd_map'),
+                ('knt_pm', 'knt_pm_std', 'knt_map'),
+                ('t0_pm', 't0_pm_std', 't0_map'),
+                ('tmax_pm', 'tmax_pm_std', 'tmax_map'),
+                ('pct_enhancement_pm', 'pct_enh_pm_std', 'a1_percent_map'),
+                ('pct_nte_pm', 'pct_nte_pm_std', 'a2_percent_map'),
+                ('pct_nte_est_pm', 'pct_nte_est_pm_std', 'a2_percent_est_map'),
+                ('R_squared_pm', None, 'r_squared_map'),
+            ]
+
+            def _pm_stats(map_key):
+                """Return (mean, std) of a parameter map's voxels inside
+                the ROI at roi_z_slice. Only counts voxels the param-map
+                fit successfully converged on (mask=True). Returns
+                ('', '') when context is missing or no voxel converges.
+                """
+                if not self.param_maps or self.roi_mask is None:
+                    return '', ''
+                map3d = self.param_maps.get(map_key)
+                fit_mask = self.param_maps.get('mask')
+                if map3d is None:
+                    return '', ''
+                z = self.roi_z_slice
+                if z is None or z >= map3d.shape[2]:
+                    return '', ''
+                slice_data = map3d[:, :, z]
+                slice_mask = (fit_mask[:, :, z]
+                              if fit_mask is not None
+                              else np.ones_like(slice_data, dtype=bool))
+                if self.roi_mask.ndim == 2:
+                    roi_slice = self.roi_mask
+                elif z < self.roi_mask.shape[2]:
+                    roi_slice = self.roi_mask[:, :, z]
+                else:
+                    return '', ''
+                combined = slice_mask & roi_slice
+                if not np.any(combined):
+                    return '', ''
+                values = slice_data[combined]
+                values = values[np.isfinite(values)]
+                if values.size == 0:
+                    return '', ''
+                return float(np.mean(values)), float(np.std(values))
+
+            for mean_col, std_col, map_key in pm_columns:
+                mean_val, std_val = _pm_stats(map_key)
+                new_row[mean_col] = mean_val
+                if std_col is not None:
+                    new_row[std_col] = std_val
+
+            header = list(new_row.keys())
+
+            # Read any existing rows so we can update-by-roi_N rather
+            # than blindly appending duplicates.
+            existing_rows = {}
+            if composite_path.exists():
+                try:
+                    with open(composite_path, 'r', newline='') as f:
+                        reader = csv.DictReader(f)
+                        for prev in reader:
+                            try:
+                                key = int(prev.get('roi_N', ''))
+                            except (TypeError, ValueError):
+                                continue
+                            existing_rows[key] = prev
+                except Exception:
+                    # If the composite is malformed, drop it and start
+                    # fresh — better than erroring out a save.
+                    existing_rows = {}
+
+            existing_rows[int(n)] = {k: new_row[k] for k in header}
+
+            # Format floats consistently when writing back out so the
+            # CSV stays human-readable. Unknown types pass through.
+            def _fmt(v):
+                if v == '' or v is None:
+                    return ''
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    return v
+                if fv == int(fv) and abs(fv) < 1e9 and 'std' not in 'forced':
+                    pass  # let numerical formatting decide below
+                # Use a generous fixed format; the consumer can re-format.
+                return f"{fv:.6g}"
+
+            with open(composite_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                for key in sorted(existing_rows.keys()):
+                    row = existing_rows[key]
+                    writer.writerow([_fmt(row.get(col, '')) for col in header])
+
+            composite_msg = (
+                f"\n  composite_summary.csv "
+                f"({len(existing_rows)} ROI{'s' if len(existing_rows) != 1 else ''})"
+            )
+        except Exception as e:
+            composite_msg = f"\n  (composite summary update failed: {e})"
+
+        # ---- 6. Parameter-map-metric companion bundle ----
+        # Only when this dialog was launched from the parameter-map
+        # measurement-ROI button (param_maps + param_map_figure are
+        # set). Writes the PM-side artefacts into
+        # <dataset>/parameter_maps/parameter_map_metrics/ with the same
+        # shared ROI counter N as the kinetic bundle:
+        #
+        #   parameter_map_metric_<N>.csv          unified-format table
+        #   parameter_map_metric_<N>.png          rendered table image
+        #   parameter_map_metric_roi_<N>.png      param-map figure snapshot
+        #   summary_strip_<N>.png                 2-row layout: top = 3
+        #                                         images; bottom = 2 tables
+        pm_msg = ""
+        if (self.param_maps is not None
+                and self.dataset_dir is not None):
+            try:
+                pm_msg = self._save_pm_metric_bundle(
+                    n=n,
+                    kinetic_results_png=results_png,
+                    kinetic_plot_png=plot_png,
+                    kinetic_roi_png=roi_png,
+                )
+            except Exception as e:
+                pm_msg = f"\n  (PM metric bundle failed: {e})"
+
         QMessageBox.information(
             self, "Save Complete",
             f"Saved per-ROI bundle (N={n}) to:\n{target_dir}\n"
@@ -464,8 +711,250 @@ class FitResultsDialog(QDialog):
             f"{results_png_msg}\n"
             f"  {timecourse_csv.name}\n"
             f"  {plot_png.name}"
-            f"{roi_msg}",
+            f"{roi_msg}"
+            f"{composite_msg}"
+            f"{pm_msg}",
         )
+
+    def _save_pm_metric_bundle(self, n, kinetic_results_png,
+                               kinetic_plot_png, kinetic_roi_png):
+        """Write the parameter-map-metric companion artefacts.
+
+        Driven from _save_all when this dialog was launched from the
+        parameter-map measurement-ROI button. Produces, in
+        ``<dataset>/parameter_maps/parameter_map_metrics/`` with the
+        same N as the kinetic bundle:
+
+        - ``parameter_map_metric_<N>.csv``      unified columns
+        - ``parameter_map_metric_<N>.png``      rendered table
+        - ``parameter_map_metric_roi_<N>.png``  PM dialog figure snapshot
+        - ``summary_strip_<N>.png``             2-row composite:
+              top = 3 images (kinetic_fit_roi, parameter_map_metric_roi,
+              kinetic_fit); bottom = 2 tables (kinetic_fit_results,
+              parameter_map_metric).
+        """
+        from pathlib import Path
+        from ..roi_selection import save_table_as_png
+        import matplotlib.pyplot as plt
+        import matplotlib.image as mpimg
+
+        metrics_dir = (Path(self.dataset_dir)
+                       / "parameter_maps" / "parameter_map_metrics")
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+
+        pm_csv  = metrics_dir / f"parameter_map_metric_{n}.csv"
+        pm_png  = metrics_dir / f"parameter_map_metric_{n}.png"
+        pm_roi_png  = metrics_dir / f"parameter_map_metric_roi_{n}.png"
+        strip_png    = metrics_dir / f"summary_strip_{n}.png"
+
+        # Build PM-metric rows. Single source of truth — these specs
+        # mirror ParameterMapResultsDialog._build_pm_metric_specs so
+        # the two paths render identical content.
+        time_units = (self.param_maps.get('metadata', {}) or {}).get(
+            'time_units', 'minutes',
+        )
+        specs = [
+            ('baseline_map',        'A0_pm',
+             'baseline signal (mean)', ''),
+            ('a1_amplitude_map',    'A1_pm',
+             'tracer amplitude (mean)', ''),
+            ('a2_amplitude_map',    'A2_pm',
+             'non-tracer amplitude (mean)', ''),
+            ('kb_map',              'kb_pm',
+             'buildup rate (mean)', f'1/{time_units}'),
+            ('kd_map',              'kd_pm',
+             'decay rate (mean)', f'1/{time_units}'),
+            ('knt_map',             'knt_pm',
+             'non-tracer rate (mean)', f'1/{time_units}'),
+            ('t0_map',              't0_pm',
+             'tracer onset (mean)', time_units),
+            ('tmax_map',            'tmax_pm',
+             'NTE onset (mean)', time_units),
+            ('a1_percent_map',      'pct_enhancement_pm',
+             '%Enhancement (mean)', '%'),
+            ('a2_percent_map',      'pct_nte_pm',
+             '%NTE (mean)', '%'),
+            ('a2_percent_est_map',  'pct_nte_est_pm',
+             '%NTE_est (mean)', '%'),
+            ('r_squared_map',       'R_squared_pm',
+             'goodness of fit (mean)', ''),
+        ]
+
+        z = self.roi_z_slice
+        if z is None:
+            z = 0
+        fit_mask = self.param_maps.get('mask')
+        if self.roi_mask is None:
+            return "\n  (PM metric bundle skipped: no ROI mask)"
+
+        if self.roi_mask.ndim == 2:
+            roi_slice = self.roi_mask
+        elif z < self.roi_mask.shape[2]:
+            roi_slice = self.roi_mask[:, :, z]
+        else:
+            return "\n  (PM metric bundle skipped: ROI z out of range)"
+        if fit_mask is not None and fit_mask.ndim == 3 and z < fit_mask.shape[2]:
+            slice_mask = roi_slice & fit_mask[:, :, z]
+        else:
+            slice_mask = roi_slice
+        n_pixels = int(np.sum(slice_mask))
+
+        unified_rows = []
+        for key, name_pm, desc, units in specs:
+            map3d = self.param_maps.get(key)
+            if map3d is None or map3d.ndim != 3 or z >= map3d.shape[2]:
+                continue
+            values = map3d[:, :, z][slice_mask]
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                continue
+            unified_rows.append((
+                name_pm, desc,
+                float(np.nanmean(values)),
+                float(np.nanstd(values)),
+                units,
+            ))
+
+        # 6a) PM CSV (unified header)
+        unified_header = ['parameter', 'description', 'value', 'std', 'units']
+        with open(pm_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(unified_header)
+            for row in unified_rows:
+                writer.writerow(row)
+
+        # Format helper for the table renderer.
+        def _fmt(v, fmt='.4f'):
+            if v == '' or v is None:
+                return ''
+            try:
+                return format(float(v), fmt)
+            except (TypeError, ValueError):
+                return str(v)
+
+        pm_png_rows = [[
+            r[0], r[1], _fmt(r[2]), _fmt(r[3]), r[4],
+        ] for r in unified_rows]
+
+        title_suffix = f"ROI #{n}"
+        title_suffix += f", z={z}, n={n_pixels} pixels"
+
+        # 6b) PM table PNG. Cap description column the same way the
+        # kinetic-fit table does so the two render with comparable
+        # proportions when laid out side-by-side in the strip.
+        save_table_as_png(
+            pm_png_rows, unified_header, str(pm_png),
+            title=f"Parameter map metrics ({title_suffix})",
+            max_col_chars=[None, 22, None, None, None],
+        )
+
+        # 6c) PM figure snapshot (param-map dialog)
+        if self.param_map_figure is not None:
+            try:
+                self.param_map_figure.savefig(
+                    str(pm_roi_png), dpi=150, bbox_inches='tight',
+                    facecolor='white', edgecolor='none',
+                )
+            except Exception:
+                pm_roi_png = None
+        else:
+            pm_roi_png = None
+
+        # 6d) Summary strip — 2-row layout for slide readability:
+        #
+        #   Top row   :  kinetic_fit_roi  |  parameter_map_metric_roi  |  kinetic_fit
+        #                (3 panels, each spanning 2 of 6 grid columns)
+        #   Bottom row:        kinetic_fit_results table  |  parameter_map_metric table
+        #                (2 panels, each spanning 3 of 6 grid columns)
+        #
+        # Combined-metrics PNG is gone — the two tables on the bottom
+        # row deliver the same content with the per-table widths the
+        # user actually wants.
+        from matplotlib.gridspec import GridSpec
+
+        top_panels = [
+            ('Kinetic fit ROI', kinetic_roi_png),
+            ('Parameter map ROI', pm_roi_png),
+            ('Kinetic fit', kinetic_plot_png),
+        ]
+        bottom_panels = [
+            ('Kinetic fit results', kinetic_results_png),
+            ('Parameter map metrics', pm_png),
+        ]
+
+        # Filter out missing sources (best-effort — a missing PM ROI
+        # snapshot, for instance, just leaves an empty placeholder
+        # rather than blowing up the whole strip).
+        def _present(p):
+            return p is not None and Path(p).exists()
+
+        any_present = (
+            any(_present(p) for _, p in top_panels)
+            or any(_present(p) for _, p in bottom_panels)
+        )
+
+        if any_present:
+            fig = plt.figure(figsize=(18.0, 11.0), dpi=120)
+            gs = GridSpec(
+                nrows=2, ncols=6, figure=fig,
+                hspace=0.18, wspace=0.08,
+                left=0.02, right=0.98, top=0.93, bottom=0.03,
+                height_ratios=[1.0, 1.1],
+            )
+
+            # Top row: 3 image panels, 2 grid cols each.
+            for i, (label, src) in enumerate(top_panels):
+                ax = fig.add_subplot(gs[0, i*2:(i+1)*2])
+                if _present(src):
+                    try:
+                        img = mpimg.imread(str(src))
+                        ax.imshow(img)
+                    except Exception:
+                        ax.text(0.5, 0.5, '(load failed)',
+                                transform=ax.transAxes, ha='center')
+                else:
+                    ax.text(0.5, 0.5, '(not generated)',
+                            transform=ax.transAxes, ha='center',
+                            color='#888')
+                ax.set_title(label, fontsize=11)
+                ax.axis('off')
+
+            # Bottom row: 2 table panels, 3 grid cols each.
+            for i, (label, src) in enumerate(bottom_panels):
+                ax = fig.add_subplot(gs[1, i*3:(i+1)*3])
+                if _present(src):
+                    try:
+                        img = mpimg.imread(str(src))
+                        ax.imshow(img)
+                    except Exception:
+                        ax.text(0.5, 0.5, '(load failed)',
+                                transform=ax.transAxes, ha='center')
+                else:
+                    ax.text(0.5, 0.5, '(not generated)',
+                            transform=ax.transAxes, ha='center',
+                            color='#888')
+                ax.set_title(label, fontsize=11)
+                ax.axis('off')
+
+            fig.suptitle(
+                f"Per-ROI summary ({title_suffix})", fontsize=13, y=0.98,
+            )
+            fig.savefig(
+                str(strip_png), dpi=150, bbox_inches='tight',
+                facecolor='white', edgecolor='none',
+            )
+            plt.close(fig)
+
+        msg_parts = [
+            f"\n  parameter_maps/parameter_map_metrics/",
+            f"\n    {pm_csv.name}",
+            f"\n    {pm_png.name}",
+        ]
+        if pm_roi_png is not None:
+            msg_parts.append(f"\n    {Path(pm_roi_png).name}")
+        if any_present:
+            msg_parts.append(f"\n    {strip_png.name}")
+        return ''.join(msg_parts)
 
     # ------------------------------------------------------------------
     # Legacy single-file save methods. Kept callable for tests and any
@@ -518,7 +1007,7 @@ class FitResultsDialog(QDialog):
             ('kd', 'decay rate', r['kd'], r['kd_error'], f'1/{time_units}'),
             ('knt', 'non-tracer rate', r['knt'], r['knt_error'], f'1/{time_units}'),
             ('t0', 'tracer onset', r['t0'], r['t0_error'], time_units),
-            ('tmax', 'NTE onset (fixed = argmax(signal))', r['tmax'], '', time_units),
+            ('tmax', 'NTE onset', r['tmax'], r['tmax_error'], time_units),
             ('%Enhancement', 'A1/A0 * 100', self.pct_enhancement, '', '%'),
             ('%NTE', 'A2/A0 * 100', self.pct_nte, '', '%'),
             ('%NTE_est', 'A2_est/A0_est * 100', pct_nte_est_cell, '', '%'),
@@ -527,7 +1016,7 @@ class FitResultsDialog(QDialog):
         ]
         with open(save_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['parameter', 'description', 'value', 'error', 'units'])
+            writer.writerow(['parameter', 'description', 'value', 'std', 'units'])
             for row in rows:
                 writer.writerow(row)
         QMessageBox.information(self, "Save Complete",
@@ -567,7 +1056,10 @@ def plot_fit_results_qt(time: np.ndarray, signal: np.ndarray,
                        roi_z_slice: Optional[int] = None,
                        dataset_dir: Optional[str] = None,
                        pre_injection_time: Optional[np.ndarray] = None,
-                       pre_injection_signal: Optional[np.ndarray] = None) -> None:
+                       pre_injection_signal: Optional[np.ndarray] = None,
+                       param_maps: Optional[Dict] = None,
+                       forced_n: Optional[int] = None,
+                       param_map_figure: Optional[object] = None) -> None:
     """
     Qt-based fit results visualization.
 
@@ -578,6 +1070,10 @@ def plot_fit_results_qt(time: np.ndarray, signal: np.ndarray,
     plot shows the full curve (pre + post) with the fit line drawn at
     A0 over the pre-injection range and the kinetic model over the
     post-injection range.
+
+    ``param_maps`` and ``forced_n`` flow in only when launched from
+    the parameter-map dialog's measurement-ROI button — see
+    FitResultsDialog.__init__ for their effect on _save_all.
     """
     app = init_qt_app()
 
@@ -589,6 +1085,9 @@ def plot_fit_results_qt(time: np.ndarray, signal: np.ndarray,
         dataset_dir=dataset_dir,
         pre_injection_time=pre_injection_time,
         pre_injection_signal=pre_injection_signal,
+        param_maps=param_maps,
+        forced_n=forced_n,
+        param_map_figure=param_map_figure,
     )
 
     # Auto-save if path provided

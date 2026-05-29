@@ -725,6 +725,10 @@ class ParameterMapResultsDialog(QDialog):
         # so the metrics panel can flag "drawn on z=3, viewing z=5" when
         # the user scrolls to a different slice.
         self.measurement_roi_drawn_z = None
+        # Shared ROI counter N allocated when the measurement ROI is
+        # drawn. Used by both the kinetic-fit bundle and the metrics
+        # CSV so they share a per-ROI number. None when no ROI active.
+        self._measurement_roi_n = None
         self._measurement_lasso = None
 
         self.setWindowTitle("Parameter Map Results")
@@ -1137,6 +1141,13 @@ class ParameterMapResultsDialog(QDialog):
 
         self.measurement_roi_mask = inside
         self.measurement_roi_drawn_z = self.current_z
+        # Allocate one shared ROI counter N for this measurement ROI,
+        # used by both the upcoming "Kinetic Fit on this ROI" save
+        # bundle (kinetic_fit_results_<N>.csv) and "Export Metrics CSV"
+        # (parameter_map_metric_<N>.csv). Pick the max free N across
+        # both target dirs so neither output collides with anything
+        # already on disk. Computed once per ROI draw, reset on Clear.
+        self._measurement_roi_n = self._allocate_shared_roi_n()
         self.clear_measure_btn.setEnabled(True)
         # Only enable the kinetic-fit button when we actually have the
         # data needed to do the fit (registered_4d for signal extraction,
@@ -1159,12 +1170,49 @@ class ParameterMapResultsDialog(QDialog):
         """Drop the measurement ROI and refresh the display + metrics."""
         self.measurement_roi_mask = None
         self.measurement_roi_drawn_z = None
+        # Release the shared ROI counter so the next Draw allocates
+        # a fresh N (and so Export Metrics, if accidentally invoked
+        # before a new draw, doesn't reuse a stale number).
+        self._measurement_roi_n = None
         self.clear_measure_btn.setEnabled(False)
         self.kinetic_fit_btn.setEnabled(False)
         self.measure_status_label.setText(
             "Click 'Draw' then drag-and-release on the map."
         )
         self._update_display()
+
+    def _allocate_shared_roi_n(self):
+        """Pick the next free ROI counter N for the measurement ROI.
+
+        Used as the index for both the kinetic-fit bundle and the
+        parameter-map metrics CSV the user can produce from this ROI.
+        Returns the max next-free N across both target directories so
+        the chosen N doesn't collide with anything already on disk in
+        either folder.
+        """
+        from pathlib import Path
+        from ..io import next_indexed_path
+        import re
+
+        if not self.dataset_dir:
+            return 1
+
+        kinetic_dir = Path(self.dataset_dir) / "kinetic_fits"
+        metrics_dir = (Path(self.dataset_dir) / "parameter_maps"
+                       / "parameter_map_metrics")
+        candidates = []
+        for parent, prefix, suffix in [
+            (kinetic_dir, "kinetic_fit_results", ".csv"),
+            (metrics_dir, "parameter_map_metric", ".csv"),
+        ]:
+            try:
+                p = next_indexed_path(parent, prefix, suffix)
+                m = re.match(rf'{prefix}_(\d+){re.escape(suffix)}$', p.name)
+                if m:
+                    candidates.append(int(m.group(1)))
+            except Exception:
+                continue
+        return max(candidates) if candidates else 1
 
     def _run_kinetic_fit_on_measurement_roi(self):
         """Run kinetic fit on the drawn measurement ROI's signal.
@@ -1259,7 +1307,11 @@ class ParameterMapResultsDialog(QDialog):
             )
             return
 
-        # Open the kinetic fit results dialog (modal).
+        # Open the kinetic fit results dialog (modal). Pass param_maps
+        # + forced_n so _save_all (a) labels its output bundle with the
+        # same N as the matching parameter_map_metric_<N>.csv export
+        # for this measurement ROI, and (b) enriches the composite-
+        # summary row with per-voxel _pm mean/std for each map.
         plot_fit_results_qt(
             time_fit, signal_fit, fitted_signal, fit_results,
             roi_mask=self.measurement_roi_mask,
@@ -1269,11 +1321,331 @@ class ParameterMapResultsDialog(QDialog):
             dataset_dir=self.dataset_dir,
             pre_injection_time=pre_time,
             pre_injection_signal=pre_signal,
+            param_maps=self.param_maps,
+            forced_n=self._measurement_roi_n,
+            # Snapshot of the live parameter-map dialog figure so
+            # FitResultsDialog._save_all can drop a matching
+            # parameter_map_metric_roi_<N>.png alongside the kinetic
+            # bundle when the user clicks Save.
+            param_map_figure=self.figure,
         )
         self.measure_status_label.setText(
             "Click 'Draw' then drag-and-release on the map."
         )
         self._update_display()
+
+    # Single-source-of-truth for which colormap and value range each
+    # parameter map uses. Used by both the live single-slice display
+    # and the multi-map stitched PNG exporter so the two stay in sync —
+    # update the LUT in one place and the stitched grid follows.
+    _MAP_TITLE_LABELS = {
+        'kb_map': 'kb (buildup rate)',
+        'kd_map': 'kd (decay rate)',
+        'knt_map': 'knt (non-tracer rate)',
+        'r_squared_map': 'R-squared',
+        'a1_amplitude_map': 'A1 (tracer amplitude)',
+        'a2_amplitude_map': 'A2 (non-tracer amplitude)',
+        'a0_est_map': 'A0_est (baseline initial estimate)',
+        'a2_est_map': 'A2_est (non-tracer initial estimate)',
+        'a1_percent_map': '%Enhancement (A1/A0)',
+        'a2_percent_map': '%NTE (A2/A0)',
+        'a2_percent_est_map': '%NTE_est (A2_est/A0_est)',
+        'baseline_map': 'A0 (baseline)',
+        't0_map': 't0 (tracer onset)',
+        'tmax_map': 'tmax (NTE onset)',
+    }
+
+    def _resolve_cmap_for_map(self, map_key):
+        """Pick a (cmap, vmin, vmax) tuple for a given parameter map key.
+
+        Centralised so both the interactive viewer (_update_display) and
+        the stitched-grid PNG exporter (_export_stitched_png) stay in
+        sync — kb/kd/knt share an ImageJ 16_color LUT, %NTE/%NTE_est
+        share a diverging LUT with ±NTE_RANGE_MAX cap, R² uses
+        RdYlBu_r on [0, 1], and so on.
+        """
+        from .colormaps import imagej_16_colors, nte_diverging  # noqa: F401
+        if 'r_squared' in map_key:
+            return 'RdYlBu_r', 0, 1
+        if map_key == 'kb_map':
+            # kb (buildup rate) shares the ImageJ 16_color LUT with
+            # kd/knt for visual consistency, but auto-ranges instead
+            # of using the fixed 0–0.15 cap — kb upper bound in the
+            # fit model is 1.0 (one order of magnitude higher than
+            # kd/knt), so a fixed cap would saturate most voxels at
+            # the bright end of the LUT.
+            return imagej_16_colors, None, None
+        if map_key in ('kd_map', 'knt_map'):
+            # Fixed 0–0.15 range so the discrete bands stay comparable
+            # across datasets and between the two rate parameters.
+            return imagej_16_colors, KD_DISPLAY_MIN, KD_DISPLAY_MAX
+        if map_key == 'a1_percent_map':
+            return (imagej_16_colors,
+                    *self._percent_display_range(
+                        'a1_percent_map', mode='positive'))
+        if map_key == 'a2_percent_map':
+            return (nte_diverging,
+                    *self._percent_display_range(
+                        'a2_percent_map', mode='symmetric',
+                        max_limit=NTE_RANGE_MAX))
+        if map_key == 'a2_percent_est_map':
+            # %NTE_est shares the LUT, range, and cap so it can be
+            # visually compared slice-for-slice against fitted %NTE.
+            return (nte_diverging,
+                    *self._percent_display_range(
+                        'a2_percent_est_map', mode='symmetric',
+                        max_limit=NTE_RANGE_MAX))
+        return 'plasma', None, None
+
+    def _export_stitched_grid_png(self, folder, selected_maps,
+                                  include_t1, include_t2, include_roi,
+                                  variants):
+        """Build a stitched PNG grid (rows = maps, cols = z-slices).
+
+        Renders one composite PNG per (overlay variant, ROI on/off)
+        combination so the user can pick the version they want without
+        re-running the export. Each row gets its own colorbar+label —
+        kb/kd/knt/percent maps don't share a single LUT, so a per-row
+        colorbar is necessary.
+
+        Saved at the export-folder root as:
+          stitched_all_maps.png             (plain, no ROI)
+          stitched_all_maps_overlay.png     (overlay variant)
+          stitched_all_maps_with_roi.png    (plain, ROI contour)
+          stitched_all_maps_overlay_with_roi.png (both)
+
+        Skipped when num_slices <= 1 (caller checks).
+        """
+        from pathlib import Path
+        import matplotlib.pyplot as plt
+        import matplotlib as mpl
+
+        folder = Path(folder)
+        saved = []
+
+        nz = int(self.num_slices)
+
+        # Build the row list. Anatomical references go on top so the
+        # parameter maps below them sit in a consistent column-aligned
+        # context. Each row spec carries everything _draw_grid_row
+        # needs to render itself — keeps that loop tidy.
+        rows = []
+        if include_t1 and self.registered_4d is not None:
+            rows.append({
+                'kind': 'anatomical',
+                'label': 'T1',
+                'data': self.registered_4d[:, :, :, 0],
+                'cmap': 'gray',
+                'vmin': None,
+                'vmax': None,
+            })
+        if include_t2 and self.registered_t2 is not None:
+            rows.append({
+                'kind': 'anatomical',
+                'label': 'T2',
+                'data': self.registered_t2,
+                'cmap': 'gray',
+                'vmin': None,
+                'vmax': None,
+            })
+        for key in selected_maps:
+            cmap, vmin, vmax = self._resolve_cmap_for_map(key)
+            if isinstance(cmap, str):
+                cmap_obj = mpl.colormaps[cmap].copy()
+            else:
+                cmap_obj = cmap.copy()
+            label = self._MAP_TITLE_LABELS.get(key, key.replace('_map', ''))
+            rows.append({
+                'kind': 'param',
+                'key': key,
+                'label': label,
+                'cmap': cmap_obj,
+                'vmin': vmin,
+                'vmax': vmax,
+            })
+
+        if not rows:
+            return saved
+
+        nrows = len(rows)
+
+        # Auto-vmin/vmax for any row that came back with None — we want
+        # a single LUT range per row so all slices in that row share the
+        # same colorbar. Compute across the full 3D volume and the
+        # row's mask.
+        param_mask = self.param_maps.get('mask')
+        for row in rows:
+            if row['kind'] != 'param':
+                continue
+            if row['vmin'] is not None and row['vmax'] is not None:
+                continue
+            data3d = self.param_maps.get(row['key'])
+            if data3d is None:
+                row['vmin'], row['vmax'] = 0, 1
+                continue
+            if param_mask is not None and data3d.shape == param_mask.shape:
+                masked = data3d[param_mask]
+            else:
+                masked = data3d.flatten()
+            masked = masked[np.isfinite(masked)]
+            if masked.size == 0:
+                row['vmin'], row['vmax'] = 0, 1
+                continue
+            row['vmin'] = float(np.percentile(masked, 1))
+            row['vmax'] = float(np.percentile(masked, 99))
+            if row['vmax'] <= row['vmin']:
+                row['vmax'] = row['vmin'] + 1e-6
+
+        roi_overlay_modes = [(False, '')]
+        if include_roi:
+            roi_overlay_modes = [(True, '_with_roi')]
+            # Plain (no ROI) is still useful even when ROI was requested,
+            # so emit both — keeps the file with the cleaner reference
+            # available alongside the annotated one.
+            roi_overlay_modes.insert(0, (False, ''))
+
+        # One PNG per (overlay variant) × (with/without ROI) combo.
+        for overlay_on, variant_suffix in variants:
+            for show_roi, roi_suffix in roi_overlay_modes:
+                fname = "stitched_all_maps"
+                if variant_suffix:
+                    fname += variant_suffix
+                if roi_suffix:
+                    fname += roi_suffix
+                fname += ".png"
+                save_path = folder / fname
+
+                # Layout: extra column on the right reserved for the
+                # per-row colorbars. width_ratios biases space toward
+                # the data columns.
+                fig_w = max(2.0 * nz + 2.0, 6.0)
+                fig_h = max(2.0 * nrows + 0.4, 3.0)
+                fig = plt.figure(figsize=(fig_w, fig_h), dpi=120)
+                gs = fig.add_gridspec(
+                    nrows=nrows,
+                    ncols=nz + 1,
+                    width_ratios=[1] * nz + [0.05],
+                    wspace=0.05,
+                    hspace=0.18,
+                    left=0.06, right=0.95,
+                    top=0.94, bottom=0.04,
+                )
+
+                for r_idx, row in enumerate(rows):
+                    cbar_ax = fig.add_subplot(gs[r_idx, nz])
+                    last_im = None
+                    for z in range(nz):
+                        ax = fig.add_subplot(gs[r_idx, z])
+                        last_im = self._draw_grid_cell(
+                            ax, row, z,
+                            overlay_on=overlay_on and row['kind'] == 'param',
+                            show_roi=show_roi,
+                        )
+                        if z == 0:
+                            ax.set_ylabel(row['label'], fontsize=10,
+                                          rotation=0, ha='right',
+                                          va='center', labelpad=10)
+                        if r_idx == 0:
+                            ax.set_title(f"z{z:02d}", fontsize=9)
+                        ax.set_xticks([])
+                        ax.set_yticks([])
+                    if last_im is not None and row['kind'] == 'param':
+                        fig.colorbar(last_im, cax=cbar_ax)
+                        cbar_ax.tick_params(labelsize=7)
+                    else:
+                        cbar_ax.axis('off')
+
+                fig.suptitle(
+                    f"Parameter map grid — {nz} slices × {nrows} rows",
+                    fontsize=12, y=0.99,
+                )
+                fig.savefig(
+                    str(save_path), dpi=150, bbox_inches='tight',
+                    facecolor='white', edgecolor='none',
+                )
+                plt.close(fig)
+                saved.append(str(save_path))
+
+        return saved
+
+    def _draw_grid_cell(self, ax, row, z, overlay_on, show_roi):
+        """Render a single grid cell for the stitched-grid exporter.
+
+        Mirrors the logic in _update_display but writes into a caller-
+        provided Axes rather than the live canvas. Returns the imshow
+        handle so the caller can attach a row colorbar.
+        """
+        # Anatomical row: just show the grayscale slice and bail — no
+        # parameter map underneath, no overlay opacity.
+        if row['kind'] == 'anatomical':
+            data = row['data']
+            if data.ndim == 3 and z < data.shape[2]:
+                ref = data[:, :, z].T
+            elif data.ndim == 3:
+                ref = data[:, :, 0].T
+            else:
+                ref = data.T
+            return ax.imshow(ref, cmap='gray', origin='lower',
+                             vmin=row['vmin'], vmax=row['vmax'])
+
+        # Parameter map row.
+        map_data = self.param_maps.get(row['key'])
+        mask = self.param_maps.get('mask')
+        cmap = row['cmap']
+
+        if map_data is None or mask is None:
+            ax.text(0.5, 0.5, 'no data', transform=ax.transAxes,
+                    ha='center', va='center', color='gray')
+            return None
+
+        if map_data.ndim == 3 and z < map_data.shape[2]:
+            map_slice = map_data[:, :, z].T
+            mask_slice = mask[:, :, z].T
+        else:
+            map_slice = map_data[:, :, 0].T if map_data.ndim == 3 else map_data.T
+            mask_slice = mask[:, :, 0].T if mask.ndim == 3 else mask.T
+
+        display_data = np.where(mask_slice, map_slice, np.nan)
+
+        if not overlay_on:
+            cmap.set_bad('black')
+
+        if overlay_on and self.reference_image is not None:
+            if self.reference_image.ndim == 3 and z < self.reference_image.shape[2]:
+                ref_slice = self.reference_image[:, :, z].T
+            elif self.reference_image.ndim == 3:
+                ref_slice = self.reference_image[:, :, 0].T
+            else:
+                ref_slice = self.reference_image.T
+            ax.imshow(ref_slice, cmap='gray', origin='lower')
+            im = ax.imshow(
+                display_data, cmap=cmap, origin='lower',
+                vmin=row['vmin'], vmax=row['vmax'],
+                alpha=self.overlay_opacity,
+            )
+        else:
+            im = ax.imshow(
+                display_data, cmap=cmap, origin='lower',
+                vmin=row['vmin'], vmax=row['vmax'],
+            )
+
+        # ROI contour (cyan = fitting ROI, yellow = measurement ROI).
+        if show_roi and self.roi_mask is not None:
+            if self.roi_mask.ndim == 2:
+                roi_slice = self.roi_mask.T
+            elif z < self.roi_mask.shape[2]:
+                roi_slice = self.roi_mask[:, :, z].T
+            else:
+                roi_slice = None
+            if roi_slice is not None and np.any(roi_slice):
+                ax.contour(roi_slice, levels=[0.5], colors='cyan', linewidths=1.0)
+        if show_roi and self.measurement_roi_mask is not None:
+            ax.contour(
+                self.measurement_roi_mask.T,
+                levels=[0.5], colors='yellow', linewidths=1.0,
+            )
+
+        return im
 
     def _update_display(self):
         """Update the parameter map display."""
@@ -1318,47 +1690,7 @@ class ParameterMapResultsDialog(QDialog):
         # extremes instead of compressing the rest of the map. The cached
         # range is shared across all z-slices so visual comparison between
         # slices stays consistent.
-        from .colormaps import imagej_16_colors, nte_diverging  # noqa: F401
-        if 'r_squared' in self.current_map:
-            cmap = 'RdYlBu_r'
-            vmin, vmax = 0, 1
-        elif self.current_map == 'kb_map':
-            # kb (buildup rate) shares the ImageJ 16_color LUT with kd/knt
-            # for visual consistency, but auto-ranges instead of using the
-            # fixed 0–0.15 cap — kb upper bound in the fit model is 1.0,
-            # an order of magnitude higher than kd/knt, so a fixed cap
-            # would saturate most voxels at the bright end of the LUT.
-            cmap = imagej_16_colors
-            vmin, vmax = None, None
-        elif self.current_map in ('kd_map', 'knt_map'):
-            # kd and knt share the ImageJ 16_color LUT with a fixed 0–0.15
-            # range so the discrete color bands stay comparable across
-            # datasets and between the two rate parameters.
-            cmap = imagej_16_colors
-            vmin, vmax = KD_DISPLAY_MIN, KD_DISPLAY_MAX
-        elif self.current_map == 'a1_percent_map':
-            cmap = imagej_16_colors
-            vmin, vmax = self._percent_display_range(
-                'a1_percent_map', mode='positive'
-            )
-        elif self.current_map == 'a2_percent_map':
-            cmap = nte_diverging
-            vmin, vmax = self._percent_display_range(
-                'a2_percent_map', mode='symmetric',
-                max_limit=NTE_RANGE_MAX,
-            )
-        elif self.current_map == 'a2_percent_est_map':
-            # %NTE_est shares the diverging LUT, the symmetric auto-range,
-            # and the ±NTE_RANGE_MAX cap so it can be visually compared
-            # slice-for-slice against the fitted %NTE map.
-            cmap = nte_diverging
-            vmin, vmax = self._percent_display_range(
-                'a2_percent_est_map', mode='symmetric',
-                max_limit=NTE_RANGE_MAX,
-            )
-        else:
-            cmap = 'plasma'
-            vmin, vmax = None, None
+        cmap, vmin, vmax = self._resolve_cmap_for_map(self.current_map)
 
         # Render NaN / undefined voxels (mask=False, divide-by-zero in
         # %Enhancement / %NTE, etc.) as black in the standalone view —
@@ -1420,21 +1752,10 @@ class ParameterMapResultsDialog(QDialog):
         # Colorbar - store reference so we can remove it later
         self.colorbar = self.figure.colorbar(im, ax=self.ax, fraction=0.046)
 
-        # Title
-        title_map = {
-            'kb_map': 'kb (buildup rate)',
-            'kd_map': 'kd (decay rate)',
-            'knt_map': 'knt (non-tracer rate)',
-            'r_squared_map': 'R-squared',
-            'a1_amplitude_map': 'A1 (tracer amplitude)',
-            'a2_amplitude_map': 'A2 (non-tracer amplitude)',
-            'a0_est_map': 'A0_est (baseline initial estimate)',
-            'a2_est_map': 'A2_est (non-tracer initial estimate)',
-            'a1_percent_map': '%Enhancement (A1/A0)',
-            'a2_percent_map': '%NTE (A2/A0)',
-            'a2_percent_est_map': '%NTE_est (A2_est/A0_est)',
-        }
-        self.ax.set_title(f"{title_map.get(self.current_map, self.current_map)} (z={self.current_z})")
+        # Title — shared label dict so the stitched export and the
+        # single-slice viewer agree on the human-readable name.
+        title = self._MAP_TITLE_LABELS.get(self.current_map, self.current_map)
+        self.ax.set_title(f"{title} (z={self.current_z})")
         self.ax.axis('off')
 
         self.figure.tight_layout()
@@ -1877,6 +2198,29 @@ class ParameterMapResultsDialog(QDialog):
                     )
                     saved_files.extend(saved)
 
+                # Stitched grid PNGs — only meaningful when there's
+                # more than one z-slice. One PNG per overlay variant
+                # so plain and overlay versions stay easy to grab
+                # separately. Always emits the plain version (rows =
+                # maps, columns = slices), and the with-roi variant
+                # when include_roi is on.
+                if self.num_slices > 1:
+                    try:
+                        stitched_paths = self._export_stitched_grid_png(
+                            folder=folder,
+                            selected_maps=selected_maps,
+                            include_t1=include_t1,
+                            include_t2=include_t2,
+                            include_roi=include_roi,
+                            variants=variants,
+                        )
+                        saved_files.extend(stitched_paths)
+                    except Exception as e:
+                        # Stitched export is best-effort — failure
+                        # shouldn't blow up the per-slice export the
+                        # user actually asked for.
+                        print(f"Stitched grid PNG failed: {e}")
+
                 # Restore original settings
                 self.current_map = original_map
                 self.current_z = original_z
@@ -1915,9 +2259,20 @@ class ParameterMapResultsDialog(QDialog):
             self.output_dir,
             'parameter_maps/parameter_map_metrics',
         ))
-        default_path = next_indexed_path(
-            metrics_dir, "parameter_map_metric", ".csv"
-        )
+        # When a measurement ROI is active, reuse the shared ROI
+        # counter so this metrics CSV lands on the same N as the
+        # matching kinetic_fit_results_<N>.csv from the "Kinetic Fit
+        # on this ROI" button. Otherwise pick the next free N as
+        # before.
+        if (self.measurement_roi_mask is not None
+                and getattr(self, '_measurement_roi_n', None) is not None):
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            default_path = (metrics_dir
+                            / f"parameter_map_metric_{int(self._measurement_roi_n)}.csv")
+        else:
+            default_path = next_indexed_path(
+                metrics_dir, "parameter_map_metric", ".csv"
+            )
 
         filepath, _ = QFileDialog.getSaveFileName(
             self, "Export Metrics",
@@ -1928,95 +2283,93 @@ class ParameterMapResultsDialog(QDialog):
         if not filepath:
             return
 
-        # All parameter maps that appear in the dialog metrics panel —
-        # keep this list in sync with _update_metrics' param_names so
-        # the CSV reflects everything the user sees on screen.
-        param_names = [
-            ('kb_map', 'kb'),
-            ('kd_map', 'kd'),
-            ('knt_map', 'knt'),
-            ('r_squared_map', 'r_squared'),
-            ('a1_percent_map', 'pct_enhancement'),
-            ('a2_percent_map', 'pct_nte'),
-            ('a2_percent_est_map', 'pct_nte_est'),
-        ]
+        # Build the unified-format rows for the measurement ROI. The
+        # CSV/PNG schema mirrors the kinetic-fit results bundle
+        # (parameter, description, value, std, units) — the column
+        # order is identical so a Combined Metrics PNG can stack the
+        # two tables seamlessly. roi_type / z_slice / n_pixels are
+        # surfaced in the title instead of as columns now: the CSV
+        # only ever describes one ROI on one z, so per-row repetition
+        # was redundant. Parameter names get the _pm suffix so they
+        # don't collide with kinetic-fit names in the composite
+        # summary CSV (kb vs kb_pm, etc.).
+        param_specs = self._build_pm_metric_specs()
 
-        def _stats_row(roi_type, z, parameter, values):
-            """Compute n/mean/std/min/max safely for a 1D values array."""
-            valid = values[np.isfinite(values)]
-            if len(valid) == 0:
-                return None
-            return [
-                roi_type, z, parameter, len(valid),
-                float(np.nanmean(valid)),
-                float(np.nanstd(valid)),
-                float(np.nanmin(valid)),
-                float(np.nanmax(valid)),
-            ]
+        n_pixels = 0
+        z_for_title = None
+        unified_rows = []
 
-        # Accumulate rows in memory so we can write them to BOTH the
-        # CSV and the table-style PNG companion.
-        all_rows = []
-
-        # ----- Fitting ROI: per slice, intersected with fit mask -----
-        if self.roi_mask is not None:
-            fit_mask = self.param_maps.get('mask')
-            for z in range(self.num_slices):
-                if self.roi_mask.ndim == 2:
-                    roi_slice = self.roi_mask
-                else:
-                    roi_slice = self.roi_mask[:, :, z]
-
-                if fit_mask is not None:
-                    if fit_mask.ndim == 3:
-                        combined = roi_slice & fit_mask[:, :, z]
-                    else:
-                        combined = roi_slice & fit_mask[:, :, 0]
-                else:
-                    combined = roi_slice
-
-                if not combined.any():
-                    continue
-
-                for key, csv_name in param_names:
-                    map_data = self.param_maps.get(key)
-                    if map_data is None:
-                        continue
-                    if map_data.ndim == 3:
-                        slice_data = map_data[:, :, z]
-                    else:
-                        slice_data = map_data[:, :, 0]
-                    row = _stats_row('fitting', z, csv_name,
-                                     slice_data[combined])
-                    if row:
-                        all_rows.append(row)
-
-        # ----- Measurement ROI: single z-slice, NaN-filtered only -----
         if self.measurement_roi_mask is not None:
             z = self.measurement_roi_drawn_z
             if z is None:
                 z = self.current_z
-            for key, csv_name in param_names:
-                map_data = self.param_maps.get(key)
+            z_for_title = z
+            for spec in param_specs:
+                map_data = self.param_maps.get(spec['key'])
                 if map_data is None:
                     continue
                 if map_data.ndim == 3:
                     slice_data = map_data[:, :, z]
                 else:
                     slice_data = map_data[:, :, 0]
-                row = _stats_row('measurement', z, csv_name,
-                                 slice_data[self.measurement_roi_mask])
-                if row:
-                    all_rows.append(row)
+                values = slice_data[self.measurement_roi_mask]
+                values = values[np.isfinite(values)]
+                if values.size == 0:
+                    continue
+                if not n_pixels:
+                    n_pixels = int(values.size)
+                unified_rows.append((
+                    spec['name_pm'],
+                    spec['description'],   # already includes "(mean)"
+                    float(np.nanmean(values)),
+                    float(np.nanstd(values)),
+                    spec['units'],
+                ))
 
-        headers = [
-            'roi_type', 'z_slice', 'parameter',
-            'n_pixels', 'mean', 'std', 'min', 'max',
-        ]
+        if not unified_rows and self.roi_mask is not None:
+            # Fallback when the user hasn't drawn a measurement ROI:
+            # use the fitting ROI restricted to the currently shown
+            # z-slice. Title context still describes one ROI / one z.
+            fit_mask = self.param_maps.get('mask')
+            z = self.current_z
+            z_for_title = z
+            roi_slice = (self.roi_mask if self.roi_mask.ndim == 2
+                         else self.roi_mask[:, :, z])
+            if fit_mask is not None:
+                fit_slice = (fit_mask[:, :, z]
+                             if fit_mask.ndim == 3
+                             else fit_mask[:, :, 0])
+                combined = roi_slice & fit_slice
+            else:
+                combined = roi_slice
+            if combined.any():
+                for spec in param_specs:
+                    map_data = self.param_maps.get(spec['key'])
+                    if map_data is None:
+                        continue
+                    if map_data.ndim == 3:
+                        slice_data = map_data[:, :, z]
+                    else:
+                        slice_data = map_data[:, :, 0]
+                    values = slice_data[combined]
+                    values = values[np.isfinite(values)]
+                    if values.size == 0:
+                        continue
+                    if not n_pixels:
+                        n_pixels = int(values.size)
+                    unified_rows.append((
+                        spec['name_pm'],
+                        spec['description'],
+                        float(np.nanmean(values)),
+                        float(np.nanstd(values)),
+                        spec['units'],
+                    ))
+
+        unified_header = ['parameter', 'description', 'value', 'std', 'units']
         with open(filepath, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(headers)
-            for row in all_rows:
+            writer.writerow(unified_header)
+            for row in unified_rows:
                 writer.writerow(row)
 
         # Companion files share the CSV's index N. Two PNGs are saved:
@@ -2050,7 +2403,8 @@ class ParameterMapResultsDialog(QDialog):
         except Exception as e:
             roi_png_msg = f"\n(ROI overlay PNG failed: {e})"
 
-        # 2) Metrics table PNG (numeric data rendered as a table)
+        # 2) Metrics table PNG (numeric data rendered as a table) using
+        #    the same unified header as the kinetic fit results table.
         from ..roi_selection import save_table_as_png
 
         def _fmt(v, fmt='.4f'):
@@ -2061,17 +2415,26 @@ class ParameterMapResultsDialog(QDialog):
             except (TypeError, ValueError):
                 return str(v)
 
-        # Format mean/std/min/max with 4 decimal places; counts and
-        # categorical columns pass through.
         png_rows = [[
-            r[0], r[1], r[2], r[3],
-            _fmt(r[4]), _fmt(r[5]), _fmt(r[6]), _fmt(r[7]),
-        ] for r in all_rows]
+            row[0], row[1], _fmt(row[2]), _fmt(row[3]), row[4],
+        ] for row in unified_rows]
+
+        title_bits = []
+        if n is not None:
+            title_bits.append(f"ROI #{n}")
+        if z_for_title is not None:
+            title_bits.append(f"z={z_for_title}")
+        if n_pixels:
+            title_bits.append(f"n={n_pixels} pixels")
+        title_suffix = (" (" + ", ".join(title_bits) + ")") if title_bits else ""
         try:
             save_table_as_png(
-                png_rows, headers, str(table_png_path),
-                title=f"Parameter map metrics (N={n})"
-                      if n is not None else "Parameter map metrics",
+                png_rows, unified_header, str(table_png_path),
+                title=f"Parameter map metrics{title_suffix}",
+                # Cap description so one verbose row doesn't blow up
+                # the column. Same cap as the kinetic-fit table so the
+                # two render with comparable proportions.
+                max_col_chars=[None, 22, None, None, None],
             )
             table_png_msg = f"\nMetrics table PNG: {table_png_path}"
         except Exception as e:
@@ -2081,6 +2444,46 @@ class ParameterMapResultsDialog(QDialog):
             self, "Exported",
             f"Metrics CSV: {filepath}{roi_png_msg}{table_png_msg}",
         )
+
+    # Single source of truth for the parameter-map metric rows so the
+    # _export_metrics path and the Combined Metrics PNG render the
+    # same parameters in the same order with the same _pm naming and
+    # description text. Description includes "(mean)" so the table
+    # reads as a per-voxel average in the ROI rather than a fitted
+    # parameter.
+    def _build_pm_metric_specs(self):
+        time_units = (self.param_maps.get('metadata', {}) or {}).get(
+            'time_units', 'minutes',
+        )
+        return [
+            {'key': 'baseline_map', 'name_pm': 'A0_pm',
+             'description': 'baseline signal (mean)', 'units': ''},
+            {'key': 'a1_amplitude_map', 'name_pm': 'A1_pm',
+             'description': 'tracer amplitude (mean)', 'units': ''},
+            {'key': 'a2_amplitude_map', 'name_pm': 'A2_pm',
+             'description': 'non-tracer amplitude (mean)', 'units': ''},
+            {'key': 'kb_map', 'name_pm': 'kb_pm',
+             'description': 'buildup rate (mean)',
+             'units': f'1/{time_units}'},
+            {'key': 'kd_map', 'name_pm': 'kd_pm',
+             'description': 'decay rate (mean)',
+             'units': f'1/{time_units}'},
+            {'key': 'knt_map', 'name_pm': 'knt_pm',
+             'description': 'non-tracer rate (mean)',
+             'units': f'1/{time_units}'},
+            {'key': 't0_map', 'name_pm': 't0_pm',
+             'description': 'tracer onset (mean)', 'units': time_units},
+            {'key': 'tmax_map', 'name_pm': 'tmax_pm',
+             'description': 'NTE onset (mean)', 'units': time_units},
+            {'key': 'a1_percent_map', 'name_pm': 'pct_enhancement_pm',
+             'description': '%Enhancement (mean)', 'units': '%'},
+            {'key': 'a2_percent_map', 'name_pm': 'pct_nte_pm',
+             'description': '%NTE (mean)', 'units': '%'},
+            {'key': 'a2_percent_est_map', 'name_pm': 'pct_nte_est_pm',
+             'description': '%NTE_est (mean)', 'units': '%'},
+            {'key': 'r_squared_map', 'name_pm': 'R_squared_pm',
+             'description': 'goodness of fit (mean)', 'units': ''},
+        ]
 
 
 def show_parameter_map_options(max_z: int = 8,

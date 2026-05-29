@@ -1081,8 +1081,16 @@ def main():
                             pre_injection_signal=roi_signal[:injection_idx],
                         )
 
-                        # Save results
-                        results_file = auto_registration_dir / "kinetic_results.txt"
+                        # Save results — drop into kinetic_fits/ with the
+                        # next free per-ROI index N so successive ROIs
+                        # don't overwrite each other and the .txt rides
+                        # alongside the rest of the per-ROI bundle.
+                        from .io import next_indexed_path
+                        kinetic_fits_dir = auto_registration_dir / "kinetic_fits"
+                        kinetic_fits_dir.mkdir(parents=True, exist_ok=True)
+                        results_file = next_indexed_path(
+                            kinetic_fits_dir, "kinetic_results", ".txt"
+                        )
                         with open(results_file, 'w') as f:
                             f.write("EXTENDED PROXYL KINETIC ANALYSIS RESULTS\n")
                             f.write("="*40 + "\n\n")
@@ -1722,8 +1730,17 @@ def main():
                 next_step = "7"
             print(f"Step {next_step}: Saving results...")
             
-            # Save numerical results
-            results_file = output_dir / "kinetic_results.txt"
+            # Save numerical results to the dataset's kinetic_fits/
+            # subfolder with an auto-incremented per-ROI index N so the
+            # text summary rides alongside the rest of the per-ROI
+            # bundle (timecourse CSV, fit results CSV/PNG, plot, ROI
+            # overlay).
+            from .io import next_indexed_path
+            kinetic_fits_dir = Path(auto_registration_dir) / "kinetic_fits"
+            kinetic_fits_dir.mkdir(parents=True, exist_ok=True)
+            results_file = next_indexed_path(
+                kinetic_fits_dir, "kinetic_results", ".txt"
+            )
             with open(results_file, 'w') as f:
                 f.write("EXTENDED PROXYL KINETIC ANALYSIS RESULTS\n")
                 f.write("="*40 + "\n\n")

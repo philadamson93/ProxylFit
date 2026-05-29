@@ -285,18 +285,6 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
         they just don't influence the optimizer. ``None`` or an
         empty sequence keeps every point.
 
-    Notes on ``tmax``
-    -----------------
-    ``tmax`` (the onset time of the non-tracer (1-exp) term) is
-    always pinned to ``time[argmax(signal)]`` — the empirical signal
-    peak — and dropped from the optimization. The non-tracer onset
-    is only weakly identifiable against the tracer rise+decay, and
-    letting it float lets ``knt`` and ``kd`` compete for explanation
-    of the late-curve shape. Anchoring tmax to the observed peak
-    keeps NTE as a refinement on top of the tracer fit instead of
-    competing with it. ``tmax_error`` is reported as 0 (fixed). A1
-    remains a free fit parameter alongside kb, kd, knt, and t0.
-
     Returns
     -------
     kb : float
@@ -415,62 +403,49 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
           initial_params['kb'], initial_params['kd'], initial_params['knt'],
           initial_params['t0'], initial_params['tmax']]
 
-    # Build fit dispatch based on which parameters are fixed.
-    #   • tmax is ALWAYS pinned to time[argmax(signal)] (the empirical
-    #     signal peak). The non-tracer term's onset is hard for the
-    #     optimizer to identify against the tracer rise+decay, so
-    #     letting it float lets knt and kd compete and pulls tmax to
-    #     unphysical values. Pinning to the observed peak anchors
-    #     the second (1-exp) term and keeps NTE as a refinement on
-    #     top of the tracer fit. A1 stays free along with kb, kd,
-    #     knt, and t0.
-    #   • A0 is fixed when pre-injection data is supplied — clean
-    #     direct measurement of baseline.
-    # Two dispatch paths (A0 free vs A0 fixed); tmax always fixed.
-    # After the fit returns, _expand_to_8 inserts the fixed values
-    # back at indices 0 (A0) and 7 (tmax) so the rest of the function
-    # (param unpacking, error reporting, fit_results dict) sees the
-    # canonical 8-element popt + 8×8 pcov regardless of dispatch
-    # path.
+    # Build fit dispatch based on which parameters are fixed. Only A0
+    # is pinned (when pre-injection data is supplied — clean direct
+    # measurement of baseline). tmax is left as a free fit parameter:
+    # we tried pinning it to time[argmax(signal)] to anchor the NTE
+    # onset, but it cost kd fit quality enough that the operator
+    # opted to live with looser tmax in exchange for tighter kd.
+    # Two dispatch paths (A0 free vs A0 fixed). After the fit returns,
+    # _expand_to_8 inserts the fixed A0 value back at index 0 so the
+    # rest of the function (param unpacking, error reporting,
+    # fit_results dict) sees the canonical 8-element popt + 8×8 pcov
+    # regardless of dispatch path.
     fix_a0 = (pre_injection_signal is not None
               and len(pre_injection_signal) > 0)
     A0_fixed = float(initial_params['A0']) if fix_a0 else None
-    tmax_fixed = float(time[int(np.argmax(signal))])
 
     if fix_a0:
-        # 6-param fit: drop A0 (0) and tmax (7)
-        def _wrap(t, A1, A2, kb, kd, knt, t0):
+        # 7-param fit: drop A0 (0) only
+        def _wrap(t, A1, A2, kb, kd, knt, t0, tmax):
             return proxyl_kinetic_model_extended(
-                t, A0_fixed, A1, A2, kb, kd, knt, t0, tmax_fixed,
+                t, A0_fixed, A1, A2, kb, kd, knt, t0, tmax,
             )
         fit_model = _wrap
-        free_indices = [1, 2, 3, 4, 5, 6]
+        free_indices = [1, 2, 3, 4, 5, 6, 7]
     else:
-        # 7-param fit: drop only tmax (7)
-        def _wrap(t, A0, A1, A2, kb, kd, knt, t0):
-            return proxyl_kinetic_model_extended(
-                t, A0, A1, A2, kb, kd, knt, t0, tmax_fixed,
-            )
-        fit_model = _wrap
-        free_indices = [0, 1, 2, 3, 4, 5, 6]
+        # 8-param free fit
+        fit_model = proxyl_kinetic_model_extended
+        free_indices = [0, 1, 2, 3, 4, 5, 6, 7]
 
     fit_p0 = [p0[i] for i in free_indices]
     fit_lower = [lower_bounds[i] for i in free_indices]
     fit_upper = [upper_bounds[i] for i in free_indices]
 
     def _expand_to_8(popt_, pcov_):
-        """Insert fixed A0/tmax values back into popt/pcov so the rest
-        of the function sees canonical 8-element shapes regardless of
-        which params were actually fit. Pcov rows/cols for fixed params
-        are zero (no fit-derived uncertainty for fixed values). tmax is
-        always fixed in this build, so index 7 is always filled from
-        tmax_fixed; A0 (index 0) is filled when pre-injection data was
-        supplied.
+        """Insert the fixed A0 value back into popt/pcov so the rest of
+        the function sees canonical 8-element shapes regardless of which
+        params were actually fit. Pcov rows/cols for fixed A0 are zero
+        (no fit-derived uncertainty). When A0 is also free (no pre-
+        injection data), we pass through unchanged.
         """
+        if not fix_a0:
+            return popt_, pcov_
         full_popt = np.zeros(8)
-        if fix_a0:
-            full_popt[0] = A0_fixed
-        full_popt[7] = tmax_fixed
+        full_popt[0] = A0_fixed
         for i, fi in enumerate(free_indices):
             full_popt[fi] = popt_[i]
         full_pcov = np.zeros((8, 8))
@@ -796,7 +771,7 @@ def print_fit_summary(fit_results: Dict) -> None:
     print(f"  kd (decay rate):         {fit_results['kd']:.4f} ± {fit_results['kd_error']:.4f} /{fit_results['time_units']}")
     print(f"  knt (non-tracer rate):   {fit_results['knt']:.4f} ± {fit_results['knt_error']:.4f} /{fit_results['time_units']}")
     print(f"  t0 (tracer onset):       {fit_results['t0']:.2f} ± {fit_results['t0_error']:.2f} {fit_results['time_units']}")
-    print(f"  tmax (NTE onset, fixed): {fit_results['tmax']:.2f} {fit_results['time_units']}  [pinned to argmax(signal)]")
+    print(f"  tmax (non-tracer onset): {fit_results['tmax']:.2f} ± {fit_results['tmax_error']:.2f} {fit_results['time_units']}")
     print()
     print("Fit Quality:")
     print(f"  R-squared:         {fit_results['r_squared']:.4f}")
