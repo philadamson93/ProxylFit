@@ -195,6 +195,14 @@ class StudyVOIs:
     scanner_to_patient: np.ndarray = field(
         default_factory=lambda: np.eye(4, dtype=float)
     )
+    # Translation (mm) applied to the VOI position before
+    # ``scanner_to_patient``. Captures the rigid T2→T1 motion-correction
+    # offset for sessions where STEAM was prescribed on the unregistered
+    # T2 image — without it the cube lands at the pre-registration
+    # location, off by the inter-acquisition motion.
+    t2_to_t1_translation_mm: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=float)
+    )
     voi: List[SteamVOI] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -204,6 +212,9 @@ class StudyVOIs:
             "scanner_to_patient": [
                 [float(x) for x in row] for row in self.scanner_to_patient
             ],
+            "t2_to_t1_translation_mm": [
+                float(x) for x in self.t2_to_t1_translation_mm
+            ],
             "voi": [v.to_dict() for v in self.voi],
         }
 
@@ -212,10 +223,14 @@ class StudyVOIs:
         m = np.asarray(
             d.get("scanner_to_patient", np.eye(4).tolist()), dtype=float
         ).reshape(4, 4)
+        t2_t1 = np.asarray(
+            d.get("t2_to_t1_translation_mm", [0.0, 0.0, 0.0]), dtype=float
+        ).reshape(3)
         return cls(
             schema_version=int(d.get("schema_version", 1)),
             subject_id=d.get("subject_id"),
             scanner_to_patient=m,
+            t2_to_t1_translation_mm=t2_t1,
             voi=[SteamVOI.from_dict(v) for v in d.get("voi", [])],
         )
 
@@ -674,29 +689,20 @@ def parse_bruker_method(method_path: Path) -> Dict[str, Any]:
                 f"{k} not found in {method_path} — not a STEAM VOI file?"
             )
 
-    position_raw = _floats(params["PVM_VoxArrPosition"], 3)
+    position = _floats(params["PVM_VoxArrPosition"], 3)
     size = _floats(params["PVM_VoxArrSize"], 3)
     orient_flat = _floats(params["PVM_VoxArrGradOrient"], 9)
-    orientation_raw = orient_flat.reshape(3, 3)
+    orientation = orient_flat.reshape(3, 3)
 
-    # Per-VOI normalization: PVM_VoxArrPosition is recorded in the
-    # gradient-axis order specified by PVM_VoxExcOrder (Read_Phase_Slice
-    # → body axis tokens). Two STEAM voxels in the same session can use
-    # different orderings (e.g. tumor=RL_AP_HF, contralateral=AP_RL_HF).
-    # Normalizing both to a canonical (RL, AP, HF) frame here means one
-    # user-tuned ``scanner_to_patient`` works for every voxel.
+    # PVM_VoxArrPosition is in scanner XYZ (the magnet frame, fixed for
+    # the whole session). PVM_VoxArrGradOrient rows are the (Read,
+    # Phase, Slice) gradient axes expressed in that same scanner XYZ.
+    # We keep both as recorded; PVM_VoxExcOrder is stored as
+    # provenance so ``derive_scanner_to_patient_from_gradient`` can
+    # later map this voxel's gradients to body axes deterministically.
     exc_order = params.get("PVM_VoxExcOrder", "") or ""
     if isinstance(exc_order, list):  # array form (unlikely but defensive)
         exc_order = ""
-    perm, signs = _exc_order_to_perm(exc_order)
-    P = _signed_perm_matrix(perm, signs)[:3, :3]
-    position = P @ position_raw
-    # orientation maps scanner → RPS; we replace scanner with canonical
-    # scanner via post-multiply by P^T:
-    #   q_RPS = orientation_raw @ delta_recorded_scanner
-    #         = orientation_raw @ (P^T @ delta_canonical_scanner)
-    #         = (orientation_raw @ P^T) @ delta_canonical_scanner
-    orientation = orientation_raw @ P.T
 
     return {
         "method": method_str or "Bruker:STEAM",
@@ -956,6 +962,7 @@ def voi_to_mask(
     voi: SteamVOI,
     geom: T1Geometry,
     scanner_to_patient: Optional[np.ndarray] = None,
+    t2_to_t1_translation_mm: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Rasterize a VOI to a 3D boolean mask aligned with a T1 grid.
 
@@ -993,6 +1000,19 @@ def voi_to_mask(
     effective = voi.effective_transform(scanner_to_patient)
 
     pts_patient = _grid_patient_coords(geom)  # (nx, ny, nz, 3)
+
+    # Optional T2→T1 motion-correction translation interpreted in
+    # *patient LPS* (not scanner XYZ). STEAM was prescribed in the
+    # un-registered T2 frame; the T2 registration translated it onto
+    # T1 anatomy. Applying the shift in patient space — by translating
+    # the T1 grid points by -t (equivalent to shifting every VOI by
+    # +t in patient space) — guarantees both tumor and contralateral
+    # move together in L/P/S regardless of their per-VOI
+    # ``scanner_to_patient`` mappings.
+    if t2_to_t1_translation_mm is not None:
+        t_lps = np.asarray(t2_to_t1_translation_mm, dtype=float).reshape(3)
+        if np.any(t_lps):
+            pts_patient = pts_patient - t_lps
 
     if voi.frame == "patient_lps":
         pts_frame = pts_patient
@@ -1354,11 +1374,246 @@ def auto_detect_scanner_to_patient(
     return _signed_perm_matrix(best_perm, best_signs), scores
 
 
+# ---------------------------------------------------------------------------
+# Deterministic scanner→patient derivation from gradient metadata
+# ---------------------------------------------------------------------------
+
+# Body-axis token → (DICOM LPS axis index, sign in LPS).
+# Patient LPS axes: 0=L (left), 1=P (posterior), 2=S (superior).
+#   +RL (right→left)        = +L direction → (0, +1)
+#   +LR (left→right)        = -L direction → (0, -1)
+#   +AP (anterior→posterior)= +P direction → (1, +1)
+#   +PA                     = -P direction → (1, -1)
+#   +HF (head→foot)         = -S direction → (2, -1) (foot = inferior)
+#   +FH (foot→head)         = +S direction → (2, +1)
+_BODY_TOKEN_TO_LPS: Dict[str, Tuple[int, int]] = {
+    "RL": (0, +1), "LR": (0, -1),
+    "AP": (1, +1), "PA": (1, -1),
+    "HF": (2, -1), "FH": (2, +1),
+}
+
+
+def derive_scanner_to_patient_from_gradient(
+    voi: SteamVOI,
+    voxel_exc_order: Optional[str] = None,
+) -> Optional[np.ndarray]:
+    """Derive ``scanner_to_patient`` deterministically from Bruker metadata.
+
+    Uses ``PVM_VoxArrGradOrient`` (rows = Read / Phase / Slice gradient
+    axes expressed in scanner XYZ) and ``PVM_VoxExcOrder`` (which body
+    axis each gradient is along — e.g. ``AP_RL_HF``) to compute the
+    rotation/sign-flip mapping from Bruker scanner XYZ to DICOM patient
+    LPS. The result should be identical for every voxel in a session,
+    because scanner XYZ is the magnet frame and is fixed for the scan.
+
+    Algorithm
+    ---------
+    For each gradient row ``i`` of ``voi.orientation``:
+
+    1. Find the dominant scanner component (``argmax(|row|)``); that is
+       the scanner axis the gradient is most aligned with.
+    2. The sign of that component is the gradient's polarity in
+       scanner XYZ.
+    3. The corresponding ``PVM_VoxExcOrder`` token maps the gradient to
+       a body axis with its own sign convention (``+AP`` = ``+P``,
+       ``+HF`` = ``-S``, etc.).
+    4. Combining: patient-axis ``k`` aligns with scanner-axis ``j`` with
+       sign ``scanner_sign × body_sign``.
+
+    Parameters
+    ----------
+    voi : SteamVOI
+        VOI carrying the raw scanner-XYZ ``orientation`` matrix.
+    voxel_exc_order : str, optional
+        ``PVM_VoxExcOrder`` string. If omitted, pulled from
+        ``voi.source["voxel_exc_order"]``.
+
+    Returns
+    -------
+    np.ndarray, shape (4, 4), or None
+        The derived scanner→patient affine. Returns ``None`` when:
+
+        - ``voxel_exc_order`` is missing or malformed,
+        - any token isn't one of RL/LR/AP/PA/HF/FH,
+        - two gradients share the same dominant scanner axis (heavily
+          rotated voxel — ambiguous; fall back to ``auto_detect`` or
+          manual override),
+        - one of the body axes can't be assigned.
+
+    Notes
+    -----
+    Off-diagonal components of ``voi.orientation`` represent the
+    fine-grained voxel rotation around the dominant scanner axes. They
+    are captured in the orientation matrix used by ``voi_to_mask``;
+    the derived ``scanner_to_patient`` only encodes the coarse
+    body-to-scanner mapping, which is what we want.
+    """
+    if voxel_exc_order is None:
+        voxel_exc_order = voi.source.get("voxel_exc_order", "")
+    if not voxel_exc_order:
+        return None
+    tokens = voxel_exc_order.split("_")
+    if len(tokens) != 3 or any(t not in _BODY_TOKEN_TO_LPS for t in tokens):
+        return None
+
+    abs_M = np.abs(np.asarray(voi.orientation, dtype=float))
+    best_perm, best_score = _best_global_assignment(abs_M)
+    if best_perm is None:
+        return None  # degenerate matrix
+
+    # Build scanner_to_patient: patient = M @ scanner.
+    # For each gradient row i, the best-assigned scanner axis tells us
+    # which scanner axis that row's direction is most aligned with;
+    # the sign of the orientation[i, best_perm[i]] gives the polarity
+    # of the gradient in scanner XYZ; combining with the body-token
+    # sign yields the M entry for the body axis the token names.
+    M = np.zeros((4, 4), dtype=float)
+    M[3, 3] = 1.0
+    for grad_idx, token in enumerate(tokens):
+        body_axis, body_sign = _BODY_TOKEN_TO_LPS[token]
+        scanner_axis = int(best_perm[grad_idx])
+        value = float(voi.orientation[grad_idx, scanner_axis])
+        scanner_sign = int(np.sign(value) or 1)
+        M[body_axis, scanner_axis] = float(scanner_sign * body_sign)
+    return M
+
+
+def _best_global_assignment(
+    abs_M: np.ndarray,
+) -> Tuple[Optional[Tuple[int, int, int]], float]:
+    """Find the row→column assignment that maximises total magnitude.
+
+    For a 3×3 matrix of non-negative magnitudes, enumerate all 6 row
+    permutations and return ``(perm, score)`` where
+    ``score = sum_i abs_M[i, perm[i]]``. Replaces the per-row
+    ``argmax`` heuristic, which fails for voxels rotated ~45° between
+    two scanner axes (two rows fight over the same dominant axis).
+    """
+    from itertools import permutations
+
+    best_perm: Optional[Tuple[int, int, int]] = None
+    best_score = -1.0
+    for perm in permutations(range(3)):
+        score = float(sum(abs_M[i, perm[i]] for i in range(3)))
+        if score > best_score:
+            best_score = score
+            best_perm = tuple(int(x) for x in perm)
+    # If multiple rows are zero (degenerate matrix), bail out.
+    if best_perm is None or best_score <= 0:
+        return None, 0.0
+    return best_perm, best_score
+
+
+def diagnose_gradient_derivation(
+    voi: SteamVOI,
+    voxel_exc_order: Optional[str] = None,
+) -> str:
+    """Return a multi-line diagnostic explaining whether — and why —
+    :func:`derive_scanner_to_patient_from_gradient` would succeed.
+
+    Walks the same logic but reports each step in human-readable
+    terms so the UI can show a precise failure mode (missing token,
+    malformed token, unknown axis label, ambiguous dominant axes,
+    borderline rotation) instead of a generic "couldn't derive".
+    """
+    if voxel_exc_order is None:
+        voxel_exc_order = voi.source.get("voxel_exc_order", "")
+
+    lines: List[str] = [
+        f"VOI label:        {voi.label!r}",
+        f"PVM_VoxExcOrder:  {voxel_exc_order!r}",
+        "",
+    ]
+
+    if not voxel_exc_order:
+        lines.append("Status: MISSING — no PVM_VoxExcOrder in method file.")
+        lines.append(
+            "Need a token like 'AP_RL_HF' to know which body axis each "
+            "gradient runs along."
+        )
+        return "\n".join(lines)
+
+    tokens = voxel_exc_order.split("_")
+    if len(tokens) != 3:
+        lines.append(
+            f"Status: MALFORMED — expected 3 tokens, got {len(tokens)}."
+        )
+        return "\n".join(lines)
+
+    unknown = [t for t in tokens if t not in _BODY_TOKEN_TO_LPS]
+    if unknown:
+        lines.append(f"Status: UNKNOWN TOKEN(S): {unknown}")
+        lines.append("Expected one of: RL, LR, AP, PA, HF, FH for each.")
+        return "\n".join(lines)
+
+    grad_names = ("Read", "Phase", "Slice")
+    axis_names = ("X", "Y", "Z")
+
+    abs_M = np.abs(np.asarray(voi.orientation, dtype=float))
+    best_perm, best_score = _best_global_assignment(abs_M)
+
+    lines.append("Global row→scanner-axis assignment:")
+    lines.append("(maximises total magnitude across all three rows;")
+    lines.append(" robust to 45° voxel rotations where one row alone")
+    lines.append(" can't pick between two scanner axes)")
+    lines.append("")
+
+    if best_perm is None:
+        lines.append("Status: DEGENERATE — orientation matrix is all-zero.")
+        return "\n".join(lines)
+
+    # Show the chosen assignment plus the (would-be) alternatives for
+    # the user to sanity-check the rotation.
+    second_perm, second_score = None, -1.0
+    from itertools import permutations
+    for perm in permutations(range(3)):
+        if perm == best_perm:
+            continue
+        score = float(sum(abs_M[i, perm[i]] for i in range(3)))
+        if score > second_score:
+            second_score = score
+            second_perm = tuple(int(x) for x in perm)
+
+    for i, token in enumerate(tokens):
+        row = np.asarray(voi.orientation[i, :], dtype=float)
+        assigned = best_perm[i]
+        value = float(row[assigned])
+        sign_str = "+" if value >= 0 else "-"
+        # Also surface the per-row dominant for comparison.
+        per_row_dom = int(np.argmax(np.abs(row)))
+        per_row_val = float(row[per_row_dom])
+        same = "" if per_row_dom == assigned else (
+            f"  (per-row dominant would have been "
+            f"{'+' if per_row_val >= 0 else '-'}{axis_names[per_row_dom]} = "
+            f"{per_row_val:+.3f})"
+        )
+        lines.append(
+            f"  {grad_names[i]:5s} ({token:2s}) → {sign_str}{axis_names[assigned]}"
+            f"   value={value:+.3f}{same}"
+        )
+
+    lines.append("")
+    margin = best_score - second_score
+    lines.append(
+        f"Status: SUCCESS — best assignment score {best_score:.3f}, "
+        f"next-best {second_score:.3f} (margin {margin:.3f})."
+    )
+    if margin < 0.15:
+        lines.append(
+            "(Margin is small — the voxel is rotated enough that the "
+            "best and next-best assignments are close. Verify the box "
+            "lands on anatomy; if not, fall back to 'Auto-detect "
+            "(overlap search)'.)"
+        )
+    return "\n".join(lines)
+
+
 def voi_to_polygon(
     voi: SteamVOI,
     z_index: int,
     geom: T1Geometry,
     scanner_to_patient: Optional[np.ndarray] = None,
+    t2_to_t1_translation_mm: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
     """Analytic intersection of the VOI cube with a single T1 z-slice.
 
@@ -1416,6 +1671,13 @@ def voi_to_polygon(
         corners_patient = corners_frame @ M.T + t
     else:
         raise ValueError(f"unknown VOI frame: {voi.frame!r}")
+
+    # Apply the T2→T1 motion correction in patient LPS — same shift
+    # for all VOIs, ensuring tumor and contralateral move together.
+    if t2_to_t1_translation_mm is not None:
+        t_lps = np.asarray(t2_to_t1_translation_mm, dtype=float).reshape(3)
+        if np.any(t_lps):
+            corners_patient = corners_patient + t_lps
 
     # patient → voxel-index: project (patient - origin) onto each voxel
     # axis (column of direction) and divide by spacing.

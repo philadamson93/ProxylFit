@@ -22,6 +22,8 @@ from proxyl_analysis.steam_voi import (
     auto_detect_scanner_to_patient,
     cluster_to_voi,
     cluster_voi_acquisitions,
+    derive_scanner_to_patient_from_gradient,
+    diagnose_gradient_derivation,
     group_clusters_by_timepoint,
     load_voi_json,
     parse_bruker_method,
@@ -691,6 +693,165 @@ class TestAutoDetectTransform:
         best, scores = auto_detect_scanner_to_patient([voi], t1, geom)
         np.testing.assert_allclose(best, np.eye(4))
         assert len(scores) == 1
+
+
+# ---------------------------------------------------------------------------
+# Deterministic gradient-derived scanner→patient
+# ---------------------------------------------------------------------------
+
+class TestDeriveScannerToPatientFromGradient:
+
+    def _make_voi(self, orientation, exc_order):
+        return SteamVOI(
+            label="x",
+            method="Bruker:STEAM",
+            frame="bruker_scanner",
+            position_mm=np.zeros(3),
+            size_mm=np.array([3.0, 3.0, 3.0]),
+            orientation=np.asarray(orientation, dtype=float),
+            source={
+                "kind": "bruker_method",
+                "voxel_exc_order": exc_order,
+            },
+        )
+
+    def test_axis_aligned_rl_ap_hf_yields_z_flip(self):
+        """Canonical RL_AP_HF with identity orientation: only HF needs
+        flipping for patient LPS (head→foot is -S)."""
+        voi = self._make_voi(np.eye(3), "RL_AP_HF")
+        M = derive_scanner_to_patient_from_gradient(voi)
+        np.testing.assert_allclose(M[:3, :3], np.diag([1, 1, -1]))
+
+    def test_ap_rl_hf_with_permuted_rows(self):
+        """AP_RL_HF where Read is along scanner +Y, Phase along +X,
+        Slice along +Z. Should yield: patient_L = +X, patient_P = +Y,
+        patient_S = -Z."""
+        orient = np.array([
+            [0.0, 1.0, 0.0],   # Read = AP, along scanner +Y
+            [1.0, 0.0, 0.0],   # Phase = RL, along scanner +X
+            [0.0, 0.0, 1.0],   # Slice = HF, along scanner +Z
+        ])
+        voi = self._make_voi(orient, "AP_RL_HF")
+        M = derive_scanner_to_patient_from_gradient(voi)
+        # patient_L (axis 0) = +scanner_X → M[0, 0] = +1
+        # patient_P (axis 1) = +scanner_Y → M[1, 1] = +1
+        # patient_S (axis 2) = -scanner_Z → M[2, 2] = -1
+        np.testing.assert_allclose(M[:3, :3], np.diag([1, 1, -1]))
+
+    def test_polarity_flip(self):
+        """Read along scanner -X with LR token: result should flip X."""
+        # LR token = -L direction, so +scanner_X for LR means -L → flip X
+        orient = np.array([
+            [1.0, 0.0, 0.0],   # Read = LR, along scanner +X (so +X = -L direction)
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        voi = self._make_voi(orient, "LR_AP_HF")
+        M = derive_scanner_to_patient_from_gradient(voi)
+        # +X gradient = +LR = -L direction → patient_L = -scanner_X
+        # Y stays as AP = +P → patient_P = +scanner_Y
+        # Z stays as HF = -S → patient_S = -scanner_Z
+        np.testing.assert_allclose(M[:3, :3], np.diag([-1, 1, -1]))
+
+    def test_user_reference_matrix(self):
+        """Use the matrix the user posted to confirm we derive
+        diag(+1, -1, -1) (per the worked example in chat)."""
+        orient = np.array([
+            [0.32580509868992297, -0.84801041747392092, 0.418006422825483],
+            [0.91987465606183, 0.18221400122714371, -0.34731639018612398],
+            [0.21836129419559303, 0.49767096520944482, 0.83942954176316897],
+        ])
+        voi = self._make_voi(orient, "AP_RL_HF")
+        M = derive_scanner_to_patient_from_gradient(voi)
+        np.testing.assert_allclose(M[:3, :3], np.diag([1, -1, -1]))
+
+    def test_missing_exc_order_returns_none(self):
+        voi = self._make_voi(np.eye(3), "")
+        assert derive_scanner_to_patient_from_gradient(voi) is None
+
+    def test_malformed_exc_order_returns_none(self):
+        voi = self._make_voi(np.eye(3), "FOO_BAR_BAZ")
+        assert derive_scanner_to_patient_from_gradient(voi) is None
+
+    def test_global_assignment_resolves_45deg_ambiguity(self):
+        """When two rows nearly tie on the same scanner axis, global
+        assignment still finds a unique row→axis matching by
+        maximising total magnitude — no longer returns None."""
+        orient = np.array([
+            [0.643, -0.642, 0.418],   # Read=RL near-tie X/Y, but Y wins globally
+            [0.766, 0.541, -0.347],   # Phase=AP — clearly on X
+            [-0.003, 0.543, 0.839],   # Slice=HF — Z dominant
+        ])
+        voi = self._make_voi(orient, "RL_AP_HF")
+        M = derive_scanner_to_patient_from_gradient(voi)
+        assert M is not None
+        # Best assignment is (Y, X, Z): RL→Y, AP→X, HF→Z.
+        # patient_L (axis 0) sits on scanner Y, patient_P (axis 1) on
+        # scanner X, patient_S (axis 2) on scanner Z.
+        # Read row Y value -0.642 (sign -); body_sign for RL is +1.
+        #   → M[0, 1] = -1 * +1 = -1
+        # Phase row X value +0.766; AP body_sign +1.
+        #   → M[1, 0] = +1
+        # Slice row Z value +0.839; HF body_sign -1.
+        #   → M[2, 2] = -1
+        # All other M[k, j] = 0.
+        np.testing.assert_allclose(M[0, 1], -1.0)
+        np.testing.assert_allclose(M[1, 0], +1.0)
+        np.testing.assert_allclose(M[2, 2], -1.0)
+        # Other entries are zero.
+        assert M[0, 0] == 0 and M[0, 2] == 0
+        assert M[1, 1] == 0 and M[1, 2] == 0
+        assert M[2, 0] == 0 and M[2, 1] == 0
+
+
+class TestDiagnoseGradientDerivation:
+
+    def _make_voi(self, orientation, exc_order):
+        return SteamVOI(
+            label="x",
+            method="Bruker:STEAM",
+            frame="bruker_scanner",
+            position_mm=np.zeros(3),
+            size_mm=np.array([3.0, 3.0, 3.0]),
+            orientation=np.asarray(orientation, dtype=float),
+            source={"voxel_exc_order": exc_order},
+        )
+
+    def test_missing_exc_order_reports_missing(self):
+        voi = self._make_voi(np.eye(3), "")
+        diag = diagnose_gradient_derivation(voi)
+        assert "MISSING" in diag
+
+    def test_malformed_exc_order_reports_malformed(self):
+        voi = self._make_voi(np.eye(3), "AP_RL")
+        diag = diagnose_gradient_derivation(voi)
+        assert "MALFORMED" in diag
+
+    def test_unknown_token_reports_unknown(self):
+        voi = self._make_voi(np.eye(3), "FOO_AP_HF")
+        diag = diagnose_gradient_derivation(voi)
+        assert "UNKNOWN" in diag
+
+    def test_global_assignment_reports_chosen_axes(self):
+        """The diagnostic now reports the global row→axis assignment
+        and surfaces per-row dominants only when they would have
+        disagreed."""
+        orient = np.array([
+            [0.643, -0.642, 0.418],
+            [0.766, 0.541, -0.347],
+            [-0.003, 0.543, 0.839],
+        ])
+        voi = self._make_voi(orient, "RL_AP_HF")
+        diag = diagnose_gradient_derivation(voi)
+        assert "Status: SUCCESS" in diag
+        # Read row's per-row dominant (X) differs from the chosen
+        # assigned axis (Y) — the diagnostic should call that out.
+        assert "per-row dominant would have been" in diag
+
+    def test_success_reports_success(self):
+        voi = self._make_voi(np.eye(3), "RL_AP_HF")
+        diag = diagnose_gradient_derivation(voi)
+        assert "SUCCESS" in diag
 
 
 def test_voi_to_polygon_returns_outline_when_slice_intersects():

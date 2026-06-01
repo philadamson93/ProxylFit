@@ -67,7 +67,7 @@ from ..steam_voi import (
     scan_bruker_study,
     voi_to_polygon,
 )
-from .styles import PROXYLFIT_STYLE
+from .styles import PROXYLFIT_STYLE, apply_brain_axes
 
 
 class SteamVoiLoaderDialog(QDialog):
@@ -112,6 +112,7 @@ class SteamVoiLoaderDialog(QDialog):
         self.clusters: List[Dict[str, Any]] = []
         self.timepoint_groups: List[List[Dict[str, Any]]] = []
         self.scanner_to_patient = np.eye(4)
+        self.t2_to_t1_translation_mm = np.zeros(3, dtype=float)
         self.tumor_voi: Optional[SteamVOI] = None
         self.contralateral_voi: Optional[SteamVOI] = None
         self.subject_id: Optional[str] = None
@@ -278,16 +279,241 @@ class SteamVoiLoaderDialog(QDialog):
         flip_row.addStretch()
         gl.addLayout(flip_row)
 
-        auto = QPushButton("Auto-detect")
+        # T2→T1 motion-correction translation in *patient LPS*. STEAM
+        # is prescribed on the pre-registration T2; this offset moves
+        # every prescribed voxel onto T1 anatomy by the same amount,
+        # regardless of each voxel's own scanner→patient transform.
+        # Tumor and contralateral always move together.
+        from PySide6.QtWidgets import QDoubleSpinBox
+        gl.addSpacing(4)
+        gl.addWidget(QLabel("<b>T2 → T1 translation (patient LPS, mm)</b>"))
+        t2t1_row = QHBoxLayout()
+        self.t2_to_t1_spins = {}
+        # Labels match DICOM patient LPS: L = patient-left, P = posterior,
+        # S = superior. Positive values shift in those directions.
+        spin_specs = [
+            ("L", "Left/Right axis (mm). +L = patient's left side; "
+                  "−L = patient's right."),
+            ("P", "Anterior/Posterior axis (mm). +P = posterior "
+                  "(back); −P = anterior."),
+            ("S", "Superior/Inferior axis (mm). +S = superior "
+                  "(toward head); −S = inferior (toward foot)."),
+        ]
+        for label, tip in spin_specs:
+            t2t1_row.addWidget(QLabel(f"{label}:"))
+            spin = QDoubleSpinBox()
+            spin.setRange(-50.0, 50.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.1)
+            spin.setValue(0.0)
+            spin.setToolTip(tip)
+            spin.valueChanged.connect(lambda _v: self._on_t2t1_changed())
+            t2t1_row.addWidget(spin)
+            self.t2_to_t1_spins[label] = spin
+        t2t1_row.addStretch()
+        gl.addLayout(t2t1_row)
+
+        derive = QPushButton("Derive from gradient")
+        derive.setToolTip(
+            "Compute scanner→patient deterministically from the active "
+            "VOI's PVM_VoxArrGradOrient + PVM_VoxExcOrder (no trial and "
+            "error). Falls back to manual flips for heavily-rotated voxels."
+        )
+        derive.clicked.connect(self._on_derive_from_gradient)
+        gl.addWidget(derive)
+
+        auto = QPushButton("Auto-detect (overlap search)")
         auto.setToolTip(
-            "Try all axis-flip combinations and pick the one whose VOIs "
-            "best overlap T1 anatomy."
+            "Try all 48 axis-permutation/sign-flip combinations and pick "
+            "the one whose VOIs best overlap T1 anatomy. Use when 'Derive "
+            "from gradient' can't decide (heavily rotated voxels)."
         )
         auto.clicked.connect(self._on_auto_detect)
         gl.addWidget(auto)
 
         gl.addStretch()
         return group
+
+    def _backfill_exc_order(self, voi):
+        """Try to fill in voi.source['voxel_exc_order'] when missing.
+
+        Older versions of the parser didn't record this token in the
+        VOI's source dict. For JSONs saved before that change we can
+        usually re-read the original Bruker method file to recover it
+        (the source.path field still points there). Silently no-ops if
+        the file isn't reachable — the user will be prompted on
+        derive-from-gradient as a final fallback.
+        """
+        if voi.source.get("voxel_exc_order"):
+            return
+        src_path = voi.source.get("path")
+        if not src_path:
+            return
+        try:
+            from ..steam_voi import _parse_bruker_params
+            params = _parse_bruker_params(Path(src_path))
+            exc_order = params.get("PVM_VoxExcOrder", "")
+            if isinstance(exc_order, str) and exc_order:
+                voi.source["voxel_exc_order"] = exc_order
+        except Exception:  # pragma: no cover — file may be moved
+            pass
+
+    def _prompt_for_exc_order(self, voi) -> bool:
+        """Ask the user to type the PVM_VoxExcOrder for a VOI.
+
+        Used when backfill from disk failed (Bruker method file moved
+        or never written into the JSON). Returns True if the user
+        supplied a value and it was applied to ``voi.source``.
+        """
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self,
+            "PVM_VoxExcOrder",
+            (
+                f"VOI {voi.label!r} has no PVM_VoxExcOrder recorded.\n\n"
+                "Paste the value from the Bruker method file, e.g.\n"
+                "    AP_RL_HF   or   RL_AP_HF   or   HF_AP_RL\n\n"
+                "(One token per gradient axis: Read_Phase_Slice.)"
+            ),
+        )
+        if ok and text.strip():
+            voi.source["voxel_exc_order"] = text.strip()
+            return True
+        return False
+
+    def _on_derive_from_gradient(self):
+        """Apply the deterministic gradient-derived transform.
+
+        Pulls PVM_VoxArrGradOrient + PVM_VoxExcOrder from whichever VOI
+        the target combo points at and writes the result to that
+        target's transform (per-VOI override or the study default).
+        When target is "both", derives each VOI independently and
+        applies per-VOI overrides when their derived transforms differ
+        (e.g. different PVM_VoxExcOrder between tumor and contralateral).
+        """
+        from ..steam_voi import derive_scanner_to_patient_from_gradient
+
+        target = self.transform_target_combo.currentData() if hasattr(
+            self, "transform_target_combo"
+        ) else "both"
+
+        # "Both" mode: derive each VOI independently and reconcile.
+        if target == "both":
+            self._derive_both_vois_independently()
+            return
+
+        if target == "tumor":
+            voi = self.tumor_voi
+        elif target == "contralateral":
+            voi = self.contralateral_voi
+        else:
+            voi = self.tumor_voi or self.contralateral_voi
+        if voi is None:
+            QMessageBox.information(
+                self, "No VOI",
+                "Assign tumor / contralateral first, then derive."
+            )
+            return
+        M = derive_scanner_to_patient_from_gradient(voi)
+        if M is None:
+            # Try to recover when exc_order is just missing — first by
+            # re-reading the method file, then by asking the user.
+            self._backfill_exc_order(voi)
+            if not voi.source.get("voxel_exc_order"):
+                if self._prompt_for_exc_order(voi):
+                    pass  # try again below
+            M = derive_scanner_to_patient_from_gradient(voi)
+        if M is None:
+            from ..steam_voi import diagnose_gradient_derivation
+            diagnostic = diagnose_gradient_derivation(voi)
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Could not derive transform")
+            msg.setText("Deterministic derivation failed for this VOI.")
+            msg.setInformativeText(diagnostic)
+            # Use a monospace font so the alignment in the diagnostic
+            # block lines up.
+            from PySide6.QtGui import QFont
+            for child in msg.findChildren(QLabel):
+                child.setFont(QFont("Menlo", 11))
+            msg.exec()
+            return
+        self._apply_transform_to_target(M)
+        self._refresh_transform_label()
+        self._update_preview()
+
+    def _derive_both_vois_independently(self):
+        """Derive a transform per VOI; apply shared if they agree, else per-VOI."""
+        from ..steam_voi import (
+            derive_scanner_to_patient_from_gradient,
+            diagnose_gradient_derivation,
+        )
+        from PySide6.QtGui import QFont
+
+        derived = []  # list of (voi, M)
+        failures = []  # list of (voi, diagnostic)
+        for voi in (self.tumor_voi, self.contralateral_voi):
+            if voi is None:
+                continue
+            self._backfill_exc_order(voi)
+            if not voi.source.get("voxel_exc_order"):
+                if not self._prompt_for_exc_order(voi):
+                    failures.append((voi, "User skipped exc-order prompt."))
+                    continue
+            M = derive_scanner_to_patient_from_gradient(voi)
+            if M is None:
+                failures.append((voi, diagnose_gradient_derivation(voi)))
+            else:
+                derived.append((voi, M))
+
+        if not derived:
+            # All VOIs failed — surface the first failure's diagnostic.
+            voi, diag = failures[0]
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Could not derive transform")
+            msg.setText("Deterministic derivation failed for every VOI.")
+            msg.setInformativeText(diag)
+            for child in msg.findChildren(QLabel):
+                child.setFont(QFont("Menlo", 11))
+            msg.exec()
+            return
+
+        mats = [m for _, m in derived]
+        all_match = all(
+            np.allclose(mats[0][:3, :3], m[:3, :3]) for m in mats[1:]
+        )
+
+        if all_match:
+            # Apply as study-wide default and clear any per-VOI overrides.
+            self.scanner_to_patient = mats[0]
+            for voi, _ in derived:
+                voi.transform = None
+            self._refresh_transform_label()
+            self._update_preview()
+            QMessageBox.information(
+                self, "Derived",
+                f"Both VOIs derived the same transform — applied as study "
+                f"default (and per-VOI overrides cleared)."
+            )
+        else:
+            # Apply as per-VOI overrides.
+            for voi, M in derived:
+                voi.transform = M.copy()
+            self._refresh_transform_label()
+            self._update_preview()
+            details = "\n".join(
+                f"  {voi.label}: order from {voi.source.get('voxel_exc_order', '?')}"
+                for voi, _ in derived
+            )
+            QMessageBox.information(
+                self, "Derived (per-VOI)",
+                "Tumor and contralateral derived different transforms — "
+                "applied as per-VOI overrides. Each box should now sit on "
+                "anatomy without needing manual flips.\n\n" + details +
+                "\n\n(Switch the 'Adjust transform for' combo to inspect "
+                "either VOI's transform individually.)"
+            )
 
     def _on_flip_check_changed(self, _checked=False):
         """Live-update the targeted transform from axis-order + flips."""
@@ -299,6 +525,14 @@ class SteamVoiLoaderDialog(QDialog):
         M = _signed_perm_matrix(perm, signs)
         self._apply_transform_to_target(M)
         self._refresh_transform_label()
+        self._update_preview()
+
+    def _on_t2t1_changed(self):
+        """Mirror the T2→T1 translation spin boxes into state + preview."""
+        self.t2_to_t1_translation_mm = np.array(
+            [self.t2_to_t1_spins[a].value() for a in ("L", "P", "S")],
+            dtype=float,
+        )
         self._update_preview()
 
     def _apply_transform_to_target(self, M: np.ndarray):
@@ -415,9 +649,24 @@ class SteamVoiLoaderDialog(QDialog):
             QMessageBox.warning(self, "Load failed", f"Could not read {path}:\n{e}")
             return
         self.scanner_to_patient = sv.scanner_to_patient
+        self.t2_to_t1_translation_mm = np.asarray(
+            sv.t2_to_t1_translation_mm, dtype=float
+        ).reshape(3)
+        # Sync the spin boxes (block signals to avoid recursive update).
+        if hasattr(self, "t2_to_t1_spins"):
+            for axis, val in zip("LPS", self.t2_to_t1_translation_mm):
+                spin = self.t2_to_t1_spins[axis]
+                spin.blockSignals(True)
+                spin.setValue(float(val))
+                spin.blockSignals(False)
         self.subject_id = sv.subject_id
         self.tumor_voi = sv.by_label("tumor")
         self.contralateral_voi = sv.by_label("contralateral")
+        # Backfill voxel_exc_order from the original Bruker method file
+        # for VOIs saved by an earlier version that didn't store this
+        # token. Lets 'Derive from gradient' work without re-scanning.
+        for v in sv.voi:
+            self._backfill_exc_order(v)
         self._refresh_transform_label()
         self._update_preview()
         self.status_label.setText(
@@ -516,16 +765,34 @@ class SteamVoiLoaderDialog(QDialog):
         tumor_ci = self.tumor_combo.currentData()
         contra_ci = self.contra_combo.currentData()
 
-        self.tumor_voi = (
-            cluster_to_voi(clusters[tumor_ci], "tumor")
-            if tumor_ci is not None and tumor_ci < len(clusters)
-            else None
+        # Preserve any per-VOI transforms across reassignment so a fresh
+        # Scan (or label-swap) doesn't wipe the tumor / contralateral
+        # transforms the user just dialed in or loaded from JSON. Click
+        # 'Derive from gradient' or 'Auto-detect' to reset deliberately.
+        prev_tumor_transform = (
+            self.tumor_voi.transform if self.tumor_voi is not None else None
         )
-        self.contralateral_voi = (
-            cluster_to_voi(clusters[contra_ci], "contralateral")
-            if contra_ci is not None and contra_ci < len(clusters)
-            else None
+        prev_contra_transform = (
+            self.contralateral_voi.transform
+            if self.contralateral_voi is not None else None
         )
+
+        if tumor_ci is not None and tumor_ci < len(clusters):
+            self.tumor_voi = cluster_to_voi(clusters[tumor_ci], "tumor")
+            if prev_tumor_transform is not None:
+                self.tumor_voi.transform = prev_tumor_transform.copy()
+        else:
+            self.tumor_voi = None
+
+        if contra_ci is not None and contra_ci < len(clusters):
+            self.contralateral_voi = cluster_to_voi(
+                clusters[contra_ci], "contralateral"
+            )
+            if prev_contra_transform is not None:
+                self.contralateral_voi.transform = prev_contra_transform.copy()
+        else:
+            self.contralateral_voi = None
+
         self.save_btn.setEnabled(
             self.tumor_voi is not None and self.contralateral_voi is not None
         )
@@ -638,6 +905,7 @@ class SteamVoiLoaderDialog(QDialog):
             sl = self.t1_volume[:, :, z].T
             self.ax.imshow(sl, cmap="gray", origin="lower")
             self.ax.set_title(f"T1 slice z={z}", fontsize=10)
+            apply_brain_axes(self.ax)
 
         for voi, color in (
             (self.tumor_voi, "red"),
@@ -647,7 +915,9 @@ class SteamVoiLoaderDialog(QDialog):
                 continue
             transform = voi.effective_transform(self.scanner_to_patient)
             poly = voi_to_polygon(
-                voi, z, self.t1_geometry, scanner_to_patient=transform
+                voi, z, self.t1_geometry,
+                scanner_to_patient=transform,
+                t2_to_t1_translation_mm=self.t2_to_t1_translation_mm,
             )
             if poly is None:
                 continue
@@ -681,6 +951,7 @@ class SteamVoiLoaderDialog(QDialog):
             schema_version=1,
             subject_id=self.subject_id,
             scanner_to_patient=self.scanner_to_patient,
+            t2_to_t1_translation_mm=self.t2_to_t1_translation_mm,
             voi=[self.tumor_voi, self.contralateral_voi],
         )
         out_path = self.output_dir / "steam_voi.json"

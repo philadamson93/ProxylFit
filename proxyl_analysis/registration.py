@@ -3,6 +3,8 @@ Registration module for rigid registration of time-resolved MRI volumes.
 Enhanced with save/load functionality, quality metrics, and visualization.
 """
 
+from __future__ import annotations
+
 import os
 import numpy as np
 import SimpleITK as sitk

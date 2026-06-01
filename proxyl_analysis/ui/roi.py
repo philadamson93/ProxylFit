@@ -17,7 +17,7 @@ from matplotlib.widgets import RectangleSelector
 from matplotlib.patches import Polygon
 from matplotlib.path import Path as MplPath
 
-from .styles import init_qt_app
+from .styles import init_qt_app, apply_brain_axes
 from .components import MatplotlibCanvas, HeaderWidget, InstructionWidget, InfoWidget, ButtonBar
 
 
@@ -96,6 +96,7 @@ class ROISelectorDialog(QDialog):
 
         # Display image
         self.im = self.ax.imshow(self.image_slice.T, cmap='gray', origin='lower')
+        apply_brain_axes(self.ax)
         self.ax.set_xlabel('X')
         self.ax.set_ylabel('Y')
         self.ax.set_title(self._title)
@@ -312,6 +313,7 @@ class ManualContourDialog(QDialog):
         self.ax.clear()
         self.image_slice = self.image_4d[:, :, self.z_index, 0]
         self.im = self.ax.imshow(self.image_slice.T, cmap='gray', origin='lower')
+        apply_brain_axes(self.ax)
         self.ax.set_xlabel('X')
         self.ax.set_ylabel('Y')
         self.ax.set_title(f"{self._title} (Z={self.z_index})")
@@ -432,6 +434,7 @@ class ManualContourDialog(QDialog):
         overlay = self.ax.imshow(mask_overlay, cmap='Reds', alpha=0.4,
                                 origin='lower', extent=self.im.get_extent())
         self.path_plots.append(overlay)
+        apply_brain_axes(self.ax)
 
         # Update info
         num_pixels = np.sum(self.mask)

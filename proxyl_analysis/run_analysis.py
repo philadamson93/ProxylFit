@@ -329,6 +329,7 @@ def main():
         print()
 
         # Show menu with no data loaded
+        _steam_info_seed = None
         result = show_main_menu(
             registered_4d=None,
             spacing=None,
@@ -367,6 +368,9 @@ def main():
                 # Store T2 path for later loading after registration
                 if result.get('t2_path'):
                     args.t2 = result['t2_path']
+                # Persist STEAM tree info so it survives the registration
+                # phase and reaches the in-session menu.
+                _steam_info_seed = result.get('steam_info')
             else:
                 print("No T1 series selected. Exiting.")
                 sys.exit(1)
@@ -649,7 +653,8 @@ def main():
                     dicom_path=args.dicom,
                     output_dir=str(auto_registration_dir),
                     registered_t2=registered_t2,
-                    roi_state=roi_state
+                    roi_state=roi_state,
+                    steam_info=locals().get('_steam_info_seed'),
                 )
 
                 if menu_result is None or menu_result.get('action') == 'exit':
@@ -855,6 +860,57 @@ def main():
                     # Draw ROI -> Extract time series -> Select injection time -> Return to menu
                     args.roi_mode = menu_result['roi_mode']
                     args.z = menu_result['z_slice']
+
+                    # STEAM VOI is a geometric ROI — the mask was
+                    # already rasterized by MainMenuDialog from the
+                    # prescribed Bruker voxel. Skip the drawing step.
+                    if menu_result.get('roi_source') == 'steam':
+                        roi_mask_3d = menu_result.get('steam_mask')
+                        steam_label = menu_result.get('steam_voi_label', 'steam')
+                        if roi_mask_3d is None or not np.any(roi_mask_3d):
+                            print(f"STEAM VOI '{steam_label}' produced an empty mask.")
+                            continue
+                        # Pick the central slice of the VOI for the
+                        # kinetic curve. Sum across (x, y) for each z
+                        # and choose the slice with the largest area.
+                        per_slice = roi_mask_3d.sum(axis=(0, 1))
+                        args.z = int(np.argmax(per_slice))
+                        roi_mask = roi_mask_3d[:, :, args.z]
+                        n_pixels = int(roi_mask.sum())
+                        print(
+                            f"  STEAM VOI '{steam_label}': mask covers "
+                            f"{int(roi_mask_3d.sum())} voxels across "
+                            f"{int((per_slice > 0).sum())} slices; using "
+                            f"z={args.z} ({n_pixels} pixels) for kinetics."
+                        )
+                        roi_signal = compute_roi_timeseries(
+                            registered_4d, roi_mask, z_slice=args.z
+                        )
+                        print(f"  Extracted {len(roi_signal)} time points")
+                        # Continue to injection-time selection (same as drawn ROIs).
+                        injection_idx, steady_state_time, excluded_full = select_injection_time_qt(
+                            time_array, roi_signal, args.time_units,
+                            str(auto_registration_dir),
+                            roi_mask=roi_mask,
+                            reference_image=registered_4d[:, :, :, 0],
+                            roi_z_slice=args.z,
+                            return_steady_state=True,
+                        )
+                        injection_time = time_array[injection_idx]
+                        print(f"  Injection time: {injection_time:.1f} {args.time_units} (index {injection_idx})")
+                        roi_state = {
+                            'roi_mask': roi_mask,
+                            'roi_signal': roi_signal,
+                            'injection_idx': injection_idx,
+                            'injection_time': injection_time,
+                            'z_slice': args.z,
+                            'steady_state_time': steady_state_time,
+                            'excluded_indices': list(excluded_full or []),
+                            'roi_source': 'steam',
+                            'steam_voi_label': steam_label,
+                            'steam_mask_3d': roi_mask_3d,
+                        }
+                        continue  # Back to menu
 
                     # Choose image for ROI selection: T2 (if registered) or T1
                     if registered_t2 is not None and menu_result.get('roi_source') == 't2':
@@ -1164,6 +1220,8 @@ def main():
                                 registered_t2=registered_t2,
                                 time_array=time_array,
                                 dataset_dir=str(auto_registration_dir),
+                                study_vois=menu_result.get('study_vois'),
+                                t1_geometry=locals().get('_t1_geometry'),
                             )
                             print("Returning to menu.")
                             continue
@@ -1173,6 +1231,16 @@ def main():
 
                     # Show parameter map options dialog (T014)
                     print("Opening parameter map options...")
+
+                    # Build T1 geometry once for STEAM-VOI rasterization.
+                    _study_vois = menu_result.get('study_vois')
+                    _t1_geometry = None
+                    if _study_vois is not None:
+                        try:
+                            from .steam_voi import build_t1_geometry_from_dicom
+                            _t1_geometry = build_t1_geometry_from_dicom(args.dicom)
+                        except Exception as e:
+                            print(f"  (STEAM ROI unavailable — geometry build failed: {e})")
 
                     options = show_parameter_map_options(
                         max_z=registered_4d.shape[2] - 1,
@@ -1185,6 +1253,8 @@ def main():
                             if roi_state else 100.0
                         ),
                         time_units=args.time_units,
+                        study_vois=_study_vois,
+                        t1_geometry=_t1_geometry,
                     )
                     # Carry the user's right-clicked exclusions
                     # forward into options so the worker thread can
@@ -1205,7 +1275,25 @@ def main():
                     param_roi_mask = None
                     param_roi_z = None
                     if options['roi_only']:
-                        if options['reuse_roi'] and roi_state is not None:
+                        if options.get('use_steam_roi') and options.get('steam_roi_mask') is not None:
+                            # STEAM VOI fitting region (T024 Phase 4) —
+                            # use the 3D mask the dialog rasterized;
+                            # select the slice with the largest VOI
+                            # cross-section so the representative-curve
+                            # comes from a non-empty in-VOI region.
+                            steam_3d = options['steam_roi_mask']
+                            per_slice = steam_3d.sum(axis=(0, 1))
+                            param_roi_z = int(np.argmax(per_slice))
+                            param_roi_mask = steam_3d[:, :, param_roi_z]
+                            label = options.get('steam_voi_label', 'steam')
+                            print(
+                                f"Using STEAM VOI '{label}' as fitting "
+                                f"region ({int(steam_3d.sum())} voxels "
+                                f"across {int((per_slice > 0).sum())} "
+                                f"slices; z={param_roi_z} = "
+                                f"{int(param_roi_mask.sum())} pixels)"
+                            )
+                        elif options['reuse_roi'] and roi_state is not None:
                             param_roi_mask = roi_state['roi_mask']
                             param_roi_z = roi_state.get('z_slice')
                             print(f"Reusing existing ROI ({np.sum(param_roi_mask)} pixels)")
@@ -1330,6 +1418,8 @@ def main():
                         registered_t2=registered_t2,
                         time_array=time_array,
                         dataset_dir=str(auto_registration_dir),
+                        study_vois=menu_result.get('study_vois'),
+                        t1_geometry=locals().get('_t1_geometry'),
                     )
 
                     # Save parameter maps

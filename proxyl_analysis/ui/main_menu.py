@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame,
     QGroupBox, QSpinBox, QRadioButton, QFileDialog, QMessageBox,
     QScrollArea, QWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QComboBox
+    QComboBox, QLineEdit
 )
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QColor
@@ -42,6 +42,16 @@ class DicomScanResultsDialog(QDialog):
 
         # Map sample_file paths to row indices for highlighting
         self.path_to_row = {}
+
+        # STEAM VOI state — populated when user picks a Bruker tree.
+        # Maps subject_id → {
+        #     "bruker_root": Path,
+        #     "subject_folder": Path,
+        #     "subject_meta": dict,
+        #     "clusters": list,
+        # }
+        self.steam_index: dict = {}
+        self.bruker_root_path: str = ""
 
         self.setWindowTitle("DICOM Scan Results")
         self.setMinimumSize(900, 600)
@@ -154,6 +164,52 @@ class DicomScanResultsDialog(QDialog):
         t2_layout.addWidget(self.t2_combo, stretch=1)
         load_layout.addLayout(t2_layout)
 
+        # STEAM VOI selector (optional). Points at a Bruker raw tree
+        # whose per-subject folders are matched against the DICOM
+        # PROXYL series. See T024 for design rationale.
+        steam_path_layout = QHBoxLayout()
+        steam_path_label = QLabel("Bruker tree:")
+        steam_path_label.setMinimumWidth(80)
+        steam_path_label.setToolTip(
+            "Optional. Root folder containing one or more per-subject "
+            "Bruker ParaVision study folders. Used to extract STEAM VOIs."
+        )
+        steam_path_layout.addWidget(steam_path_label)
+        self.bruker_root_edit = QLineEdit()
+        self.bruker_root_edit.setPlaceholderText(
+            "Optional — path to Bruker root containing per-subject folders"
+        )
+        steam_path_layout.addWidget(self.bruker_root_edit, stretch=1)
+        bruker_browse = QPushButton("Browse…")
+        bruker_browse.clicked.connect(self._on_browse_bruker_root)
+        steam_path_layout.addWidget(bruker_browse)
+        bruker_scan = QPushButton("Scan")
+        bruker_scan.clicked.connect(self._on_scan_bruker_root)
+        steam_path_layout.addWidget(bruker_scan)
+        load_layout.addLayout(steam_path_layout)
+
+        steam_layout = QHBoxLayout()
+        steam_label = QLabel("STEAM VOIs:")
+        steam_label.setMinimumWidth(80)
+        steam_layout.addWidget(steam_label)
+        self.steam_combo = QComboBox()
+        self.steam_combo.addItem("-- None --", None)
+        self.steam_combo.setEnabled(False)
+        steam_layout.addWidget(self.steam_combo, stretch=1)
+        # Indicator (•) reflects auto-match confidence:
+        #   green  = PatientID match
+        #   yellow = StudyDate or ordinal match
+        #   red    = manual / no match
+        self.steam_match_label = QLabel("")
+        self.steam_match_label.setMinimumWidth(20)
+        self.steam_match_label.setToolTip("Auto-match confidence")
+        steam_layout.addWidget(self.steam_match_label)
+        load_layout.addLayout(steam_layout)
+
+        # Auto-follow: when T1 changes, jump STEAM combo to the
+        # matching subject (PatientID → StudyDate → ordinal).
+        self.t1_combo.currentIndexChanged.connect(self._on_t1_changed_auto_follow)
+
         layout.addWidget(load_group)
 
         # Buttons
@@ -244,16 +300,196 @@ class DicomScanResultsDialog(QDialog):
             QMessageBox.warning(self, "No Selection", "Please select at least one series to load.")
             return
 
+        # STEAM info: pass whatever the user has set in the Bruker
+        # tree field — even if they didn't pick a STEAM subject yet —
+        # so the downstream loader dialog can pre-populate the same
+        # path and the user doesn't have to re-browse.
+        steam_subject_id = self.steam_combo.currentData()
+        steam_info = None
+        if self.bruker_root_path:
+            entry = (
+                self.steam_index.get(steam_subject_id)
+                if steam_subject_id else None
+            )
+            steam_info = {
+                'bruker_root': self.bruker_root_path,
+                'subject_id': steam_subject_id,
+                'subject_folder': (
+                    str(entry['subject_folder']) if entry else None
+                ),
+                'auto_load': bool(entry),
+            }
+
         self.result = {
             'action': 'load_from_scan',
             't1_path': t1_path,
-            't2_path': t2_path
+            't2_path': t2_path,
+            'steam_info': steam_info,
         }
         self.accept()
 
     def get_result(self):
         """Get the dialog result."""
         return self.result
+
+    # ------------------------------------------------------------------
+    # Bruker / STEAM auto-follow (T024 Phase 3)
+    # ------------------------------------------------------------------
+
+    def _on_browse_bruker_root(self):
+        """Open a folder picker seeded at the current Bruker root."""
+        seed = self.bruker_root_edit.text() or str(Path(self.folder_path).parent)
+        d = QFileDialog.getExistingDirectory(self, "Pick Bruker root folder", seed)
+        if d:
+            self.bruker_root_edit.setText(d)
+
+    def _on_scan_bruker_root(self):
+        """Walk every subject folder under the Bruker root, find STEAM
+        VOIs, and populate the STEAM combo."""
+        from ..steam_voi import (
+            cluster_voi_acquisitions,
+            parse_bruker_subject,
+            scan_bruker_study,
+        )
+
+        root = self.bruker_root_edit.text().strip()
+        if not root:
+            QMessageBox.warning(self, "No path", "Pick a Bruker root folder first.")
+            return
+        root_path = Path(root)
+        if not root_path.is_dir():
+            QMessageBox.warning(self, "Not found", f"Folder does not exist:\n{root}")
+            return
+
+        # Two cases: root IS a single subject folder, OR root contains
+        # multiple subject folders. Treat both uniformly by including
+        # the root itself plus its immediate subdirectories.
+        candidates = [root_path] + [
+            c for c in sorted(root_path.iterdir()) if c.is_dir()
+        ]
+
+        self.steam_index = {}
+        for subj_folder in candidates:
+            vois = scan_bruker_study(subj_folder)
+            if not vois:
+                continue
+            subj_meta = {}
+            subj_file = subj_folder / "subject"
+            if subj_file.is_file():
+                try:
+                    subj_meta = parse_bruker_subject(subj_file)
+                except Exception:  # pragma: no cover - corrupt subject file
+                    pass
+            subject_id = (
+                subj_meta.get("subject_id")
+                or subj_folder.name
+            )
+            self.steam_index[subject_id] = {
+                'bruker_root': root_path,
+                'subject_folder': subj_folder,
+                'subject_meta': subj_meta,
+                'clusters': cluster_voi_acquisitions(vois, tolerance_mm=0.1),
+                'raw_acquisitions': vois,
+            }
+
+        self.bruker_root_path = root
+        self._refresh_steam_combo()
+
+        n_subjects = len(self.steam_index)
+        if n_subjects == 0:
+            QMessageBox.information(
+                self,
+                "No STEAM",
+                "No STEAM acquisitions found anywhere under this folder.",
+            )
+        else:
+            self._auto_follow_to_t1_subject()
+
+    def _refresh_steam_combo(self):
+        """Repopulate steam_combo from steam_index."""
+        self.steam_combo.blockSignals(True)
+        self.steam_combo.clear()
+        self.steam_combo.addItem("-- None --", None)
+        for subj_id, entry in self.steam_index.items():
+            n_clusters = len(entry['clusters'])
+            n_acqs = len(entry['raw_acquisitions'])
+            label = f"{subj_id}  —  {n_clusters} VOIs / {n_acqs} acqs"
+            self.steam_combo.addItem(label, subj_id)
+        self.steam_combo.setEnabled(self.steam_combo.count() > 1)
+        self.steam_combo.blockSignals(False)
+
+    def _on_t1_changed_auto_follow(self, _index: int):
+        """When the user picks a different T1, follow the STEAM combo
+        to the subject that matches it."""
+        if not self.steam_index:
+            return
+        self._auto_follow_to_t1_subject()
+
+    def _auto_follow_to_t1_subject(self):
+        """Run the PatientID → StudyDate → ordinal cascade and select
+        the matching subject in the STEAM combo.
+
+        Updates ``steam_match_label`` with a coloured indicator:
+        • = green (PatientID match),
+        • = yellow (StudyDate match),
+        • = orange (ordinal match), • = grey (no match).
+        """
+        # Find the T1 series record for the current combo selection.
+        t1_path = self.t1_combo.currentData() if hasattr(self, 't1_combo') else None
+        t1_series = None
+        if t1_path:
+            for s in self.scan_results:
+                if s.get('sample_file') == t1_path:
+                    t1_series = s
+                    break
+
+        match_subj, match_kind = None, "none"
+        if t1_series:
+            t1_pid = t1_series.get('patient_id', '')
+            t1_date = t1_series.get('study_date', '')
+
+            # Priority 1: PatientID
+            if t1_pid:
+                for sid, entry in self.steam_index.items():
+                    meta = entry['subject_meta']
+                    if meta.get('subject_id') and meta['subject_id'] == t1_pid:
+                        match_subj, match_kind = sid, "patient_id"
+                        break
+
+            # Priority 2: StudyDate (YYYYMMDD substring on either side)
+            if match_subj is None and t1_date:
+                for sid, entry in self.steam_index.items():
+                    folder_name = entry['subject_folder'].name
+                    if t1_date and t1_date in folder_name:
+                        match_subj, match_kind = sid, "study_date"
+                        break
+
+            # Priority 3: ordinal — match by sort order of T1 series
+            # vs. STEAM subject folders.
+            if match_subj is None and self.proxyl_series:
+                t1_ix = self.proxyl_series.index(t1_series) if t1_series in self.proxyl_series else 0
+                subj_ids = list(self.steam_index.keys())
+                if 0 <= t1_ix < len(subj_ids):
+                    match_subj, match_kind = subj_ids[t1_ix], "ordinal"
+
+        # Apply match.
+        if match_subj is None:
+            self.steam_combo.setCurrentIndex(0)
+            self.steam_match_label.setText("")
+            self.steam_match_label.setToolTip("No auto-match")
+        else:
+            for i in range(self.steam_combo.count()):
+                if self.steam_combo.itemData(i) == match_subj:
+                    self.steam_combo.setCurrentIndex(i)
+                    break
+            color, text, tip = {
+                "patient_id": ("#4CAF50", "●", "Matched by PatientID"),
+                "study_date": ("#FFC107", "●", "Matched by StudyDate substring"),
+                "ordinal":    ("#FF9800", "●", "Matched by ordinal position (verify!)"),
+            }.get(match_kind, ("#888", "●", "Manual"))
+            self.steam_match_label.setText(text)
+            self.steam_match_label.setStyleSheet(f"color: {color}; font-size: 16px;")
+            self.steam_match_label.setToolTip(tip)
 
 
 class MainMenuDialog(QDialog):
@@ -281,6 +517,7 @@ class MainMenuDialog(QDialog):
                  output_dir: str = './output',
                  registered_t2: Optional[np.ndarray] = None,
                  roi_state: Optional[dict] = None,
+                 steam_info: Optional[dict] = None,
                  parent=None):
         super().__init__(parent)
         self.registered_4d = registered_4d
@@ -289,6 +526,15 @@ class MainMenuDialog(QDialog):
         self.dicom_path = dicom_path
         self.output_dir = output_dir
         self.registered_t2 = registered_t2
+
+        # STEAM VOI hint carried in from DicomScanResultsDialog — has
+        # bruker_root, subject_folder, subject_id. Used when the user
+        # clicks "Manage STEAM VOIs…" to seed the loader dialog.
+        self.steam_info = steam_info or {}
+        # Loaded VOIs (StudyVOIs) — None until user runs the loader.
+        self.study_vois = None
+        # Cached T1Geometry — lazily computed when first needed.
+        self._t1_geometry = None
 
         # State - persisted across menu returns via roi_state dict
         if roi_state:
@@ -315,6 +561,12 @@ class MainMenuDialog(QDialog):
 
         self._setup_ui()
         self._update_data_status()
+
+        # Eagerly load any previously-saved STEAM VOIs for this dataset
+        # so downstream dialogs (parameter-map options, results) see
+        # them as available without requiring the user to first switch
+        # to the STEAM ROI method.
+        self._try_load_steam_voi_json()
 
     def _setup_ui(self):
         """Build the menu UI."""
@@ -438,7 +690,8 @@ class MainMenuDialog(QDialog):
         description.setStyleSheet("color: #666;")
         layout.addWidget(description)
 
-        # ROI Source
+        # ROI Source — which anatomy is shown for drawing or as the
+        # overlay backdrop for a STEAM VOI.
         source_layout = QHBoxLayout()
         source_layout.addWidget(QLabel("ROI Source:"))
 
@@ -456,23 +709,53 @@ class MainMenuDialog(QDialog):
         source_layout.addStretch()
         layout.addLayout(source_layout)
 
-        # ROI Method
-        method_layout = QHBoxLayout()
+        # ROI Method — how the ROI is produced. STEAM VOI sits here as
+        # a fourth option: instead of drawing on the image, use the
+        # prescribed Bruker voxel directly. Z-slice and Source are both
+        # irrelevant for STEAM (the box is 3D and prescribed), so they
+        # collapse when STEAM is picked.
+        self.method_row = QWidget()
+        method_layout = QHBoxLayout(self.method_row)
+        method_layout.setContentsMargins(0, 0, 0, 0)
         method_layout.addWidget(QLabel("ROI Method:"))
 
         self.rect_radio = QRadioButton("Rectangle")
         self.contour_radio = QRadioButton("Manual Contour")
         self.segment_radio = QRadioButton("Segment")
+        self.steam_method_radio = QRadioButton("STEAM VOI")
         self.contour_radio.setChecked(True)  # Default
 
         method_layout.addWidget(self.rect_radio)
         method_layout.addWidget(self.contour_radio)
         method_layout.addWidget(self.segment_radio)
+        method_layout.addWidget(self.steam_method_radio)
         method_layout.addStretch()
-        layout.addLayout(method_layout)
+        layout.addWidget(self.method_row)
 
-        # Z-slice
-        z_layout = QHBoxLayout()
+        # STEAM-VOI sub-row: voxel picker + manage button. Shown only
+        # when the STEAM Method radio is selected.
+        self.steam_subrow = QWidget()
+        steam_sub_layout = QHBoxLayout(self.steam_subrow)
+        steam_sub_layout.setContentsMargins(20, 0, 0, 0)
+        steam_sub_layout.addWidget(QLabel("Voxel:"))
+        self.steam_voxel_combo = QComboBox()
+        self.steam_voxel_combo.addItem("-- (load VOIs first) --", None)
+        self.steam_voxel_combo.setEnabled(False)
+        steam_sub_layout.addWidget(self.steam_voxel_combo, stretch=1)
+        self.manage_steam_btn = QPushButton("Manage STEAM VOIs…")
+        self.manage_steam_btn.clicked.connect(self._on_manage_steam)
+        steam_sub_layout.addWidget(self.manage_steam_btn)
+        layout.addWidget(self.steam_subrow)
+        self.steam_subrow.setVisible(False)
+
+        # Hook the STEAM radio after the subrow is in place so the
+        # initial signal handler can find it.
+        self.steam_method_radio.toggled.connect(self._on_roi_source_changed)
+
+        # Z-slice (hidden when STEAM is the method — picked automatically)
+        self.z_row = QWidget()
+        z_layout = QHBoxLayout(self.z_row)
+        z_layout.setContentsMargins(0, 0, 0, 0)
         z_layout.addWidget(QLabel("Z-slice:"))
 
         self.z_spinbox = QSpinBox()
@@ -485,7 +768,7 @@ class MainMenuDialog(QDialog):
         z_layout.addWidget(self.z_max_label)
 
         z_layout.addStretch()
-        layout.addLayout(z_layout)
+        layout.addWidget(self.z_row)
 
         # ROI status line
         self.roi_status_label = QLabel("ROI: Not drawn")
@@ -818,6 +1101,33 @@ class MainMenuDialog(QDialog):
 
     def _draw_roi(self):
         """Launch ROI drawing workflow (just ROI + injection time, no fitting)."""
+        # STEAM VOI is a geometric ROI — no drawing step.
+        if self.steam_method_radio.isChecked():
+            voi = self.steam_voxel_combo.currentData()
+            if voi is None or self.study_vois is None:
+                QMessageBox.warning(
+                    self,
+                    "No STEAM VOI",
+                    "Click 'Manage STEAM VOIs…' to load tumor + contralateral "
+                    "voxels first, then pick one from the Voxel dropdown."
+                )
+                return
+            try:
+                steam_mask = self._build_steam_mask(voi)
+            except Exception as e:
+                QMessageBox.critical(self, "Mask build failed", f"{e}")
+                return
+            self.result = {
+                'action': 'draw_roi',
+                'roi_source': 'steam',
+                'roi_mode': 'steam_voi',
+                'z_slice': self.z_spinbox.value(),
+                'steam_voi_label': voi.label,
+                'steam_mask': steam_mask,
+            }
+            self.accept()
+            return
+
         # Gather settings
         if self.t2_source_radio.isChecked() and self.registered_t2 is not None:
             roi_source = 't2'
@@ -838,6 +1148,129 @@ class MainMenuDialog(QDialog):
             'z_slice': self.z_spinbox.value()
         }
         self.accept()
+
+    # ------------------------------------------------------------------
+    # STEAM VOI source (T024 Phase 3)
+    # ------------------------------------------------------------------
+
+    def _on_roi_source_changed(self, _checked: bool):
+        """Show/hide STEAM sub-row + Z-slice row based on the method.
+
+        When STEAM is the method, the voxel sub-picker appears and the
+        Z-slice control is hidden — the slice is picked automatically
+        from the slice with the largest VOI cross-section.
+        """
+        is_steam = self.steam_method_radio.isChecked()
+        self.steam_subrow.setVisible(is_steam)
+        if hasattr(self, 'z_row'):
+            self.z_row.setVisible(not is_steam)
+        if is_steam:
+            self._try_load_steam_voi_json()
+
+    def _try_load_steam_voi_json(self):
+        """Look for an existing steam_voi.json in the dataset's output dir."""
+        if self.study_vois is not None:
+            return
+        from ..steam_voi import load_voi_json
+        candidate = Path(self.output_dir) / "steam_voi.json"
+        if candidate.is_file():
+            try:
+                self.study_vois = load_voi_json(candidate)
+                self._refresh_steam_voxel_combo()
+            except Exception:  # pragma: no cover
+                pass
+
+    def _refresh_steam_voxel_combo(self):
+        """Populate the Voxel combo with the loaded VOIs."""
+        self.steam_voxel_combo.blockSignals(True)
+        self.steam_voxel_combo.clear()
+        if self.study_vois is None or not self.study_vois.voi:
+            self.steam_voxel_combo.addItem("-- (load VOIs first) --", None)
+            self.steam_voxel_combo.setEnabled(False)
+        else:
+            for v in self.study_vois.voi:
+                pos = v.position_mm
+                label = (
+                    f"{v.label.capitalize()}  "
+                    f"({pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f})"
+                )
+                self.steam_voxel_combo.addItem(label, v)
+            self.steam_voxel_combo.setEnabled(True)
+        self.steam_voxel_combo.blockSignals(False)
+
+    def _on_manage_steam(self):
+        """Open the STEAM VOI loader dialog seeded with current state."""
+        if self.registered_4d is None:
+            QMessageBox.warning(self, "Load data", "Load a T1 series first.")
+            return
+        from ..steam_voi import build_t1_geometry_from_dicom, load_voi_json
+        from .steam_voi import SteamVoiLoaderDialog
+
+        # Lazily compute / cache the T1Geometry.
+        if self._t1_geometry is None:
+            try:
+                self._t1_geometry = build_t1_geometry_from_dicom(self.dicom_path)
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Geometry unavailable",
+                    f"Could not build T1 geometry from DICOM:\n{e}\n\n"
+                    "STEAM VOI overlay requires DICOM ImagePositionPatient / "
+                    "ImageOrientationPatient tags. Try re-loading the dataset."
+                )
+                return
+
+        # T1 mid-slice volume (3D) for the preview.
+        t1_volume = self.registered_4d[:, :, :, 0]
+
+        # Prefer the subject-specific folder if the DICOM scan dialog
+        # already narrowed it down, otherwise fall back to the
+        # multi-subject Bruker root the user picked.
+        bruker_hint = None
+        if self.steam_info:
+            bruker_hint = (
+                self.steam_info.get('subject_folder')
+                or self.steam_info.get('bruker_root')
+            )
+        json_path = Path(self.output_dir) / "steam_voi.json"
+        existing = json_path if json_path.is_file() else None
+
+        dlg = SteamVoiLoaderDialog(
+            t1_volume,
+            self._t1_geometry,
+            output_dir=Path(self.output_dir),
+            parent=self,
+            bruker_root_hint=bruker_hint,
+            existing_json=existing,
+        )
+        if dlg.exec():
+            self.study_vois = dlg.result_vois
+            self._refresh_steam_voxel_combo()
+            # Pre-select tumor.
+            for i in range(self.steam_voxel_combo.count()):
+                v = self.steam_voxel_combo.itemData(i)
+                if v is not None and v.label == "tumor":
+                    self.steam_voxel_combo.setCurrentIndex(i)
+                    break
+
+    def _build_steam_mask(self, voi):
+        """Rasterize a SteamVOI to a T1-grid mask. Caches geometry."""
+        from ..steam_voi import build_t1_geometry_from_dicom, voi_to_mask
+        if self._t1_geometry is None:
+            self._t1_geometry = build_t1_geometry_from_dicom(self.dicom_path)
+        # Pass the study default; voi_to_mask honors voi.transform if set.
+        s2p = (
+            self.study_vois.scanner_to_patient
+            if self.study_vois is not None else np.eye(4)
+        )
+        t2_to_t1 = (
+            self.study_vois.t2_to_t1_translation_mm
+            if self.study_vois is not None else None
+        )
+        return voi_to_mask(
+            voi, self._t1_geometry,
+            scanner_to_patient=s2p,
+            t2_to_t1_translation_mm=t2_to_t1,
+        )
 
     def _run_kinetic_fit(self):
         """Launch kinetic fitting on existing ROI data."""
@@ -927,7 +1360,11 @@ class MainMenuDialog(QDialog):
     def _create_parameter_maps(self):
         """Launch parameter mapping workflow."""
         self.result = {
-            'action': 'parameter_maps'
+            'action': 'parameter_maps',
+            # Carry loaded STEAM VOIs + transform forward so the
+            # parameter-map options dialog can offer them as a
+            # fitting-region choice and/or as a measurement ROI.
+            'study_vois': self.study_vois,
         }
         self.accept()
 
@@ -987,7 +1424,8 @@ def show_main_menu(registered_4d: Optional[np.ndarray] = None,
                    dicom_path: str = "",
                    output_dir: str = './output',
                    registered_t2: Optional[np.ndarray] = None,
-                   roi_state: Optional[dict] = None) -> Optional[dict]:
+                   roi_state: Optional[dict] = None,
+                   steam_info: Optional[dict] = None) -> Optional[dict]:
     """
     Show the main workflow menu.
 
@@ -1022,7 +1460,8 @@ def show_main_menu(registered_4d: Optional[np.ndarray] = None,
         dicom_path=dicom_path,
         output_dir=output_dir,
         registered_t2=registered_t2,
-        roi_state=roi_state
+        roi_state=roi_state,
+        steam_info=steam_info,
     )
 
     result = dialog.exec()

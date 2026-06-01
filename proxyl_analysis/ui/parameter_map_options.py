@@ -25,7 +25,7 @@ from PySide6.QtGui import QFont
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from .styles import init_qt_app
+from .styles import init_qt_app, apply_brain_axes
 from .components import HeaderWidget
 
 
@@ -267,6 +267,8 @@ class ParameterMapOptionsDialog(QDialog):
                  default_window_size: Tuple[int, int, int] = (15, 15, 1),
                  default_steady_state_time: float = 100.0,
                  time_units: str = 'minutes',
+                 study_vois=None,
+                 t1_geometry=None,
                  parent=None):
         super().__init__(parent)
         self.max_z = max_z
@@ -274,6 +276,12 @@ class ParameterMapOptionsDialog(QDialog):
         self.existing_roi = existing_roi
         self.existing_injection_idx = existing_injection_idx
         self.default_window_size = default_window_size
+        # STEAM VOI integration (T024 Phase 4) — when both are present,
+        # the ROI Processing section offers "Use STEAM VOI" with a
+        # tumor/contralateral picker. The dialog rasterizes the chosen
+        # VOI to a 3D mask on _on_run and returns it via the result.
+        self.study_vois = study_vois
+        self.t1_geometry = t1_geometry
         # Default value (in time_units) for the NTE steady-state-time
         # spinbox. Mirrors the same control on the injection time
         # dialog so the user's prior choice carries forward.
@@ -377,6 +385,7 @@ class ParameterMapOptionsDialog(QDialog):
 
         self.reuse_roi_radio = QRadioButton("Reuse existing ROI")
         self.redraw_roi_radio = QRadioButton("Draw new ROI")
+        self.steam_roi_radio = QRadioButton("Use STEAM VOI")
 
         # Enable reuse only if we have an existing ROI
         self.reuse_roi_radio.setEnabled(self.existing_roi is not None)
@@ -387,13 +396,29 @@ class ParameterMapOptionsDialog(QDialog):
         else:
             self.redraw_roi_radio.setChecked(True)
 
+        # STEAM is only available when both VOIs and geometry are passed in.
+        has_steam = (
+            self.study_vois is not None
+            and len(self.study_vois.voi) > 0
+            and self.t1_geometry is not None
+        )
+        self.steam_roi_radio.setEnabled(has_steam)
+        if has_steam:
+            self.steam_roi_radio.setToolTip(
+                "Bound parameter-map fitting to the prescribed STEAM voxel "
+                "(much faster than whole-image; matches the spectroscopy "
+                "sampling region exactly)."
+            )
+
         # Group these together
         self.roi_action_group = QButtonGroup(self)
         self.roi_action_group.addButton(self.reuse_roi_radio)
         self.roi_action_group.addButton(self.redraw_roi_radio)
+        self.roi_action_group.addButton(self.steam_roi_radio)
 
         roi_options_layout.addWidget(self.reuse_roi_radio)
         roi_options_layout.addWidget(self.redraw_roi_radio)
+        roi_options_layout.addWidget(self.steam_roi_radio)
         roi_options_layout.addStretch()
 
         self.roi_options_widget = QWidget()
@@ -401,10 +426,40 @@ class ParameterMapOptionsDialog(QDialog):
         self.roi_options_widget.setEnabled(False)
         layout.addWidget(self.roi_options_widget)
 
+        # STEAM voxel sub-picker: indented row that appears below the
+        # action radios when "Use STEAM VOI" is selected.
+        steam_voxel_layout = QHBoxLayout()
+        steam_voxel_layout.addSpacing(40)
+        steam_voxel_layout.addWidget(QLabel("Voxel:"))
+        self.steam_voxel_combo = QComboBox()
+        if has_steam:
+            for v in self.study_vois.voi:
+                pos = v.position_mm
+                self.steam_voxel_combo.addItem(
+                    f"{v.label.capitalize()}  "
+                    f"({pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f})",
+                    v,
+                )
+        else:
+            self.steam_voxel_combo.addItem("-- no STEAM VOIs loaded --", None)
+        self.steam_voxel_combo.setEnabled(False)
+        steam_voxel_layout.addWidget(self.steam_voxel_combo, stretch=1)
+
+        self.steam_voxel_widget = QWidget()
+        self.steam_voxel_widget.setLayout(steam_voxel_layout)
+        self.steam_voxel_widget.setVisible(False)
+        layout.addWidget(self.steam_voxel_widget)
+
         # Connect signals
         self.roi_only_radio.toggled.connect(self._on_roi_mode_changed)
+        self.steam_roi_radio.toggled.connect(self._on_steam_roi_toggled)
 
         parent_layout.addWidget(group)
+
+    def _on_steam_roi_toggled(self, checked: bool):
+        """Show / enable the STEAM voxel picker when STEAM is selected."""
+        self.steam_voxel_widget.setVisible(checked)
+        self.steam_voxel_combo.setEnabled(checked)
 
     def _create_kernel_section(self, parent_layout):
         """Create kernel configuration section.
@@ -621,6 +676,31 @@ class ParameterMapOptionsDialog(QDialog):
 
     def _on_run(self):
         """Handle run button click."""
+        # If STEAM is selected, rasterize the chosen VOI to a 3D mask now
+        # so the caller doesn't need geometry knowledge.
+        steam_roi_mask = None
+        steam_voi_label = None
+        use_steam_roi = False
+        if self.roi_only_radio.isChecked() and self.steam_roi_radio.isChecked():
+            voi = self.steam_voxel_combo.currentData()
+            if voi is not None and self.t1_geometry is not None:
+                from ..steam_voi import voi_to_mask
+                s2p = (
+                    self.study_vois.scanner_to_patient
+                    if self.study_vois is not None else None
+                )
+                t2_to_t1 = (
+                    self.study_vois.t2_to_t1_translation_mm
+                    if self.study_vois is not None else None
+                )
+                steam_roi_mask = voi_to_mask(
+                    voi, self.t1_geometry,
+                    scanner_to_patient=s2p,
+                    t2_to_t1_translation_mm=t2_to_t1,
+                )
+                steam_voi_label = voi.label
+                use_steam_roi = True
+
         self.result = {
             # Slice options
             'single_slice': self.single_slice_radio.isChecked(),
@@ -630,6 +710,9 @@ class ParameterMapOptionsDialog(QDialog):
             'roi_only': self.roi_only_radio.isChecked(),
             'reuse_roi': self.reuse_roi_radio.isChecked() if self.roi_only_radio.isChecked() else False,
             'redraw_roi': self.redraw_roi_radio.isChecked() if self.roi_only_radio.isChecked() else False,
+            'use_steam_roi': use_steam_roi,
+            'steam_roi_mask': steam_roi_mask,
+            'steam_voi_label': steam_voi_label,
 
             # Kernel options
             'kernel_type': self.kernel_type_combo.currentText(),
@@ -679,6 +762,8 @@ class ParameterMapResultsDialog(QDialog):
                  registered_t2: Optional[np.ndarray] = None,
                  time_array: Optional[np.ndarray] = None,
                  dataset_dir: Optional[str] = None,
+                 study_vois=None,
+                 t1_geometry=None,
                  parent=None):
         super().__init__(parent)
         self.param_maps = param_maps
@@ -687,6 +772,16 @@ class ParameterMapResultsDialog(QDialog):
         self.output_dir = output_dir
         self.reference_image = reference_image or param_maps.get('reference_slice')
         self.source_dicom = source_dicom
+        # STEAM VOI integration (T024 Phase 5). When both are provided,
+        # the Measurement ROI panel exposes a "From STEAM VOI…" button
+        # that loads tumor / contralateral as a measurement ROI and
+        # labels the saved bundle accordingly.
+        self.study_vois = study_vois
+        self.t1_geometry = t1_geometry
+        # Label string when the current measurement ROI was sourced
+        # from a STEAM VOI (e.g. "STEAM_Tumor"). Reset to None when
+        # the user draws a new ROI manually.
+        self._measurement_roi_label: Optional[str] = None
         # Anatomical sources kept around so the Save-as-DICOM export can
         # optionally write the corresponding T1 baseline and T2 volumes
         # alongside the parameter maps. Either may be None if not available.
@@ -730,6 +825,12 @@ class ParameterMapResultsDialog(QDialog):
         # CSV so they share a per-ROI number. None when no ROI active.
         self._measurement_roi_n = None
         self._measurement_lasso = None
+        # Optional 3D mask backing the measurement ROI. Set when the
+        # ROI was sourced from a STEAM VOI — lets the display show the
+        # cube cross-section per slice (oblique cuboids do not have a
+        # constant 2D footprint across z). None when the ROI was drawn
+        # by hand on a single slice.
+        self.measurement_roi_mask_3d: Optional[np.ndarray] = None
 
         self.setWindowTitle("Parameter Map Results")
         self.setMinimumSize(900, 700)
@@ -881,6 +982,25 @@ class ParameterMapResultsDialog(QDialog):
         self.clear_measure_btn.setEnabled(False)
         measure_btn_row.addWidget(self.clear_measure_btn)
         measure_layout.addLayout(measure_btn_row)
+
+        # STEAM VOI as measurement ROI (T024 Phase 5). Disabled unless
+        # the calling dialog passed both VOIs and T1 geometry. When
+        # used, the saved bundle's filename uses the VOI label
+        # (STEAM_Tumor / STEAM_Contralateral) instead of a counter.
+        has_steam = (
+            self.study_vois is not None
+            and len(self.study_vois.voi) > 0
+            and self.t1_geometry is not None
+        )
+        self.steam_measure_btn = QPushButton("From STEAM VOI…")
+        self.steam_measure_btn.setEnabled(has_steam)
+        self.steam_measure_btn.setToolTip(
+            "Use a prescribed STEAM voxel (tumor or contralateral) as "
+            "the measurement ROI. Stats and exports are labeled with "
+            "the voxel name."
+        )
+        self.steam_measure_btn.clicked.connect(self._measure_from_steam_voi)
+        measure_layout.addWidget(self.steam_measure_btn)
 
         # Kinetic Fit button — runs fit_proxyl_kinetics on the signal
         # extracted from the drawn measurement ROI and opens the fit
@@ -1140,6 +1260,10 @@ class ParameterMapResultsDialog(QDialog):
             return
 
         self.measurement_roi_mask = inside
+        # Manual drawing produces a single-slice mask — clear any 3D
+        # backing left over from a previous STEAM-VOI source so the
+        # display falls back to the all-slices 2D behavior.
+        self.measurement_roi_mask_3d = None
         self.measurement_roi_drawn_z = self.current_z
         # Allocate one shared ROI counter N for this measurement ROI,
         # used by both the upcoming "Kinetic Fit on this ROI" save
@@ -1166,18 +1290,109 @@ class ParameterMapResultsDialog(QDialog):
         # Redraws the contour and recomputes metrics.
         self._update_display()
 
+    def _measurement_mask_for_slice(self, z: int) -> Optional[np.ndarray]:
+        """Return the 2D measurement mask to overlay on slice ``z``.
+
+        For STEAM-sourced ROIs (``measurement_roi_mask_3d`` set) this
+        slices the 3D cube mask at ``z``; the result is empty on slices
+        the cube doesn't reach, so the contour disappears outside the
+        VOI's z-extent. For manually-drawn ROIs the 2D mask is reused
+        on every slice (legacy behavior).
+        """
+        if self.measurement_roi_mask_3d is not None:
+            if 0 <= z < self.measurement_roi_mask_3d.shape[2]:
+                return self.measurement_roi_mask_3d[:, :, z]
+            return None
+        return self.measurement_roi_mask
+
     def _clear_measurement_roi(self):
         """Drop the measurement ROI and refresh the display + metrics."""
         self.measurement_roi_mask = None
+        self.measurement_roi_mask_3d = None
         self.measurement_roi_drawn_z = None
         # Release the shared ROI counter so the next Draw allocates
         # a fresh N (and so Export Metrics, if accidentally invoked
         # before a new draw, doesn't reuse a stale number).
         self._measurement_roi_n = None
+        self._measurement_roi_label = None
         self.clear_measure_btn.setEnabled(False)
         self.kinetic_fit_btn.setEnabled(False)
         self.measure_status_label.setText(
             "Click 'Draw' then drag-and-release on the map."
+        )
+        self._update_display()
+
+    def _measure_from_steam_voi(self):
+        """Set the measurement ROI from a prescribed STEAM voxel.
+
+        Pops a small picker dialog when more than one VOI exists, then
+        rasterizes the chosen voxel into ``measurement_roi_mask`` for
+        the slice currently displayed. The saved metrics bundle gets a
+        STEAM_<Label> name so downstream exports are self-identifying.
+        """
+        from ..steam_voi import voi_to_mask
+
+        # Pick a VOI (use the dialog's currentText combo if >1, else pick the only).
+        if not self.study_vois or not self.study_vois.voi:
+            QMessageBox.warning(self, "No STEAM VOIs", "No STEAM VOIs loaded.")
+            return
+
+        if len(self.study_vois.voi) == 1:
+            voi = self.study_vois.voi[0]
+        else:
+            from PySide6.QtWidgets import QInputDialog
+            labels = [v.label.capitalize() for v in self.study_vois.voi]
+            label, ok = QInputDialog.getItem(
+                self, "Pick STEAM Voxel",
+                "Which prescribed voxel should be the measurement ROI?",
+                labels, 0, False,
+            )
+            if not ok:
+                return
+            voi = next(
+                v for v in self.study_vois.voi if v.label.capitalize() == label
+            )
+
+        # Rasterize the 3D mask and slice at the currently displayed z.
+        try:
+            s2p = self.study_vois.scanner_to_patient
+            t2_to_t1 = self.study_vois.t2_to_t1_translation_mm
+            mask3d = voi_to_mask(
+                voi, self.t1_geometry,
+                scanner_to_patient=s2p,
+                t2_to_t1_translation_mm=t2_to_t1,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Mask build failed", f"{e}")
+            return
+
+        z = int(self.current_z)
+        if z < 0 or z >= mask3d.shape[2] or not mask3d[:, :, z].any():
+            # Find the slice with the largest cross-section and jump to it.
+            per_slice = mask3d.sum(axis=(0, 1))
+            z = int(np.argmax(per_slice))
+            if not per_slice[z]:
+                QMessageBox.warning(
+                    self, "Out of view",
+                    "STEAM VOI does not intersect any parameter-map slice."
+                )
+                return
+            self.current_z = z
+
+        self.measurement_roi_mask = mask3d[:, :, z]
+        self.measurement_roi_mask_3d = mask3d
+        self.measurement_roi_drawn_z = z
+        self._measurement_roi_n = self._allocate_shared_roi_n()
+        self._measurement_roi_label = f"STEAM_{voi.label.capitalize()}"
+
+        self.clear_measure_btn.setEnabled(True)
+        self.kinetic_fit_btn.setEnabled(
+            self.registered_4d is not None and self.time_array is not None
+        )
+        n_pixels = int(self.measurement_roi_mask.sum())
+        self.measure_status_label.setText(
+            f"ROI active: {self._measurement_roi_label}  "
+            f"({n_pixels} pixels on z={z})"
         )
         self._update_display()
 
@@ -1555,10 +1770,19 @@ class ParameterMapResultsDialog(QDialog):
                     else:
                         cbar_ax.axis('off')
 
-                fig.suptitle(
-                    f"Parameter map grid — {nz} slices × {nrows} rows",
-                    fontsize=12, y=0.99,
+                # Prefix the suptitle with the dataset folder name
+                # (e.g. study number "35352258") so a stitched PNG
+                # dropped in a slide deck is self-identifying without
+                # having to back-trace the file path.
+                dataset_label = ''
+                if self.dataset_dir:
+                    dataset_label = Path(self.dataset_dir).name
+                title_text = (
+                    f"Parameter map grid — {nz} slices × {nrows} rows"
                 )
+                if dataset_label:
+                    title_text = f"{dataset_label} — {title_text}"
+                fig.suptitle(title_text, fontsize=12, y=0.99)
                 fig.savefig(
                     str(save_path), dpi=150, bbox_inches='tight',
                     facecolor='white', edgecolor='none',
@@ -1585,8 +1809,10 @@ class ParameterMapResultsDialog(QDialog):
                 ref = data[:, :, 0].T
             else:
                 ref = data.T
-            return ax.imshow(ref, cmap='gray', origin='lower',
-                             vmin=row['vmin'], vmax=row['vmax'])
+            im = ax.imshow(ref, cmap='gray', origin='lower',
+                           vmin=row['vmin'], vmax=row['vmax'])
+            apply_brain_axes(ax)
+            return im
 
         # Parameter map row.
         map_data = self.param_maps.get(row['key'])
@@ -1623,11 +1849,13 @@ class ParameterMapResultsDialog(QDialog):
                 vmin=row['vmin'], vmax=row['vmax'],
                 alpha=self.overlay_opacity,
             )
+            apply_brain_axes(ax)
         else:
             im = ax.imshow(
                 display_data, cmap=cmap, origin='lower',
                 vmin=row['vmin'], vmax=row['vmax'],
             )
+            apply_brain_axes(ax)
 
         # ROI contour (cyan = fitting ROI, yellow = measurement ROI).
         if show_roi and self.roi_mask is not None:
@@ -1640,10 +1868,12 @@ class ParameterMapResultsDialog(QDialog):
             if roi_slice is not None and np.any(roi_slice):
                 ax.contour(roi_slice, levels=[0.5], colors='cyan', linewidths=1.0)
         if show_roi and self.measurement_roi_mask is not None:
-            ax.contour(
-                self.measurement_roi_mask.T,
-                levels=[0.5], colors='yellow', linewidths=1.0,
-            )
+            meas_slice = self._measurement_mask_for_slice(z)
+            if meas_slice is not None and meas_slice.any():
+                ax.contour(
+                    meas_slice.T,
+                    levels=[0.5], colors='yellow', linewidths=1.0,
+                )
 
         return im
 
@@ -1724,8 +1954,10 @@ class ParameterMapResultsDialog(QDialog):
             # Overlay parameter map with transparency
             im = self.ax.imshow(display_data, cmap=cmap, origin='lower',
                                vmin=vmin, vmax=vmax, alpha=self.overlay_opacity)
+            apply_brain_axes(self.ax)
         else:
             im = self.ax.imshow(display_data, cmap=cmap, origin='lower', vmin=vmin, vmax=vmax)
+            apply_brain_axes(self.ax)
 
         # Add ROI contour if enabled (cyan = the fitting ROI used during
         # parameter mapping)
@@ -1740,14 +1972,19 @@ class ParameterMapResultsDialog(QDialog):
             if roi_slice is not None and np.any(roi_slice):
                 self.ax.contour(roi_slice, levels=[0.5], colors='cyan', linewidths=2)
 
-        # Measurement ROI contour (yellow), shown whenever set so it's
-        # visually distinct from the cyan fitting ROI. The mask is 2D
-        # in (x, y) and applies to whichever z-slice is shown.
+        # Measurement ROI contour (yellow). When the ROI was sourced
+        # from a STEAM VOI we have a 3D backing mask, so the contour
+        # shows the cube cross-section at the currently-displayed
+        # slice (and is hidden on slices the cube doesn't reach).
+        # Manually-drawn ROIs are 2D and shown on every slice as
+        # before.
         if self.measurement_roi_mask is not None:
-            self.ax.contour(
-                self.measurement_roi_mask.T,
-                levels=[0.5], colors='yellow', linewidths=2,
-            )
+            meas_slice = self._measurement_mask_for_slice(self.current_z)
+            if meas_slice is not None and meas_slice.any():
+                self.ax.contour(
+                    meas_slice.T,
+                    levels=[0.5], colors='yellow', linewidths=2,
+                )
 
         # Colorbar - store reference so we can remove it later
         self.colorbar = self.figure.colorbar(im, ax=self.ax, fraction=0.046)
@@ -2259,12 +2496,20 @@ class ParameterMapResultsDialog(QDialog):
             self.output_dir,
             'parameter_maps/parameter_map_metrics',
         ))
-        # When a measurement ROI is active, reuse the shared ROI
-        # counter so this metrics CSV lands on the same N as the
-        # matching kinetic_fit_results_<N>.csv from the "Kinetic Fit
-        # on this ROI" button. Otherwise pick the next free N as
-        # before.
-        if (self.measurement_roi_mask is not None
+        # When the measurement ROI came from a STEAM VOI (T024 Phase 5),
+        # use the VOI label as the filename suffix so the export is
+        # self-identifying without needing to inspect the CSV header.
+        # Otherwise reuse the shared ROI counter (kinetic-fit bundle
+        # alignment) or pick the next free integer N.
+        steam_label_slug = (
+            self._measurement_roi_label.lower()
+            if getattr(self, '_measurement_roi_label', None) else None
+        )
+        if steam_label_slug:
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            default_path = (metrics_dir
+                            / f"parameter_map_metric_{steam_label_slug}.csv")
+        elif (self.measurement_roi_mask is not None
                 and getattr(self, '_measurement_roi_n', None) is not None):
             metrics_dir.mkdir(parents=True, exist_ok=True)
             default_path = (metrics_dir
@@ -2372,26 +2617,32 @@ class ParameterMapResultsDialog(QDialog):
             for row in unified_rows:
                 writer.writerow(row)
 
-        # Companion files share the CSV's index N. Two PNGs are saved:
+        # Companion files share the CSV's index N — or, for STEAM ROIs,
+        # the same label slug — so the three files of one ROI live
+        # together visually:
         #
-        #   parameter_map_metric_roi_<N>.png   — snapshot of the dialog
-        #         figure with active ROI contour overlay (map context).
-        #   parameter_map_metric_<N>.png       — table render of the
-        #         numeric data so the metrics are presentation-ready.
+        #   parameter_map_metric_roi_<N|label>.png — dialog snapshot
+        #         with the ROI contour overlay (map context).
+        #   parameter_map_metric_<N|label>.png     — table render of
+        #         the numeric data so the metrics are presentation-ready.
         csv_path = Path(filepath)
-        n = index_from_filename(csv_path, "parameter_map_metric", ".csv")
-        if n is not None:
-            roi_png_path = csv_path.parent / f"parameter_map_metric_roi_{n}.png"
-            table_png_path = csv_path.parent / f"parameter_map_metric_{n}.png"
+        if steam_label_slug and csv_path.stem.endswith(steam_label_slug):
+            roi_png_path = csv_path.parent / f"parameter_map_metric_roi_{steam_label_slug}.png"
+            table_png_path = csv_path.parent / f"parameter_map_metric_{steam_label_slug}.png"
         else:
-            roi_png_path = next_indexed_path(
-                csv_path.parent, "parameter_map_metric_roi", ".png"
-            )
-            # When the CSV got renamed off-pattern, fall back to next
-            # free pattern slot for the table PNG too.
-            table_png_path = next_indexed_path(
-                csv_path.parent, "parameter_map_metric", ".png"
-            )
+            n = index_from_filename(csv_path, "parameter_map_metric", ".csv")
+            if n is not None:
+                roi_png_path = csv_path.parent / f"parameter_map_metric_roi_{n}.png"
+                table_png_path = csv_path.parent / f"parameter_map_metric_{n}.png"
+            else:
+                roi_png_path = next_indexed_path(
+                    csv_path.parent, "parameter_map_metric_roi", ".png"
+                )
+                # When the CSV got renamed off-pattern, fall back to next
+                # free pattern slot for the table PNG too.
+                table_png_path = next_indexed_path(
+                    csv_path.parent, "parameter_map_metric", ".png"
+                )
 
         # 1) ROI overlay PNG (figure snapshot)
         try:
@@ -2492,7 +2743,9 @@ def show_parameter_map_options(max_z: int = 8,
                                 existing_injection_idx: Optional[int] = None,
                                 default_window_size: Tuple[int, int, int] = (15, 15, 1),
                                 default_steady_state_time: float = 100.0,
-                                time_units: str = 'minutes') -> Optional[dict]:
+                                time_units: str = 'minutes',
+                                study_vois=None,
+                                t1_geometry=None) -> Optional[dict]:
     """
     Show the parameter map options dialog.
 
@@ -2528,6 +2781,8 @@ def show_parameter_map_options(max_z: int = 8,
         default_window_size=default_window_size,
         default_steady_state_time=default_steady_state_time,
         time_units=time_units,
+        study_vois=study_vois,
+        t1_geometry=t1_geometry,
     )
 
     result = dialog.exec()
@@ -2545,7 +2800,9 @@ def show_parameter_map_results(param_maps: Dict[str, np.ndarray],
                                 registered_4d: Optional[np.ndarray] = None,
                                 registered_t2: Optional[np.ndarray] = None,
                                 time_array: Optional[np.ndarray] = None,
-                                dataset_dir: Optional[str] = None) -> None:
+                                dataset_dir: Optional[str] = None,
+                                study_vois=None,
+                                t1_geometry=None) -> None:
     """
     Show the parameter map results viewer.
 
@@ -2581,6 +2838,8 @@ def show_parameter_map_results(param_maps: Dict[str, np.ndarray],
         registered_t2=registered_t2,
         time_array=time_array,
         dataset_dir=dataset_dir,
+        study_vois=study_vois,
+        t1_geometry=t1_geometry,
     )
 
     dialog.exec()

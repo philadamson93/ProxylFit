@@ -15,7 +15,7 @@ from PySide6.QtGui import QFont
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from .styles import PROXYLFIT_STYLE, init_qt_app
+from .styles import PROXYLFIT_STYLE, init_qt_app, apply_brain_axes
 
 
 class RegistrationWorker(QThread):
@@ -342,6 +342,8 @@ class RegistrationReviewDialog(QDialog):
         self.im_registered = self.ax_registered.imshow(placeholder, cmap='gray', origin='lower')
         self.im_diff = self.ax_diff.imshow(placeholder, cmap='hot', origin='lower')
         self.im_unregistered = self.ax_unregistered.imshow(placeholder, cmap='gray', origin='lower')
+        for _ax in (self.ax_ref, self.ax_registered, self.ax_diff, self.ax_unregistered):
+            apply_brain_axes(_ax)
 
         # Set up axes titles and styling once
         self.ax_ref.set_title('Reference (t=0)', fontsize=10)
@@ -789,6 +791,8 @@ class T2RegistrationReviewDialog(QDialog):
         self.im_overlay = self.ax_overlay.imshow(np.zeros((10, 10, 3)), origin='lower')
         self.im_diff = self.ax_diff.imshow(placeholder, cmap='hot', origin='lower')
         self.im_t2_orig = self.ax_t2_orig.imshow(placeholder, cmap='gray', origin='lower')
+        for _ax in (self.ax_t1, self.ax_t2_reg, self.ax_overlay, self.ax_diff, self.ax_t2_orig):
+            apply_brain_axes(_ax)
 
         # Set titles
         self.ax_t1.set_title('T1 Reference', fontsize=11, fontweight='bold')

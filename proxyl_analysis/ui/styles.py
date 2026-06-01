@@ -119,6 +119,45 @@ QSlider::handle:horizontal {
 """
 
 
+# ---------------------------------------------------------------------------
+# Display convention — neurological (patient-right on viewer-right) vs.
+# radiological (patient-right on viewer-left, DICOM default for human MR).
+# ---------------------------------------------------------------------------
+
+# Set True to display brain slices in neurological convention (matches the
+# Bruker / preclinical prescribing view: looking down at the animal, patient-
+# right on the right side of the screen). The underlying data and patient
+# coordinates are unchanged; only the matplotlib X-axis is inverted.
+NEUROLOGICAL_CONVENTION = True
+
+
+def apply_brain_axes(ax) -> None:
+    """Apply the configured brain-slice display convention to a matplotlib axis.
+
+    Call *after* the ``ax.imshow(slice.T, origin='lower')`` of any brain
+    slice — including inside any handler that re-renders after a clear.
+    Checks ``ax.xaxis_inverted()`` to be idempotent across ``ax.clear()``
+    calls (which reset the inversion silently).
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The axis showing the brain slice (any orientation — the X-axis
+        inversion is what flips L/R for transverse views).
+    """
+    if not NEUROLOGICAL_CONVENTION:
+        return
+    # matplotlib reports the actual current state; ax.clear() resets
+    # inversion silently, so we must re-check rather than relying on a
+    # cached "we did this once" flag.
+    try:
+        already = bool(ax.xaxis_inverted())
+    except AttributeError:  # pragma: no cover — older matplotlib
+        already = False
+    if not already:
+        ax.invert_xaxis()
+
+
 def get_logo_path() -> Optional[Path]:
     """Get path to ProxylFit logo if it exists."""
     logo_path = Path(__file__).parent.parent.parent / "proxylfit.png"

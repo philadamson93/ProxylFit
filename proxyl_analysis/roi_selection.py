@@ -10,6 +10,7 @@ from matplotlib.patches import Polygon
 from typing import Tuple, Optional, List
 import warnings
 from .model import add_proxylfit_logo, set_proxylfit_style
+from .ui.styles import apply_brain_axes
 
 try:
     from segment_anything import sam_model_registry, SamPredictor
@@ -304,6 +305,7 @@ def save_roi_overlay_png(reference_image: np.ndarray,
     if roi_mask is not None and np.any(roi_mask):
         ax.contour(roi_mask.T, levels=[0.5],
                    colors=contour_color, linewidths=2)
+    apply_brain_axes(ax)
     ax.set_title(title or f"ROI on slice z={z_slice}")
     ax.axis('off')
     fig.tight_layout()
@@ -317,7 +319,8 @@ def save_roi_overlay_png(reference_image: np.ndarray,
 def save_table_as_png(rows: list,
                       headers: list,
                       output_path: str,
-                      title: Optional[str] = None) -> str:
+                      title: Optional[str] = None,
+                      max_col_chars: Optional[list] = None) -> str:
     """
     Render a simple data table as a PNG.
 
@@ -343,6 +346,15 @@ def save_table_as_png(rows: list,
         Destination .png path.
     title : str, optional
         Plot title shown above the table.
+    max_col_chars : list of int or None, optional
+        Per-column cap on the "effective character width" used to size
+        the column. ``None`` entries mean "no cap" (use the longest
+        actual content). Useful when one column has a single outlier
+        row that would otherwise blow up the column width and leave
+        every other row visually swimming in blank space — e.g. cap
+        a description column at 22 chars even if one row has 36, and
+        the longer row will visually extend a touch past its cell
+        instead of forcing the whole column wider.
 
     Returns
     -------
@@ -367,7 +379,16 @@ def save_table_as_png(rows: list,
                 widest = max(widest, len(r[col_idx]))
         # Floor of 4 chars so a 1-character column doesn't collapse to
         # an unreadable sliver.
-        col_max_chars.append(max(widest, 4))
+        widest = max(widest, 4)
+        # Apply per-column cap if given. Header length still wins so
+        # the column header itself never clips.
+        if max_col_chars is not None and col_idx < len(max_col_chars):
+            cap = max_col_chars[col_idx]
+            if cap is not None:
+                hdr_len = (len(str(headers[col_idx]))
+                           if col_idx < len(headers) else 0)
+                widest = max(min(widest, int(cap)), hdr_len, 4)
+        col_max_chars.append(widest)
 
     total_chars = sum(col_max_chars) or 1
     col_widths_frac = [w / total_chars for w in col_max_chars]

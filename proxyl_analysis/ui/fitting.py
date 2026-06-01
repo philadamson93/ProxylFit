@@ -936,9 +936,16 @@ class FitResultsDialog(QDialog):
                 ax.set_title(label, fontsize=11)
                 ax.axis('off')
 
-            fig.suptitle(
-                f"Per-ROI summary ({title_suffix})", fontsize=13, y=0.98,
-            )
+            # Prefix with the dataset folder name (e.g. study number
+            # "35352258") so the strip is self-identifying when
+            # dropped into a slide deck without the surrounding path.
+            dataset_label = ''
+            if self.dataset_dir:
+                dataset_label = Path(self.dataset_dir).name
+            strip_title = f"Per-ROI summary ({title_suffix})"
+            if dataset_label:
+                strip_title = f"{dataset_label} — {strip_title}"
+            fig.suptitle(strip_title, fontsize=13, y=0.98)
             fig.savefig(
                 str(strip_png), dpi=150, bbox_inches='tight',
                 facecolor='white', edgecolor='none',
