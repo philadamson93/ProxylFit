@@ -72,6 +72,40 @@ def create_time_array(num_timepoints: int, time_units: str = 'minutes',
     return time_array
 
 
+def _has_registered_dicoms(session_root):
+    """Return True if registration DICOMs are present at session_root.
+
+    Walks every layout the project has used so a previously-registered
+    dataset is always found, regardless of which point in the codebase's
+    history wrote the directory:
+
+    * ``registered/dicoms/T1/z00/t000.dcm`` — current layout. T1/T2
+      anatomical maps got their own subfolders, then per-slice subdirs
+      hold each slice's time series.
+    * ``registered/dicoms/z00/t000.dcm`` — transitional layout from
+      the per-slice reorg before the T1/T2 split.
+    * ``registered/dicoms/z00_t000.dcm`` — legacy flat layout (pre-
+      registration speedup work).
+
+    Without this dual/triple-format probe, every previous-registration
+    check fell back to "no data" and the user was forced to redo
+    registration each session.
+    """
+    dicoms = Path(session_root) / "registered" / "dicoms"
+    if not dicoms.exists():
+        return False
+    # Current layout: registered/dicoms/T1/z00/t000.dcm
+    if (dicoms / "T1" / "z00" / "t000.dcm").exists():
+        return True
+    # Transitional: registered/dicoms/z00/t000.dcm
+    if (dicoms / "z00" / "t000.dcm").exists():
+        return True
+    # Legacy flat: registered/dicoms/z00_t000.dcm
+    if (dicoms / "z00_t000.dcm").exists():
+        return True
+    return False
+
+
 def _detect_registered_session(dicom_path):
     """Check if a DICOM file path is inside a registered output directory.
 
@@ -81,7 +115,7 @@ def _detect_registered_session(dicom_path):
     for parent in p.parents:
         if parent.name == 'dicoms' and parent.parent.name == 'registered':
             session_root = parent.parent.parent
-            if (session_root / "registered" / "dicoms" / "z00_t000.dcm").exists():
+            if _has_registered_dicoms(session_root):
                 return str(session_root)
     return None
 
@@ -295,6 +329,7 @@ def main():
         print()
 
         # Show menu with no data loaded
+        _steam_info_seed = None
         result = show_main_menu(
             registered_4d=None,
             spacing=None,
@@ -333,6 +368,9 @@ def main():
                 # Store T2 path for later loading after registration
                 if result.get('t2_path'):
                     args.t2 = result['t2_path']
+                # Persist STEAM tree info so it survives the registration
+                # phase and reaches the in-session menu.
+                _steam_info_seed = result.get('steam_info')
             else:
                 print("No T1 series selected. Exiting.")
                 sys.exit(1)
@@ -373,18 +411,22 @@ def main():
     # Override when loading registered data from scan
     if args.load_registration:
         reg_path = Path(args.load_registration)
-        if (reg_path / "registered" / "dicoms" / "z00_t000.dcm").exists():
+        if _has_registered_dicoms(reg_path):
             auto_registration_dir = reg_path
 
     # Check if we should automatically load registration data
     auto_load = False
 
     def _find_registration_data(dir_path):
-        """Check if registration data exists in directory (2D DICOM slice format)."""
+        """Check if registration data exists in directory.
+
+        Accepts both the current per-slice layout (``z00/t000.dcm``) and
+        the legacy flat layout (``z00_t000.dcm``) — the registration
+        speedup work moved to the per-slice format and the old probe
+        was missing the new files entirely.
+        """
         p = Path(dir_path)
-        dicom_dir = p / "registered" / "dicoms"
-        # Check for 2D slice format: z00_t000.dcm (3 digits for time index)
-        if dicom_dir.exists() and (dicom_dir / "z00_t000.dcm").exists():
+        if _has_registered_dicoms(p):
             return p / "registered" / "registration_metrics.json"
         return None
 
@@ -571,6 +613,15 @@ def main():
 
             # ROI state preserved across menu returns
             roi_state = None
+            # Parameter maps preserved across menu returns until the
+            # user explicitly requests a recalculation. Lets the user
+            # close the parameter-map results dialog, do other things
+            # (e.g., draw a different ROI for kinetic fitting), then
+            # come back and view / measure on the same maps without
+            # re-running parameter mapping. Reset when a new dataset
+            # is loaded or registration is redone (matches how
+            # roi_state is invalidated below).
+            param_maps_cache = None
             registered_t2 = loaded_t2  # Use previously loaded T2 if available
 
             # If T2 was specified via args (e.g., from scan dialog) but not yet loaded, load it now
@@ -602,7 +653,8 @@ def main():
                     dicom_path=args.dicom,
                     output_dir=str(auto_registration_dir),
                     registered_t2=registered_t2,
-                    roi_state=roi_state
+                    roi_state=roi_state,
+                    steam_info=locals().get('_steam_info_seed'),
                 )
 
                 if menu_result is None or menu_result.get('action') == 'exit':
@@ -655,6 +707,7 @@ def main():
                                 temporal_res = extract_temporal_resolution(args.dicom) if args.dicom else None
                                 time_array = create_time_array(registered_4d.shape[3], args.time_units, temporal_resolution_s=temporal_res)
                                 roi_state = None
+                                param_maps_cache = None  # different dataset → invalidate cached maps
 
                                 # Load T2 if available in session
                                 loaded_t2, _ = load_registered_t2(session_path)
@@ -738,6 +791,7 @@ def main():
 
                         # Reset ROI state
                         roi_state = None
+                        param_maps_cache = None  # re-registration → maps invalid
                         registered_t2 = None
 
                         # Step 3: Load T2 if selected
@@ -807,6 +861,57 @@ def main():
                     args.roi_mode = menu_result['roi_mode']
                     args.z = menu_result['z_slice']
 
+                    # STEAM VOI is a geometric ROI — the mask was
+                    # already rasterized by MainMenuDialog from the
+                    # prescribed Bruker voxel. Skip the drawing step.
+                    if menu_result.get('roi_source') == 'steam':
+                        roi_mask_3d = menu_result.get('steam_mask')
+                        steam_label = menu_result.get('steam_voi_label', 'steam')
+                        if roi_mask_3d is None or not np.any(roi_mask_3d):
+                            print(f"STEAM VOI '{steam_label}' produced an empty mask.")
+                            continue
+                        # Pick the central slice of the VOI for the
+                        # kinetic curve. Sum across (x, y) for each z
+                        # and choose the slice with the largest area.
+                        per_slice = roi_mask_3d.sum(axis=(0, 1))
+                        args.z = int(np.argmax(per_slice))
+                        roi_mask = roi_mask_3d[:, :, args.z]
+                        n_pixels = int(roi_mask.sum())
+                        print(
+                            f"  STEAM VOI '{steam_label}': mask covers "
+                            f"{int(roi_mask_3d.sum())} voxels across "
+                            f"{int((per_slice > 0).sum())} slices; using "
+                            f"z={args.z} ({n_pixels} pixels) for kinetics."
+                        )
+                        roi_signal = compute_roi_timeseries(
+                            registered_4d, roi_mask, z_slice=args.z
+                        )
+                        print(f"  Extracted {len(roi_signal)} time points")
+                        # Continue to injection-time selection (same as drawn ROIs).
+                        injection_idx, steady_state_time, excluded_full = select_injection_time_qt(
+                            time_array, roi_signal, args.time_units,
+                            str(auto_registration_dir),
+                            roi_mask=roi_mask,
+                            reference_image=registered_4d[:, :, :, 0],
+                            roi_z_slice=args.z,
+                            return_steady_state=True,
+                        )
+                        injection_time = time_array[injection_idx]
+                        print(f"  Injection time: {injection_time:.1f} {args.time_units} (index {injection_idx})")
+                        roi_state = {
+                            'roi_mask': roi_mask,
+                            'roi_signal': roi_signal,
+                            'injection_idx': injection_idx,
+                            'injection_time': injection_time,
+                            'z_slice': args.z,
+                            'steady_state_time': steady_state_time,
+                            'excluded_indices': list(excluded_full or []),
+                            'roi_source': 'steam',
+                            'steam_voi_label': steam_label,
+                            'steam_mask_3d': roi_mask_3d,
+                        }
+                        continue  # Back to menu
+
                     # Choose image for ROI selection: T2 (if registered) or T1
                     if registered_t2 is not None and menu_result.get('roi_source') == 't2':
                         roi_selection_image = registered_t2[:, :, :, np.newaxis]
@@ -815,12 +920,18 @@ def main():
                         roi_selection_image = registered_4d
                         print("  Using T1 for ROI selection")
 
-                    # Do ROI selection
+                    # Do ROI selection. For contour mode, the dialog has
+                    # a z-slider so the user can pick a different slice
+                    # mid-draw — capture the final z and sync args.z to
+                    # it so downstream views (kinetic fit, parameter map)
+                    # open on the slice the ROI actually lives on.
                     print(f"ROI selection ({args.roi_mode}) on slice {args.z}...")
                     if args.roi_mode == 'rectangle':
                         roi_mask = select_rectangle_roi_qt(roi_selection_image, args.z)
                     elif args.roi_mode == 'contour':
-                        roi_mask = select_manual_contour_roi_qt(roi_selection_image, args.z)
+                        roi_mask, args.z = select_manual_contour_roi_qt(
+                            roi_selection_image, args.z, return_z=True
+                        )
                     elif args.roi_mode == 'segment':
                         try:
                             roi_mask = select_segmentation_roi(
@@ -830,7 +941,9 @@ def main():
                             )
                         except Exception as e:
                             print(f"Segmentation failed: {e}, falling back to contour")
-                            roi_mask = select_manual_contour_roi_qt(roi_selection_image, args.z)
+                            roi_mask, args.z = select_manual_contour_roi_qt(
+                                roi_selection_image, args.z, return_z=True
+                            )
 
                     if not np.any(roi_mask):
                         print("No ROI was selected.")
@@ -839,24 +952,92 @@ def main():
                     print(f"  ROI selected with {np.sum(roi_mask)} pixels")
 
                     # Extract time series from T1 (always use T1 for signal)
-                    roi_signal = compute_roi_timeseries(registered_4d, roi_mask)
+                    # on the same z-slice the ROI was drawn on — ROI features
+                    # change slice to slice, so the kinetic curve must come
+                    # from the slice the user actually selected.
+                    roi_signal = compute_roi_timeseries(
+                        registered_4d, roi_mask, z_slice=args.z
+                    )
                     print(f"  Extracted {len(roi_signal)} time points")
 
-                    # Select injection time
+                    # Select injection time. Pass ROI context so the
+                    # Export CSV button in the dialog can drop a
+                    # companion ROI overlay PNG. Also collects the
+                    # NTE steady-state-time fit option and any user-
+                    # right-clicked excluded-point indices so the
+                    # kinetic_fit menu action can honour them.
                     print("Select injection time point...")
-                    injection_idx = select_injection_time_qt(time_array, roi_signal, args.time_units, str(auto_registration_dir))
+                    injection_idx, steady_state_time, excluded_full = select_injection_time_qt(
+                        time_array, roi_signal, args.time_units,
+                        str(auto_registration_dir),
+                        roi_mask=roi_mask,
+                        reference_image=registered_4d[:, :, :, 0],
+                        roi_z_slice=args.z,
+                        return_steady_state=True,
+                    )
                     injection_time = time_array[injection_idx]
                     print(f"  Injection time: {injection_time:.1f} {args.time_units} (index {injection_idx})")
 
-                    # Store ROI state
+                    # Store ROI state. z_slice is recorded so subsequent
+                    # menu actions (kinetic fit, parameter mapping injection
+                    # time, exports) can recompute single-slice signals
+                    # against the same slice the ROI was drawn on.
+                    # steady_state_time and excluded_indices ride along
+                    # so the kinetic_fit action and any later parameter
+                    # mapping kicked off from this menu can pre-fill
+                    # the matching controls. excluded_indices are kept
+                    # in FULL-array (pre+post) space — what the user
+                    # sees on the injection plot — and translated to
+                    # post-injection space at each fit call site.
                     roi_state = {
                         'roi_mask': roi_mask,
                         'roi_signal': roi_signal,
                         'injection_idx': injection_idx,
-                        'injection_time': injection_time
+                        'injection_time': injection_time,
+                        'z_slice': args.z,
+                        'steady_state_time': steady_state_time,
+                        'excluded_indices': list(excluded_full or []),
                     }
                     print("ROI and injection time set. Returning to menu.")
                     continue  # Return to menu with ROI state
+
+                elif action == 'reopen_injection':
+                    # Reopen the injection time dialog with the existing
+                    # ROI signal so the user can change the injection
+                    # index and/or toggle Fix A2 without redrawing the
+                    # ROI. Updates roi_state in place; the same ROI is
+                    # used for the next kinetic fit, so the user can
+                    # compare fits with different settings on identical
+                    # input.
+                    if roi_state is None or roi_state.get('roi_signal') is None:
+                        print("No ROI / signal available. Draw an ROI first.")
+                        continue
+
+                    print("Reopening injection time selector...")
+                    roi_z_existing = roi_state.get('z_slice')
+                    new_idx, new_steady_state, new_excluded = select_injection_time_qt(
+                        time_array, roi_state['roi_signal'], args.time_units,
+                        str(auto_registration_dir),
+                        roi_mask=roi_state.get('roi_mask'),
+                        reference_image=registered_4d[:, :, :, 0],
+                        roi_z_slice=roi_z_existing,
+                        steady_state_default=float(
+                            roi_state.get('steady_state_time', 100.0)
+                        ),
+                        excluded_default=set(roi_state.get('excluded_indices') or []),
+                        return_steady_state=True,
+                    )
+                    roi_state['injection_idx'] = new_idx
+                    roi_state['injection_time'] = time_array[new_idx]
+                    roi_state['steady_state_time'] = new_steady_state
+                    roi_state['excluded_indices'] = list(new_excluded or [])
+                    print(f"  Injection time: {roi_state['injection_time']:.1f} "
+                          f"{args.time_units} (index {new_idx})")
+                    print(f"  NTE steady-state time: {new_steady_state:.0f} {args.time_units}")
+                    if new_excluded:
+                        print(f"  Excluded indices: {new_excluded}")
+                    print("Returning to menu — re-run kinetic fit to see updated results.")
+                    continue
 
                 elif action == 'kinetic_fit':
                     # Run kinetic fitting on existing ROI data
@@ -867,6 +1048,14 @@ def main():
                     roi_mask = roi_state['roi_mask']
                     roi_signal = roi_state['roi_signal']
                     injection_idx = roi_state['injection_idx']
+                    # Use the z-slice recorded with the ROI in roi_state,
+                    # not args.z. args.z gets re-set every time the user
+                    # starts a "Draw ROI" action (line 808) — even if they
+                    # cancel — so it can drift away from the slice the
+                    # *currently active* ROI mask lives on. roi_state is
+                    # only updated when an ROI is successfully accepted,
+                    # so it always matches roi_mask.
+                    roi_z = roi_state.get('z_slice')
 
                     # Trim data to start from injection time
                     time_array_fit = time_array[injection_idx:]
@@ -874,8 +1063,40 @@ def main():
 
                     print(f"Fitting kinetic model ({len(signal_fit)} points from injection)...")
                     try:
+                        # Pass pre-injection signal so A0 initial estimate
+                        # comes from the actual baseline (mean of pre-
+                        # injection points) instead of the first few
+                        # post-injection samples — those are already on
+                        # the buildup curve and overestimate A0. The
+                        # NTE steady-state time mirrors the user's
+                        # choice from the injection time dialog (or
+                        # any later parameter map run) — bounds knt
+                        # from below so it doesn't drift to ~0.
+                        ss_time_for_fit = roi_state.get('steady_state_time')
+                        if ss_time_for_fit:
+                            print(
+                                f"  Fit option: NTE steady-state time = "
+                                f"{ss_time_for_fit:.0f} {args.time_units}"
+                            )
+                        # Translate FULL-array exclusion indices to
+                        # post-injection-array space (where the fit
+                        # operates after the [injection_idx:] slice).
+                        full_excluded = roi_state.get('excluded_indices') or []
+                        excluded_post = [
+                            int(i) - int(injection_idx)
+                            for i in full_excluded
+                            if int(i) >= int(injection_idx)
+                        ]
+                        if excluded_post:
+                            print(
+                                f"  Fit option: excluding {len(excluded_post)} point(s) "
+                                f"(post-injection indices {excluded_post})"
+                            )
                         kb, kd, knt, fitted_signal, fit_results = fit_proxyl_kinetics(
-                            time_array_fit, signal_fit, args.time_units
+                            time_array_fit, signal_fit, args.time_units,
+                            pre_injection_signal=roi_signal[:injection_idx],
+                            steady_state_time=ss_time_for_fit,
+                            excluded_indices=excluded_post,
                         )
 
                         # Print results
@@ -890,13 +1111,42 @@ def main():
                         print(f"  Tracer half-life (buildup):  {derived_params['half_life_buildup']:.2f} ± {derived_params['half_life_buildup_error']:.2f} {args.time_units}")
                         print(f"  Tracer half-life (decay):    {derived_params['half_life_decay']:.2f} ± {derived_params['half_life_decay_error']:.2f} {args.time_units}")
 
-                        # Show fit plot (Qt-based)
-                        plot_file = auto_registration_dir / "kinetic_fit.png"
-                        plot_fit_results_qt(time_array_fit, signal_fit, fitted_signal,
-                                           fit_results, str(plot_file))
+                        # Show fit plot (Qt-based). Auto-save kinetic_fit
+                        # PNG goes to <dataset>/kinetic_fits/ with an
+                        # auto-incremented filename so successive ROIs
+                        # in a session each get their own bundle. Save
+                        # Plot / Save Results Table inside the dialog
+                        # default to the same folder + matching N.
+                        from .io import next_indexed_path
+                        plot_file = next_indexed_path(
+                            auto_registration_dir / "kinetic_fits",
+                            "kinetic_fit", ".png",
+                        )
+                        # Pre-injection slice — points the fit didn't
+                        # see, included in the dialog plot so the user
+                        # can review the full ROI signal at once. The
+                        # fit curve is drawn at A0 over this range.
+                        plot_fit_results_qt(
+                            time_array_fit, signal_fit, fitted_signal,
+                            fit_results, str(plot_file),
+                            roi_mask=roi_mask,
+                            reference_image=registered_4d[:, :, :, 0],
+                            roi_z_slice=roi_z,
+                            dataset_dir=str(auto_registration_dir),
+                            pre_injection_time=time_array[:injection_idx],
+                            pre_injection_signal=roi_signal[:injection_idx],
+                        )
 
-                        # Save results
-                        results_file = auto_registration_dir / "kinetic_results.txt"
+                        # Save results — drop into kinetic_fits/ with the
+                        # next free per-ROI index N so successive ROIs
+                        # don't overwrite each other and the .txt rides
+                        # alongside the rest of the per-ROI bundle.
+                        from .io import next_indexed_path
+                        kinetic_fits_dir = auto_registration_dir / "kinetic_fits"
+                        kinetic_fits_dir.mkdir(parents=True, exist_ok=True)
+                        results_file = next_indexed_path(
+                            kinetic_fits_dir, "kinetic_results", ".txt"
+                        )
                         with open(results_file, 'w') as f:
                             f.write("EXTENDED PROXYL KINETIC ANALYSIS RESULTS\n")
                             f.write("="*40 + "\n\n")
@@ -922,32 +1172,144 @@ def main():
                     continue  # Return to menu
 
                 elif action == 'parameter_maps':
+                    # If parameter maps from a previous calculation are
+                    # still cached, offer to view them instead of going
+                    # through the full pipeline again. The maps stay
+                    # available across menu returns until the user
+                    # explicitly recalculates, so they can come back
+                    # for further ROI measurement on the same maps
+                    # without paying the parameter-mapping cost.
+                    if param_maps_cache is not None:
+                        from PySide6.QtWidgets import QMessageBox
+
+                        box = QMessageBox()
+                        box.setWindowTitle("Parameter maps available")
+                        box.setText(
+                            "Parameter maps from a previous calculation "
+                            "are still in memory."
+                        )
+                        box.setInformativeText(
+                            "View the existing maps, or recalculate "
+                            "from scratch?"
+                        )
+                        view_btn = box.addButton(
+                            "View existing", QMessageBox.AcceptRole
+                        )
+                        recalc_btn = box.addButton(
+                            "Recalculate", QMessageBox.DestructiveRole
+                        )
+                        cancel_btn = box.addButton(QMessageBox.Cancel)
+                        box.setDefaultButton(view_btn)
+                        box.exec()
+
+                        clicked = box.clickedButton()
+                        if clicked is cancel_btn:
+                            print("Parameter mapping cancelled.")
+                            continue
+                        if clicked is view_btn:
+                            # Skip the options dialog and the calculation;
+                            # show the cached maps directly.
+                            print("Showing cached parameter maps...")
+                            show_parameter_map_results(
+                                param_maps=param_maps_cache,
+                                spacing=spacing,
+                                roi_mask=param_maps_cache.get('roi_mask'),
+                                output_dir=str(auto_registration_dir),
+                                source_dicom=args.dicom,
+                                registered_4d=registered_4d,
+                                registered_t2=registered_t2,
+                                time_array=time_array,
+                                dataset_dir=str(auto_registration_dir),
+                                study_vois=menu_result.get('study_vois'),
+                                t1_geometry=locals().get('_t1_geometry'),
+                            )
+                            print("Returning to menu.")
+                            continue
+                        # Else (recalc_btn): fall through to the full
+                        # pipeline below; the cache will be replaced
+                        # with the new result on success.
+
                     # Show parameter map options dialog (T014)
                     print("Opening parameter map options...")
+
+                    # Build T1 geometry once for STEAM-VOI rasterization.
+                    _study_vois = menu_result.get('study_vois')
+                    _t1_geometry = None
+                    if _study_vois is not None:
+                        try:
+                            from .steam_voi import build_t1_geometry_from_dicom
+                            _t1_geometry = build_t1_geometry_from_dicom(args.dicom)
+                        except Exception as e:
+                            print(f"  (STEAM ROI unavailable — geometry build failed: {e})")
 
                     options = show_parameter_map_options(
                         max_z=registered_4d.shape[2] - 1,
                         current_z=roi_state.get('z_slice', 4) if roi_state else 4,
                         existing_roi=roi_state.get('roi_mask') if roi_state else None,
                         existing_injection_idx=roi_state.get('injection_idx') if roi_state else None,
-                        default_window_size=menu_result.get('window_size', (15, 15, 3))
+                        default_window_size=menu_result.get('window_size', (15, 15, 1)),
+                        default_steady_state_time=float(
+                            roi_state.get('steady_state_time', 100.0)
+                            if roi_state else 100.0
+                        ),
+                        time_units=args.time_units,
+                        study_vois=_study_vois,
+                        t1_geometry=_t1_geometry,
                     )
+                    # Carry the user's right-clicked exclusions
+                    # forward into options so the worker thread can
+                    # forward them to create_parameter_maps. Stored
+                    # in FULL-array space (the worker translates).
+                    if options is not None and roi_state is not None:
+                        options['excluded_indices'] = list(
+                            roi_state.get('excluded_indices') or []
+                        )
 
                     if options is None:
                         print("Parameter mapping cancelled.")
                         continue
 
-                    # Determine ROI mask to use
+                    # Determine ROI mask to use, and remember the slice
+                    # that ROI lives on so the representative-curve signal
+                    # is computed from that slice (not averaged across z).
                     param_roi_mask = None
+                    param_roi_z = None
                     if options['roi_only']:
-                        if options['reuse_roi'] and roi_state is not None:
+                        if options.get('use_steam_roi') and options.get('steam_roi_mask') is not None:
+                            # STEAM VOI fitting region (T024 Phase 4) —
+                            # use the 3D mask the dialog rasterized;
+                            # select the slice with the largest VOI
+                            # cross-section so the representative-curve
+                            # comes from a non-empty in-VOI region.
+                            steam_3d = options['steam_roi_mask']
+                            per_slice = steam_3d.sum(axis=(0, 1))
+                            param_roi_z = int(np.argmax(per_slice))
+                            param_roi_mask = steam_3d[:, :, param_roi_z]
+                            label = options.get('steam_voi_label', 'steam')
+                            print(
+                                f"Using STEAM VOI '{label}' as fitting "
+                                f"region ({int(steam_3d.sum())} voxels "
+                                f"across {int((per_slice > 0).sum())} "
+                                f"slices; z={param_roi_z} = "
+                                f"{int(param_roi_mask.sum())} pixels)"
+                            )
+                        elif options['reuse_roi'] and roi_state is not None:
                             param_roi_mask = roi_state['roi_mask']
+                            param_roi_z = roi_state.get('z_slice')
                             print(f"Reusing existing ROI ({np.sum(param_roi_mask)} pixels)")
                         elif options['redraw_roi']:
-                            # Draw new ROI for parameter mapping
+                            # Draw new ROI for parameter mapping. Capture
+                            # the final z from the contour selector since
+                            # the user can move the slider mid-draw —
+                            # otherwise param_roi_z would track the
+                            # *initial* slice instead of where the ROI
+                            # actually got drawn.
                             z_for_roi = options['z_slice'] if options['single_slice'] else registered_4d.shape[2] // 2
                             print(f"Drawing new ROI on slice {z_for_roi}...")
-                            param_roi_mask = select_manual_contour_roi_qt(registered_4d, z_for_roi)
+                            param_roi_mask, z_for_roi = select_manual_contour_roi_qt(
+                                registered_4d, z_for_roi, return_z=True
+                            )
+                            param_roi_z = z_for_roi
                             if not np.any(param_roi_mask):
                                 print("No ROI was drawn. Returning to menu.")
                                 continue
@@ -960,8 +1322,15 @@ def main():
                     elif options['select_injection']:
                         # Need to get representative curve
                         if param_roi_mask is not None:
-                            # Use ROI mean signal (compute_roi_timeseries imported at top of file)
-                            rep_signal = compute_roi_timeseries(registered_4d, param_roi_mask)
+                            # Single-slice mean from the slice the ROI was
+                            # drawn on. param_roi_z is None only if a legacy
+                            # roi_state without z_slice is being reused —
+                            # in that case fall back to the existing
+                            # all-slices behavior (better than crashing).
+                            rep_signal = compute_roi_timeseries(
+                                registered_4d, param_roi_mask,
+                                z_slice=param_roi_z,
+                            )
                         elif roi_state is not None and roi_state.get('roi_signal') is not None:
                             rep_signal = roi_state['roi_signal']
                         else:
@@ -971,10 +1340,32 @@ def main():
                             rep_signal = registered_4d[cx-5:cx+5, cy-5:cy+5, cz, :].mean(axis=(0, 1))
 
                         print("Select injection time...")
-                        injection_idx = select_injection_time_qt(
-                            time_array, rep_signal, args.time_units, str(auto_registration_dir)
+                        # Pre-fill the dialog's NTE steady-state-time
+                        # spinbox AND the excluded-points list from
+                        # whatever was set on the parameter-map options
+                        # page (which itself came from roi_state). If
+                        # the user changes either here, propagate the
+                        # new values back into options so the worker
+                        # uses the on-screen state.
+                        injection_idx, steady_state_time, excluded_full = select_injection_time_qt(
+                            time_array, rep_signal, args.time_units,
+                            str(auto_registration_dir),
+                            roi_mask=param_roi_mask,
+                            reference_image=registered_4d[:, :, :, 0],
+                            roi_z_slice=param_roi_z,
+                            steady_state_default=float(options.get('steady_state_time', 100.0)),
+                            excluded_default=set(options.get('excluded_indices') or []),
+                            return_steady_state=True,
                         )
+                        options['steady_state_time'] = steady_state_time
+                        options['excluded_indices'] = list(excluded_full or [])
                         print(f"Selected injection time index: {injection_idx}")
+                        print(
+                            f"  Fit option: NTE steady-state time = "
+                            f"{steady_state_time:.0f} {args.time_units}"
+                        )
+                        if excluded_full:
+                            print(f"  Excluded indices: {excluded_full}")
 
                     # Run parameter mapping with progress dialog
                     print("Creating parameter maps...")
@@ -1002,14 +1393,33 @@ def main():
                         # Store entire 3D reference for z-slice navigation
                         param_maps['reference_slice'] = registered_4d[:, :, :, 0]
 
-                    # Show results viewer (T014)
+                    # Cache so the user can revisit the results dialog
+                    # later without re-running parameter mapping. The
+                    # ROI mask used for fitting is already stored
+                    # inside param_maps under the 'roi_mask' key (set
+                    # by create_parameter_maps when an roi_mask was
+                    # provided), so a re-open later can recover it.
+                    if param_roi_mask is not None and 'roi_mask' not in param_maps:
+                        param_maps['roi_mask'] = param_roi_mask
+                    param_maps_cache = param_maps
+
+                    # Show results viewer (T014). Pass registered_4d and
+                    # registered_t2 so the Save-as-DICOM export can offer
+                    # "Include T1 baseline" / "Include T2 anatomical"
+                    # alongside the parameter maps.
                     print("Displaying parameter map results...")
                     show_parameter_map_results(
                         param_maps=param_maps,
                         spacing=spacing,
                         roi_mask=param_roi_mask,
                         output_dir=str(auto_registration_dir),
-                        source_dicom=args.dicom
+                        source_dicom=args.dicom,
+                        registered_4d=registered_4d,
+                        registered_t2=registered_t2,
+                        time_array=time_array,
+                        dataset_dir=str(auto_registration_dir),
+                        study_vois=menu_result.get('study_vois'),
+                        t1_geometry=locals().get('_t1_geometry'),
                     )
 
                     # Save parameter maps
@@ -1050,15 +1460,59 @@ def main():
                     elif export_type == 'registration_report':
                         print(f"Registration metrics saved to: {auto_registration_dir / 'registration_metrics.json'}")
                     elif export_type == 'timeseries' and roi_state is not None:
-                        # Export time series CSV
-                        csv_file = auto_registration_dir / "roi_timeseries.csv"
+                        # Export time series CSV. Default location is
+                        # <dataset>/kinetic_fits/timecourse_data_<N>.csv
+                        # with N auto-incremented so multiple ROIs in a
+                        # session each get their own bundle. The
+                        # companion ROI overlay PNG uses the matching
+                        # N (kinetic_fit_roi_<N>.png) so a single ROI's
+                        # files share an index.
+                        from PySide6.QtWidgets import QFileDialog
+                        from .io import next_indexed_path, index_from_filename
                         import csv
-                        with open(csv_file, 'w', newline='') as f:
-                            writer = csv.writer(f)
-                            writer.writerow(['time', 'signal'])
-                            for t, s in zip(time_array, roi_state['roi_signal']):
-                                writer.writerow([t, s])
-                        print(f"Time series CSV saved to: {csv_file}")
+
+                        default_csv = next_indexed_path(
+                            auto_registration_dir / "kinetic_fits",
+                            "timecourse_data", ".csv",
+                        )
+                        save_path, _ = QFileDialog.getSaveFileName(
+                            None, "Save Time Series CSV", str(default_csv),
+                            "CSV Files (*.csv);;All Files (*)"
+                        )
+                        if save_path:
+                            csv_file = Path(save_path)
+                            with open(csv_file, 'w', newline='') as f:
+                                writer = csv.writer(f)
+                                writer.writerow(['time', 'signal'])
+                                for t, s in zip(time_array, roi_state['roi_signal']):
+                                    writer.writerow([t, s])
+                            print(f"Time series CSV saved to: {csv_file}")
+
+                            # Companion ROI PNG, matching N when the
+                            # filename keeps the auto-suggested pattern.
+                            from .roi_selection import save_roi_overlay_png
+                            n = index_from_filename(
+                                csv_file, "timecourse_data", ".csv"
+                            )
+                            if n is not None:
+                                png_path = csv_file.parent / f"kinetic_fit_roi_{n}.png"
+                            else:
+                                png_path = next_indexed_path(
+                                    csv_file.parent, "kinetic_fit_roi", ".png"
+                                )
+                            try:
+                                save_roi_overlay_png(
+                                    reference_image=registered_4d[:, :, :, 0],
+                                    roi_mask=roi_state.get('roi_mask'),
+                                    z_slice=roi_state.get('z_slice'),
+                                    output_path=str(png_path),
+                                    title=f"ROI on T1 baseline (z={roi_state.get('z_slice')})",
+                                )
+                                print(f"ROI overlay PNG saved to: {png_path}")
+                            except Exception as e:
+                                print(f"  (PNG companion failed: {e})")
+                        else:
+                            print("Time series CSV export cancelled.")
                     print("Export complete.")
                     continue  # Return to menu
 
@@ -1223,7 +1677,11 @@ def main():
             elif args.roi_mode == 'contour':
                 print(f"  Please draw a contour around the ROI on slice {args.z}")
                 print("  Using Qt-based UI with proper layout management.")
-                roi_mask = select_manual_contour_roi_qt(roi_selection_image, args.z)
+                # Capture final z from the contour selector — user can
+                # change slice via the slider mid-draw.
+                roi_mask, args.z = select_manual_contour_roi_qt(
+                    roi_selection_image, args.z, return_z=True
+                )
 
             elif args.roi_mode == 'segment':
                 print(f"  Please segment the ROI using SegmentAnything on slice {args.z}")
@@ -1257,7 +1715,12 @@ def main():
             else:
                 next_step = "4"
             print(f"Step {next_step}: Computing ROI time series...")
-            signal_timeseries = compute_roi_timeseries(registered_4d, roi_mask)
+            # Use only the slice the ROI was drawn on — single-slice mean
+            # matches the ImageJ workflow and is what the curve is
+            # supposed to represent. See compute_roi_timeseries docstring.
+            signal_timeseries = compute_roi_timeseries(
+                registered_4d, roi_mask, z_slice=args.z
+            )
             
             # Create time array
             time_array = create_time_array(len(signal_timeseries), args.time_units, temporal_resolution_s=temporal_res)
@@ -1274,7 +1737,17 @@ def main():
             print(f"Step {next_step}: Selecting injection time...")
             print("  Please click on the time point when contrast was injected.")
             print("  Using Qt-based UI with proper layout management.")
-            injection_index = select_injection_time_qt(time_array, signal_timeseries, args.time_units, str(output_dir))
+            # Pass ROI context so the dialog's Export CSV button can
+            # drop a companion ROI overlay PNG. Capture the NTE
+            # steady-state time and excluded-point list so the
+            # kinetic fit below can honour them.
+            injection_index, steady_state_time, excluded_full = select_injection_time_qt(
+                time_array, signal_timeseries, args.time_units, str(output_dir),
+                roi_mask=roi_mask,
+                reference_image=registered_4d[:, :, :, 0],
+                roi_z_slice=args.z,
+                return_steady_state=True,
+            )
             
             # Trim data to start from injection time
             time_array_fit = time_array[injection_index:]
@@ -1291,8 +1764,32 @@ def main():
                 next_step = "6"
             print(f"Step {next_step}: Fitting kinetic model...")
             try:
+                # Pass pre-injection signal for a true-baseline A0
+                # initial estimate — see model.py's
+                # estimate_initial_parameters_extended docstring.
+                # steady_state_time mirrors the user's spinbox choice
+                # from the injection time dialog (knt lower bound).
+                # excluded_indices: translate FULL-array indices →
+                # post-injection space.
+                print(
+                    f"  Fit option: NTE steady-state time = "
+                    f"{steady_state_time:.0f} {args.time_units}"
+                )
+                excluded_post = [
+                    int(i) - int(injection_index)
+                    for i in (excluded_full or [])
+                    if int(i) >= int(injection_index)
+                ]
+                if excluded_post:
+                    print(
+                        f"  Fit option: excluding {len(excluded_post)} point(s) "
+                        f"(post-injection indices {excluded_post})"
+                    )
                 kb, kd, knt, fitted_signal, fit_results = fit_proxyl_kinetics(
-                    time_array_fit, signal_timeseries_fit, args.time_units
+                    time_array_fit, signal_timeseries_fit, args.time_units,
+                    pre_injection_signal=signal_timeseries[:injection_index],
+                    steady_state_time=steady_state_time,
+                    excluded_indices=excluded_post,
                 )
                 
                 # Print results
@@ -1323,8 +1820,17 @@ def main():
                 next_step = "7"
             print(f"Step {next_step}: Saving results...")
             
-            # Save numerical results
-            results_file = output_dir / "kinetic_results.txt"
+            # Save numerical results to the dataset's kinetic_fits/
+            # subfolder with an auto-incremented per-ROI index N so the
+            # text summary rides alongside the rest of the per-ROI
+            # bundle (timecourse CSV, fit results CSV/PNG, plot, ROI
+            # overlay).
+            from .io import next_indexed_path
+            kinetic_fits_dir = Path(auto_registration_dir) / "kinetic_fits"
+            kinetic_fits_dir.mkdir(parents=True, exist_ok=True)
+            results_file = next_indexed_path(
+                kinetic_fits_dir, "kinetic_results", ".txt"
+            )
             with open(results_file, 'w') as f:
                 f.write("EXTENDED PROXYL KINETIC ANALYSIS RESULTS\n")
                 f.write("="*40 + "\n\n")
@@ -1404,11 +1910,26 @@ def main():
             )
             print(f"  Raw data saved to: {data_file}")
             
-            # Create and save plot
+            # Create and save plot. Auto-save uses the kinetic_fits/
+            # subdir with an auto-incremented filename; the dialog's
+            # Save Plot / Save Results Table buttons inherit the same
+            # convention through dataset_dir.
             if not args.no_plot:
-                plot_file = output_dir / "kinetic_fit.png"
-                plot_fit_results_qt(time_array_fit, signal_timeseries_fit, fitted_signal,
-                                   fit_results, str(plot_file))
+                from .io import next_indexed_path
+                plot_file = next_indexed_path(
+                    Path(output_dir) / "kinetic_fits",
+                    "kinetic_fit", ".png",
+                )
+                plot_fit_results_qt(
+                    time_array_fit, signal_timeseries_fit, fitted_signal,
+                    fit_results, str(plot_file),
+                    roi_mask=roi_mask,
+                    reference_image=registered_4d[:, :, :, 0],
+                    roi_z_slice=args.z,
+                    dataset_dir=str(output_dir),
+                    pre_injection_time=time_array[:injection_index],
+                    pre_injection_signal=signal_timeseries[:injection_index],
+                )
         
         print("\nAnalysis completed successfully!")
         print("="*60)

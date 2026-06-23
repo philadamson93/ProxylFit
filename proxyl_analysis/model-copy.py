@@ -5,7 +5,7 @@ Kinetic modeling module for fitting Proxyl injection curves.
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
-from typing import Tuple, Dict, Optional, Sequence
+from typing import Tuple, Dict, Optional
 from pathlib import Path
 import os
 
@@ -160,52 +160,28 @@ def proxyl_kinetic_model_extended(t: np.ndarray, A0: float, A1: float, A2: float
     return signal
 
 
-def estimate_initial_parameters_extended(
-    time: np.ndarray,
-    signal: np.ndarray,
-    pre_injection_signal: Optional[np.ndarray] = None,
-) -> Dict[str, float]:
+def estimate_initial_parameters_extended(time: np.ndarray, signal: np.ndarray) -> Dict[str, float]:
     """
     Estimate initial parameters for extended curve fitting.
-
+    
     Parameters
     ----------
     time : np.ndarray
-        Time points (in minutes), post-injection.
+        Time points (in minutes)
     signal : np.ndarray
-        Signal values, post-injection.
-    pre_injection_signal : np.ndarray, optional
-        Signal values *before* injection. When provided, A0_est (the
-        baseline) is the mean of these points — that's the actual
-        baseline of the ROI. Without it, the function falls back to
-        the mean of the first ~4% of the post-injection signal, which
-        is unreliable: those points are already on the buildup curve,
-        not at baseline, so A0 is overestimated and A2_est (which is
-        derived from tail − A0) becomes correspondingly biased.
-
+        Signal values
+        
     Returns
     -------
     dict
         Initial parameter estimates
     """
-    # tail level ~ median of last ~10% of points
-    tail = signal[int(0.9*len(signal)):]
+    # tail level ~ median of last ~20% of points
+    tail = signal[int(0.8*len(signal)):]
     tail_level = float(np.median(tail))
 
-    if pre_injection_signal is not None and len(pre_injection_signal) > 0:
-        # Real baseline: mean of pre-injection points. This is the
-        # physically meaningful A0 — what the signal looks like before
-        # contrast arrives — and matches what an ImageJ user would
-        # compute by averaging the same pre-injection window.
-        A0_est = float(np.mean(pre_injection_signal))
-    else:
-        # Fallback when caller didn't supply pre-injection data. The
-        # first ~4% of the post-injection signal is approximately the
-        # baseline only if the user clicked injection time slightly
-        # late; otherwise these points are already rising.
-        A0_est = float(np.mean(signal[:max(3, int(0.04*len(signal)))]))
-
-    A2_est = tail_level - A0_est      # can be negative
+    A0_est = np.mean(signal[:max(3, int(0.05*len(signal)))])  # early baseline
+    A2_est = tail_level - A0_est      # can be negative  
 
     # keep your A1_est as before or set from peak - baseline
     A1_est = max((np.max(signal) - A0_est) - max(A2_est, 0), 0)
@@ -229,62 +205,20 @@ def estimate_initial_parameters_extended(
     }
 
 
-def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
-                       time_units: str = 'minutes',
-                       verbose: bool = True,
-                       pre_injection_signal: Optional[np.ndarray] = None,
-                       steady_state_time: Optional[float] = None,
-                       excluded_indices: Optional[Sequence[int]] = None,
-                       ) -> Tuple[float, float, float, np.ndarray, Dict]:
+def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray, 
+                       time_units: str = 'minutes') -> Tuple[float, float, float, np.ndarray, Dict]:
     """
     Fit extended Proxyl kinetic model to extract rate parameters.
-
+    
     Parameters
     ----------
     time : np.ndarray
-        Time points (in minutes), post-injection.
-    signal : np.ndarray
-        Signal intensity values, post-injection.
+        Time points (in minutes)
+    signal : np.ndarray  
+        Signal intensity values
     time_units : str
         Units for time (for display purposes)
-    verbose : bool
-        Print diagnostic ``Note``/``Warning`` messages when parameters hit
-        bounds, the covariance matrix is degenerate, or the primary fit
-        falls back to relaxed bounds. Set to ``False`` for parameter
-        mapping (thousands of fits per run) — the messages are useful for
-        a single ROI fit but become per-voxel noise at scale and slow the
-        run measurably on terminals that re-render each line.
-    pre_injection_signal : np.ndarray, optional
-        Signal values from before the injection time. When provided,
-        A0 is **fixed** to the mean of these points and dropped from
-        the optimization variables. Pre-injection signal is a clean
-        direct measurement of A0; letting the optimizer wiggle it
-        just lets it compensate for model error in the kinetic
-        terms, which biases the derived A1/A2/%Enhancement/%NTE
-        values. The reported ``A0_error`` is 0 in this mode (fixed
-        parameter). Strongly recommended for kinetic-fit-page calls;
-        param-mapping voxels also use it when create_parameter_maps
-        is told the injection time.
-    steady_state_time : float, optional
-        Maximum time (in ``time_units``, post-tmax) at which the
-        non-tracer term should reach steady state. Used to bound the
-        non-tracer rate constant from below: ``knt_lower = ln(20) /
-        steady_state_time`` so that ``(1 - exp(-knt·t_steady)) ≥ 0.95``
-        (i.e. NTE is within 5% of A2 by ``t_steady``). Without this
-        constraint, ``knt`` can drift arbitrarily small to inflate
-        the reported A2 amplitude even though the tail is nowhere
-        near saturation, biasing %NTE high. Typical values: 70–100
-        minutes for in-vivo PROXYL data. ``None`` (default) keeps
-        the legacy lower bound of 0.001/min.
-    excluded_indices : sequence of int, optional
-        Indices into the post-injection ``time`` / ``signal`` arrays
-        to drop from the fit. Useful for masking bolus-passage points
-        (commonly indices 6–7) that aren't well described by the
-        kb/kd/knt processes the model is meant to extract. The
-        excluded points still appear on the rendered fit plot —
-        they just don't influence the optimizer. ``None`` or an
-        empty sequence keeps every point.
-
+        
     Returns
     -------
     kb : float
@@ -305,171 +239,58 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
     """
     if len(time) != len(signal):
         raise ValueError("Time and signal arrays must have same length")
-
+    
     if len(time) < 8:
         raise ValueError("Need at least 8 time points for model fitting")
-
-    # Keep the full input arrays around for the fitted-signal return —
-    # excluded points still need a model value at their time so the
-    # plot can show the fit line going through (or near) them. The fit
-    # itself only sees the kept subset.
-    time_full = np.asarray(time)
-    signal_full = np.asarray(signal)
-
-    if excluded_indices:
-        excluded_set = {int(i) for i in excluded_indices
-                        if 0 <= int(i) < len(signal_full)}
-    else:
-        excluded_set = set()
-
-    if excluded_set:
-        keep_mask = np.ones(len(signal_full), dtype=bool)
-        keep_mask[list(excluded_set)] = False
-        time_fit_in = time_full[keep_mask]
-        signal_fit_in = signal_full[keep_mask]
-        if len(time_fit_in) < 8:
-            raise ValueError(
-                "Need at least 8 time points after exclusions for model fitting"
-            )
-    else:
-        time_fit_in = time_full
-        signal_fit_in = signal_full
-
-    # Use the masked-down arrays for everything that follows. The fit's
-    # tmax pinning, knt-floor derivation, and bound construction should
-    # all reflect the points the optimizer is actually looking at.
-    time = time_fit_in
-    signal = signal_fit_in
-
+    
     # Get initial parameter estimates
-    initial_params = estimate_initial_parameters_extended(
-        time, signal, pre_injection_signal=pre_injection_signal,
-    )
+    initial_params = estimate_initial_parameters_extended(time, signal)
     
 
     # More reasonable bounds to prevent numerical issues
     signal_range = np.max(signal) - np.min(signal)
-
-    # knt lower bound: derived from steady_state_time when caller
-    # supplies it. The non-tracer term (1 - exp(-knt·Δt)) reaches 95%
-    # of A2 at knt·Δt = ln(20) ≈ 3.0. Bounding knt from below at
-    # ln(20)/t_steady forces the fitted NTE to actually saturate
-    # within the user-specified window — preventing the optimizer
-    # from running knt to ~0 (slow non-saturating term that inflates
-    # A2 to absorb residuals). When steady_state_time is None we
-    # fall back to the legacy 0.001 lower bound.
-    if steady_state_time is not None and steady_state_time > 0:
-        knt_lower = float(np.log(20.0) / steady_state_time)
-    else:
-        knt_lower = 0.001
-
-    # If the derived knt lower exceeds the existing 0.2 upper, bump
-    # the upper to keep the constraint feasible. This only happens
-    # for very short steady_state_time (< 15 min when using ln(20));
-    # at that point the user is asserting NTE is fast, so let knt be.
-    knt_upper = max(0.2, knt_lower * 2.0)
-
+    
     lower_bounds = [
-        0,            # A0 >= 0
-        0,            # A1 >= 0
+        0,        # A0 >= 0
+        0,        # A1 >= 0
         -signal_range,  # A2 can be negative
-        0.001,        # kb > 0
-        0.001,        # kd > 0
-        knt_lower,    # knt: ≥ ln(20)/t_steady when set, else 0.001
-        time[0],      # t0 >= first time
-        time[0]       # tmax >= first time
+        0.001,    # kb > 0
+        0.001,    # kd > 0
+        0.001,    # knt > 0
+        time[0],  # t0 >= first time
+        time[0]   # tmax >= first time
     ]
 
     upper_bounds = [
         np.max(signal) * 2,  # A0 - reasonable baseline bound
         signal_range * 3,    # A1 - reasonable amplitude bound
         signal_range,    # A2 - smaller non-tracer amplitude
-        2.0,          # kb <= 2.0/min (more permissive for fast binding)
-        1.0,          # kd <= 1.0/min (allow faster decay)
-        knt_upper,    # knt: 0.2 unless bumped to keep lower < upper
-        time[-1],     # t0 <= last time
-        time[-1]      # tmax <= last time
+        2.0,      # kb <= 2.0/min (more permissive for fast binding)
+        1.0,      # kd <= 1.0/min (allow faster decay)
+        0.2,      # knt <= 0.2/min (allow moderate non-tracer effects)
+        time[-1], # t0 <= last time
+        time[-1]  # tmax <= last time
     ]
-
-    # Make sure the initial knt estimate respects the new lower bound
-    # so curve_fit doesn't reject p0 as out-of-bounds.
-    if initial_params['knt'] < knt_lower:
-        initial_params['knt'] = knt_lower * 1.05
-    if initial_params['knt'] > knt_upper:
-        initial_params['knt'] = knt_upper * 0.95
         
     # Initial guess
     p0 = [initial_params['A0'], initial_params['A1'], initial_params['A2'],
           initial_params['kb'], initial_params['kd'], initial_params['knt'],
           initial_params['t0'], initial_params['tmax']]
-
-    # Build fit dispatch based on which parameters are fixed. Only A0
-    # is pinned (when pre-injection data is supplied — clean direct
-    # measurement of baseline). tmax is left as a free fit parameter:
-    # we tried pinning it to time[argmax(signal)] to anchor the NTE
-    # onset, but it cost kd fit quality enough that the operator
-    # opted to live with looser tmax in exchange for tighter kd.
-    # Two dispatch paths (A0 free vs A0 fixed). After the fit returns,
-    # _expand_to_8 inserts the fixed A0 value back at index 0 so the
-    # rest of the function (param unpacking, error reporting,
-    # fit_results dict) sees the canonical 8-element popt + 8×8 pcov
-    # regardless of dispatch path.
-    fix_a0 = (pre_injection_signal is not None
-              and len(pre_injection_signal) > 0)
-    A0_fixed = float(initial_params['A0']) if fix_a0 else None
-
-    if fix_a0:
-        # 7-param fit: drop A0 (0) only
-        def _wrap(t, A1, A2, kb, kd, knt, t0, tmax):
-            return proxyl_kinetic_model_extended(
-                t, A0_fixed, A1, A2, kb, kd, knt, t0, tmax,
-            )
-        fit_model = _wrap
-        free_indices = [1, 2, 3, 4, 5, 6, 7]
-    else:
-        # 8-param free fit
-        fit_model = proxyl_kinetic_model_extended
-        free_indices = [0, 1, 2, 3, 4, 5, 6, 7]
-
-    fit_p0 = [p0[i] for i in free_indices]
-    fit_lower = [lower_bounds[i] for i in free_indices]
-    fit_upper = [upper_bounds[i] for i in free_indices]
-
-    def _expand_to_8(popt_, pcov_):
-        """Insert the fixed A0 value back into popt/pcov so the rest of
-        the function sees canonical 8-element shapes regardless of which
-        params were actually fit. Pcov rows/cols for fixed A0 are zero
-        (no fit-derived uncertainty). When A0 is also free (no pre-
-        injection data), we pass through unchanged.
-        """
-        if not fix_a0:
-            return popt_, pcov_
-        full_popt = np.zeros(8)
-        full_popt[0] = A0_fixed
-        for i, fi in enumerate(free_indices):
-            full_popt[fi] = popt_[i]
-        full_pcov = np.zeros((8, 8))
-        for i, fi in enumerate(free_indices):
-            for j, fj in enumerate(free_indices):
-                full_pcov[fi, fj] = pcov_[i, j]
-        return full_popt, full_pcov
-
+    
     try:
         # First attempt with standard fitting
         popt, pcov = curve_fit(
-            fit_model,
+            proxyl_kinetic_model_extended,
             time,
             signal,
-            p0=fit_p0,
-            bounds=(fit_lower, fit_upper),
-            maxfev=500,    # Cap iterations; pathological pixels fall through
-                           # to the relaxed-bounds dogbox retry below.
+            p0=p0,
+            bounds=(lower_bounds, upper_bounds),
+            maxfev=5000,  # More iterations for extended model
             method='trf',  # Trust region reflective algorithm
-            ftol=1e-6,     # Loosened from 1e-8 — the initial estimates are
-            xtol=1e-6,     # close enough that 1e-6 converges in far fewer steps.
+            ftol=1e-8,     # Tighter tolerance
+            xtol=1e-8
         )
-        popt, pcov = _expand_to_8(popt, pcov)
-
+        
         A0_fit, A1_fit, A2_fit, kb_fit, kd_fit, knt_fit, t0_fit, tmax_fit = popt
         
         # Check for critical parameters at bounds (only warn for kb, kd, knt)
@@ -485,20 +306,13 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                 critical_bounds_hit.append(f"{name} at upper bound")
         
         # Only print warning if critical kinetic parameters hit bounds
-        if verbose and critical_bounds_hit and len(critical_bounds_hit) <= 2:
+        if critical_bounds_hit and len(critical_bounds_hit) <= 2:  # Limit verbosity
             print(f"Note: {', '.join(critical_bounds_hit)} - consider adjusting parameter bounds")
         
-        # Calculate fitted curve over the FULL input time array (including
-        # excluded points) so the caller can draw the model line through
-        # every data point on the plot. R²/RMSE/residuals below are still
-        # computed against the kept points only — those are what the
-        # optimizer actually minimized.
-        fitted_signal = proxyl_kinetic_model_extended(time_full, A0_fit, A1_fit, A2_fit,
-                                                     kb_fit, kd_fit, knt_fit,
+        # Calculate fitted curve
+        fitted_signal = proxyl_kinetic_model_extended(time, A0_fit, A1_fit, A2_fit, 
+                                                     kb_fit, kd_fit, knt_fit, 
                                                      t0_fit, tmax_fit)
-        fitted_signal_kept = proxyl_kinetic_model_extended(time, A0_fit, A1_fit, A2_fit,
-                                                           kb_fit, kd_fit, knt_fit,
-                                                           t0_fit, tmax_fit)
         
         # Calculate parameter uncertainties with robust error handling
         try:
@@ -506,8 +320,7 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             diag_elements = np.diag(pcov)
             if np.any(diag_elements < 0) or np.any(np.isinf(diag_elements)) or np.any(np.isnan(diag_elements)):
                 # Use relative error estimation if covariance is bad
-                if verbose:
-                    print("Warning: Covariance matrix has numerical issues. Using conservative error estimates.")
+                print("Warning: Covariance matrix has numerical issues. Using conservative error estimates.")
                 param_errors = np.abs(popt) * 0.1  # 10% relative error as fallback
             else:
                 param_errors = np.sqrt(diag_elements)
@@ -516,32 +329,21 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                     if param_errors[i] > abs(popt[i]) * 2:  # Error > 200% of value
                         param_errors[i] = abs(popt[i])  # Cap at 100% error
         except Exception as e:
-            if verbose:
-                print(f"Warning: Error calculation failed ({e}). Using conservative estimates.")
+            print(f"Warning: Error calculation failed ({e}). Using conservative estimates.")
             param_errors = np.abs(popt) * 0.1  # 10% relative error as fallback
-
-        # Force errors for fixed parameters to zero. The conservative
-        # fallbacks above (10% of |popt|) would otherwise lie about
-        # uncertainty for parameters the optimizer never touched.
-        fixed_indices = set(range(8)) - set(free_indices)
-        for fi in fixed_indices:
-            param_errors[fi] = 0.0
-
-        # Calculate fit quality metrics over the kept (non-excluded)
-        # subset only — those are what the optimizer actually saw.
-        residuals = signal - fitted_signal_kept
+        
+        # Calculate fit quality metrics
+        residuals = signal - fitted_signal
         ss_res = np.sum(residuals ** 2)
         ss_tot = np.sum((signal - np.mean(signal)) ** 2)
         r_squared = 1 - (ss_res / ss_tot)
         rmse = np.sqrt(np.mean(residuals ** 2))
-
+        
         # Compile results
         fit_results = {
             'A0': A0_fit,
             'A1': A1_fit,
             'A2': A2_fit,
-            'A0_est': initial_params['A0'],
-            'A2_est': initial_params['A2'],
             'kb': kb_fit,
             'kd': kd_fit,
             'knt': knt_fit,
@@ -549,7 +351,7 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             'tmax': tmax_fit,
             'A0_error': param_errors[0],
             'A1_error': param_errors[1],
-            'A2_error': param_errors[2],
+            'A2_error': param_errors[2], 
             'kb_error': param_errors[3],
             'kd_error': param_errors[4],
             'knt_error': param_errors[5],
@@ -559,65 +361,49 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
             'rmse': rmse,
             'residuals': residuals,
             'covariance_matrix': pcov,
-            'time_units': time_units,
-            'excluded_indices': sorted(excluded_set),
+            'time_units': time_units
         }
-
+        
         return kb_fit, kd_fit, knt_fit, fitted_signal, fit_results
-
+        
     except Exception as e:
-        if verbose:
-            print(f"First fitting attempt failed: {e}")
-            print("Trying alternative fitting approach with relaxed constraints...")
+        print(f"First fitting attempt failed: {e}")
+        print("Trying alternative fitting approach with relaxed constraints...")
         
         try:
-            # Fallback approach with relaxed bounds and different method.
-            # knt upper still respects steady_state_time so the fallback
-            # can't sneak past the user's knt floor either.
+            # Fallback approach with relaxed bounds and different method
             relaxed_upper = [
-                np.max(signal) * 3,         # More relaxed A0
-                signal_range * 5,           # More relaxed A1
-                signal_range * 3,           # More relaxed A2
-                1.0,                        # More relaxed kb
-                0.5,                        # More relaxed kd
-                max(0.1, knt_lower * 2.0),  # knt: keep ≥ 2× knt_lower
-                time[-1],                   # t0
-                time[-1]                    # tmax
+                np.max(signal) * 3,  # More relaxed A0
+                signal_range * 5,    # More relaxed A1
+                signal_range * 3,    # More relaxed A2
+                1.0,      # More relaxed kb
+                0.5,      # More relaxed kd
+                0.1,      # More relaxed knt
+                time[-1], # t0
+                time[-1]  # tmax
             ]
-
-            # Slice relaxed upper bounds to match the free-parameter
-            # set (same indices used for the primary fit).
-            fit_relaxed_upper = [relaxed_upper[i] for i in free_indices]
-
+            
             # Try with dogbox method and looser tolerances
             popt, pcov = curve_fit(
-                fit_model,
+                proxyl_kinetic_model_extended,
                 time,
                 signal,
-                p0=fit_p0,
-                bounds=(fit_lower, fit_relaxed_upper),
+                p0=p0,
+                bounds=(lower_bounds, relaxed_upper),
                 maxfev=2000,
                 method='dogbox',  # Different algorithm
                 ftol=1e-6,        # Looser tolerance
                 xtol=1e-6
             )
-            popt, pcov = _expand_to_8(popt, pcov)
-
+            
             A0_fit, A1_fit, A2_fit, kb_fit, kd_fit, knt_fit, t0_fit, tmax_fit = popt
             
-            if verbose:
-                print("Fallback fitting succeeded with relaxed constraints.")
+            print("Fallback fitting succeeded with relaxed constraints.")
             
-            # Calculate fitted curve over the FULL input time array
-            # (including excluded points) so the caller can plot the
-            # model line through every data point. Quality metrics
-            # below use the kept subset only.
-            fitted_signal = proxyl_kinetic_model_extended(time_full, A0_fit, A1_fit, A2_fit,
-                                                         kb_fit, kd_fit, knt_fit,
+            # Calculate fitted curve
+            fitted_signal = proxyl_kinetic_model_extended(time, A0_fit, A1_fit, A2_fit, 
+                                                         kb_fit, kd_fit, knt_fit, 
                                                          t0_fit, tmax_fit)
-            fitted_signal_kept = proxyl_kinetic_model_extended(time, A0_fit, A1_fit, A2_fit,
-                                                               kb_fit, kd_fit, knt_fit,
-                                                               t0_fit, tmax_fit)
             
             # Simplified error handling for fallback
             try:
@@ -629,29 +415,19 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                         param_errors[i] = abs(popt[i])
             except:
                 param_errors = np.abs(popt) * 0.2  # 20% relative error as fallback
-
-            # Force errors for fixed parameters to zero — same as the
-            # primary fit path. Without this, the 20% fallback would
-            # report a fake uncertainty for tmax / A0 / A2 even though
-            # the optimizer never moved them.
-            fixed_indices = set(range(8)) - set(free_indices)
-            for fi in fixed_indices:
-                param_errors[fi] = 0.0
-
-            # Calculate fit quality metrics on kept points only.
-            residuals = signal - fitted_signal_kept
+            
+            # Calculate fit quality metrics
+            residuals = signal - fitted_signal
             ss_res = np.sum(residuals ** 2)
             ss_tot = np.sum((signal - np.mean(signal)) ** 2)
             r_squared = 1 - (ss_res / ss_tot)
             rmse = np.sqrt(np.mean(residuals ** 2))
-
+            
             # Compile results
             fit_results = {
                 'A0': A0_fit,
                 'A1': A1_fit,
                 'A2': A2_fit,
-                'A0_est': initial_params['A0'],
-                'A2_est': initial_params['A2'],
                 'kb': kb_fit,
                 'kd': kd_fit,
                 'knt': knt_fit,
@@ -659,7 +435,7 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                 'tmax': tmax_fit,
                 'A0_error': param_errors[0],
                 'A1_error': param_errors[1],
-                'A2_error': param_errors[2],
+                'A2_error': param_errors[2], 
                 'kb_error': param_errors[3],
                 'kd_error': param_errors[4],
                 'knt_error': param_errors[5],
@@ -670,10 +446,9 @@ def fit_proxyl_kinetics(time: np.ndarray, signal: np.ndarray,
                 'residuals': residuals,
                 'covariance_matrix': pcov,
                 'time_units': time_units,
-                'excluded_indices': sorted(excluded_set),
                 'fit_method': 'fallback'  # Mark as fallback fit
             }
-
+            
             return kb_fit, kd_fit, knt_fit, fitted_signal, fit_results
             
         except Exception as e2:

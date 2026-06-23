@@ -22,7 +22,7 @@ from PySide6.QtCore import Qt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from .styles import init_qt_app
+from .styles import init_qt_app, apply_brain_axes
 from .components import HeaderWidget
 
 
@@ -623,6 +623,7 @@ class ImageToolsDialog(QDialog):
             im = self.preview_ax.imshow(slice_data, cmap='gray', aspect='equal',
                                         origin='lower')
             self.preview_ax.set_title(f'Difference B-A (z={self.current_z})')
+        apply_brain_axes(self.preview_ax)
 
         # Add ROI contour overlay (T013)
         if self.show_roi_overlay and self.roi_mask is not None:

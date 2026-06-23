@@ -415,14 +415,21 @@ class TestCsvFitResultsRoundtrip:
         assert float(rows['%NTE']['value']) == pytest.approx(expected_nte, rel=0.001)
         assert rows['%Enhancement']['units'] == '%'
 
+        # Initial-estimate values
+        assert float(rows['A0_est']['value']) == pytest.approx(5100.0)
+        assert float(rows['A2_est']['value']) == pytest.approx(-350.0)
+        expected_nte_est = (-350.0 / 5100.0) * 100
+        assert float(rows['%NTE_est']['value']) == pytest.approx(expected_nte_est, rel=0.001)
+        assert rows['%NTE_est']['units'] == '%'
+
         # Fit quality
         assert float(rows['R_squared']['value']) == pytest.approx(0.76)
         assert float(rows['RMSE']['value']) == pytest.approx(163.5)
 
         dialog.close()
 
-    def test_csv_has_12_data_rows(self, temp_dir, sample_fit_results):
-        """CSV should have header + 12 data rows."""
+    def test_csv_has_15_data_rows(self, temp_dir, sample_fit_results):
+        """CSV should have header + 15 data rows."""
         from proxyl_analysis.ui.fitting import FitResultsDialog
         from proxyl_analysis.ui.styles import init_qt_app
 
@@ -442,9 +449,9 @@ class TestCsvFitResultsRoundtrip:
         with open(csv_path, 'r') as f:
             lines = f.readlines()
 
-        # Header + 12 params (A0, A1, A2, kb, kd, knt, t0, tmax,
-        # %Enhancement, %NTE, R_squared, RMSE)
-        assert len(lines) == 13, f"Expected 13 lines (header + 12), got {len(lines)}"
+        # Header + 15 params (A0, A0_est, A1, A2, A2_est, kb, kd, knt, t0,
+        # tmax, %Enhancement, %NTE, %NTE_est, R_squared, RMSE)
+        assert len(lines) == 16, f"Expected 16 lines (header + 15), got {len(lines)}"
 
         dialog.close()
 

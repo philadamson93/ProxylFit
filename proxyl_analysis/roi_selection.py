@@ -10,6 +10,7 @@ from matplotlib.patches import Polygon
 from typing import Tuple, Optional, List
 import warnings
 from .model import add_proxylfit_logo, set_proxylfit_style
+from .ui.styles import apply_brain_axes
 
 try:
     from segment_anything import sam_model_registry, SamPredictor
@@ -196,45 +197,257 @@ def select_rectangle_roi(image_4d: np.ndarray, z_index: int) -> np.ndarray:
     return roi_mask
 
 
-def compute_roi_timeseries(image_4d: np.ndarray, roi_mask: np.ndarray) -> np.ndarray:
+def compute_roi_timeseries(image_4d: np.ndarray, roi_mask: np.ndarray,
+                           z_slice: Optional[int] = None) -> np.ndarray:
     """
-    Compute mean intensity time series for ROI across all timepoints.
-    
+    Compute mean intensity time series for an ROI across all timepoints.
+
     Parameters
     ----------
     image_4d : np.ndarray
-        4D array with shape [x, y, z, t]
+        4D array with shape [x, y, z, t].
     roi_mask : np.ndarray
-        Boolean mask of shape [x, y] defining the ROI
-        
+        Boolean mask of shape [x, y] defining the ROI in-plane.
+    z_slice : int, optional
+        Z-slice the ROI was drawn on. When provided, the signal is the
+        mean of ``image_4d[roi_mask, z_slice, t]`` across timepoints —
+        i.e., a single-slice mean, matching what an ImageJ user gets
+        when drawing a 2D ROI on one slice. **Pass this whenever you
+        know which slice the ROI belongs to** — otherwise (None), the
+        function falls back to averaging the same 2D mask across every
+        z-slice of the volume, which is rarely what's wanted because
+        ROI features change slice to slice.
+
     Returns
     -------
     timeseries : np.ndarray
-        1D array of mean ROI intensity for each timepoint
+        1D array of mean ROI intensity for each timepoint.
     """
     if not np.any(roi_mask):
         raise ValueError("ROI mask contains no True values")
-    
+
     t_points = image_4d.shape[3]
+
+    if z_slice is not None:
+        # Single-slice mean — vectorized over time for speed and clarity.
+        roi_pixels_per_t = image_4d[roi_mask, z_slice, :]  # (n_roi, t)
+        return roi_pixels_per_t.mean(axis=0)
+
+    # Legacy all-z fallback. Averages the same 2D mask across every
+    # z-slice. Kept for backwards compatibility with callers (e.g., older
+    # tests) that don't pass z_slice.
     timeseries = np.zeros(t_points)
-    
-    # Compute mean for each timepoint
     for t in range(t_points):
-        # Extract 2D slice for this timepoint
-        slice_2d = image_4d[:, :, :, t]
-        
-        # Apply mask and compute mean across all z-slices
+        slice_3d = image_4d[:, :, :, t]
         masked_values = []
-        for z in range(slice_2d.shape[2]):
-            slice_z = slice_2d[:, :, z]
-            masked_values.extend(slice_z[roi_mask])
-        
+        for z in range(slice_3d.shape[2]):
+            masked_values.extend(slice_3d[:, :, z][roi_mask])
         timeseries[t] = np.mean(masked_values)
-    
+
     return timeseries
 
 
-def visualize_roi_on_slice(image_slice: np.ndarray, roi_mask: np.ndarray, 
+def save_roi_overlay_png(reference_image: np.ndarray,
+                         roi_mask: np.ndarray,
+                         output_path: str,
+                         z_slice: Optional[int] = None,
+                         title: Optional[str] = None,
+                         contour_color: str = 'cyan') -> str:
+    """
+    Render an anatomical / parameter slice with an ROI contour overlay as a PNG.
+
+    Used as a companion to CSV exports so the saved data is self-documenting:
+    a CSV with mean ± std stats sits next to a PNG showing exactly which
+    pixels produced those numbers.
+
+    Parameters
+    ----------
+    reference_image : np.ndarray
+        2D image (x, y) or 3D volume (x, y, z) — typically the T1 baseline
+        (registered_4d[..., 0]) or a parameter map slice.
+    roi_mask : np.ndarray
+        2D boolean mask (x, y) defining the ROI to outline.
+    output_path : str
+        Destination .png path.
+    z_slice : int, optional
+        Z-slice to render when reference_image is 3D. Defaults to the
+        middle slice. Ignored if reference_image is already 2D.
+    title : str, optional
+        Plot title. Defaults to "ROI on slice z=N".
+    contour_color : str
+        matplotlib color spec for the ROI contour (default 'cyan').
+
+    Returns
+    -------
+    str
+        The output path actually written.
+    """
+    import matplotlib
+    # Use a non-interactive backend so this works headless / from worker
+    # threads / inside batch exports without popping a window.
+    if matplotlib.get_backend().lower() not in ('agg', 'pdf', 'svg', 'ps'):
+        # Already on something interactive — savefig still works fine,
+        # we just don't bother switching backends.
+        pass
+    import matplotlib.pyplot as plt
+
+    if reference_image.ndim == 3:
+        if z_slice is None:
+            z_slice = reference_image.shape[2] // 2
+        ref_slice = reference_image[:, :, z_slice]
+    else:
+        ref_slice = reference_image
+        if z_slice is None:
+            z_slice = 0
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.imshow(ref_slice.T, cmap='gray', origin='lower')
+    if roi_mask is not None and np.any(roi_mask):
+        ax.contour(roi_mask.T, levels=[0.5],
+                   colors=contour_color, linewidths=2)
+    apply_brain_axes(ax)
+    ax.set_title(title or f"ROI on slice z={z_slice}")
+    ax.axis('off')
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=150, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close(fig)
+
+    return str(output_path)
+
+
+def save_table_as_png(rows: list,
+                      headers: list,
+                      output_path: str,
+                      title: Optional[str] = None,
+                      max_col_chars: Optional[list] = None) -> str:
+    """
+    Render a simple data table as a PNG.
+
+    Companion to the various CSV exports — gives users a presentation-
+    ready image of the same data without having to import the CSV into
+    a spreadsheet and screenshot it. Cell content is whatever string
+    representation Python's str() produces, so callers should pre-
+    format floats (e.g. ``f"{value:.4f}"``) before passing the rows.
+
+    Column widths are sized proportionally to the longest string in
+    each column so wide columns (e.g. "description") don't clip while
+    narrow columns (e.g. "units") don't get padded with empty space.
+    Figure width scales with the total character count too, so the
+    table never has to compress to fit a fixed canvas.
+
+    Parameters
+    ----------
+    rows : list of list
+        Table body. Each inner list is one row; cells should be strings.
+    headers : list of str
+        Column headers, rendered with bold styling at the top.
+    output_path : str
+        Destination .png path.
+    title : str, optional
+        Plot title shown above the table.
+    max_col_chars : list of int or None, optional
+        Per-column cap on the "effective character width" used to size
+        the column. ``None`` entries mean "no cap" (use the longest
+        actual content). Useful when one column has a single outlier
+        row that would otherwise blow up the column width and leave
+        every other row visually swimming in blank space — e.g. cap
+        a description column at 22 chars even if one row has 36, and
+        the longer row will visually extend a touch past its cell
+        instead of forcing the whole column wider.
+
+    Returns
+    -------
+    str
+        The output path actually written.
+    """
+    import matplotlib.pyplot as plt
+
+    n_rows = len(rows)
+    n_cols = max(len(headers), 1)
+
+    # Compute the longest cell content per column, including the header
+    # itself. Used to drive both proportional column widths and the
+    # overall figure width — wide columns (long descriptions) get more
+    # horizontal space, narrow columns (units, n_pixels) get less.
+    str_rows = [[str(c) for c in r] for r in rows]
+    col_max_chars = []
+    for col_idx in range(n_cols):
+        widest = len(str(headers[col_idx])) if col_idx < len(headers) else 0
+        for r in str_rows:
+            if col_idx < len(r):
+                widest = max(widest, len(r[col_idx]))
+        # Floor of 4 chars so a 1-character column doesn't collapse to
+        # an unreadable sliver.
+        widest = max(widest, 4)
+        # Apply per-column cap if given. Header length still wins so
+        # the column header itself never clips.
+        if max_col_chars is not None and col_idx < len(max_col_chars):
+            cap = max_col_chars[col_idx]
+            if cap is not None:
+                hdr_len = (len(str(headers[col_idx]))
+                           if col_idx < len(headers) else 0)
+                widest = max(min(widest, int(cap)), hdr_len, 4)
+        col_max_chars.append(widest)
+
+    total_chars = sum(col_max_chars) or 1
+    col_widths_frac = [w / total_chars for w in col_max_chars]
+
+    # Figure dimensions. Width scales with total content length —
+    # roughly 0.10" per character of combined column content, with
+    # padding for the cell margins. Height scales with row count.
+    fig_width = max(6.0, total_chars * 0.10 + 1.5)
+    fig_height = max(2.0, 0.35 * (n_rows + 1) + (0.6 if title else 0.2))
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis('off')
+
+    if title:
+        ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
+
+    if rows:
+        table = ax.table(
+            cellText=str_rows,
+            colLabels=headers,
+            colWidths=col_widths_frac,
+            cellLoc='center',
+            loc='center',
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        # Slight vertical scale so the rows don't crowd; the default
+        # row height is too tight for readable export.
+        table.scale(1, 1.5)
+        # Bold the header row + style.
+        for col in range(n_cols):
+            cell = table[0, col]
+            cell.set_text_props(weight='bold')
+            cell.set_facecolor('#e0e0e0')
+        # Left-align long text columns (heuristic: any column whose
+        # widest content exceeds ~14 characters reads better
+        # left-aligned than centered).
+        for col_idx, widest in enumerate(col_max_chars):
+            if widest > 14:
+                # Left-align all body cells in this column. Header
+                # stays centered + bold.
+                for row_idx in range(1, n_rows + 1):
+                    cell = table[row_idx, col_idx]
+                    cell.get_text().set_ha('left')
+                    # Slight left padding so text doesn't kiss the edge.
+                    cell.PAD = 0.04
+    else:
+        ax.text(0.5, 0.5, "(no data)", ha='center', va='center',
+                fontsize=12, color='#888', transform=ax.transAxes)
+
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=150, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close(fig)
+
+    return str(output_path)
+
+
+def visualize_roi_on_slice(image_slice: np.ndarray, roi_mask: np.ndarray,
                           title: str = "ROI Visualization") -> None:
     """
     Visualize the selected ROI overlaid on the image slice.

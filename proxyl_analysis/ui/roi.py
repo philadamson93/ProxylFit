@@ -17,7 +17,7 @@ from matplotlib.widgets import RectangleSelector
 from matplotlib.patches import Polygon
 from matplotlib.path import Path as MplPath
 
-from .styles import init_qt_app
+from .styles import init_qt_app, apply_brain_axes
 from .components import MatplotlibCanvas, HeaderWidget, InstructionWidget, InfoWidget, ButtonBar
 
 
@@ -96,6 +96,7 @@ class ROISelectorDialog(QDialog):
 
         # Display image
         self.im = self.ax.imshow(self.image_slice.T, cmap='gray', origin='lower')
+        apply_brain_axes(self.ax)
         self.ax.set_xlabel('X')
         self.ax.set_ylabel('Y')
         self.ax.set_title(self._title)
@@ -312,6 +313,7 @@ class ManualContourDialog(QDialog):
         self.ax.clear()
         self.image_slice = self.image_4d[:, :, self.z_index, 0]
         self.im = self.ax.imshow(self.image_slice.T, cmap='gray', origin='lower')
+        apply_brain_axes(self.ax)
         self.ax.set_xlabel('X')
         self.ax.set_ylabel('Y')
         self.ax.set_title(f"{self._title} (Z={self.z_index})")
@@ -432,6 +434,7 @@ class ManualContourDialog(QDialog):
         overlay = self.ax.imshow(mask_overlay, cmap='Reds', alpha=0.4,
                                 origin='lower', extent=self.im.get_extent())
         self.path_plots.append(overlay)
+        apply_brain_axes(self.ax)
 
         # Update info
         num_pixels = np.sum(self.mask)
@@ -500,11 +503,31 @@ def select_rectangle_roi_qt(image_4d: np.ndarray, z_index: int) -> np.ndarray:
         return np.zeros(image_slice.shape, dtype=bool)
 
 
-def select_manual_contour_roi_qt(image_4d: np.ndarray, z_index: int) -> np.ndarray:
+def select_manual_contour_roi_qt(image_4d: np.ndarray, z_index: int,
+                                  return_z: bool = False):
     """
     Qt-based interactive manual contour ROI selection.
 
-    Drop-in replacement for select_manual_contour_roi().
+    Drop-in replacement for select_manual_contour_roi(). The dialog
+    has a z-slider so the user can navigate to a different slice
+    before drawing, which means the slice the ROI lands on can differ
+    from the ``z_index`` the caller passed.
+
+    Parameters
+    ----------
+    image_4d : np.ndarray
+        4D array [x, y, z, t].
+    z_index : int
+        Initial z-slice shown when the dialog opens.
+    return_z : bool, default False
+        When False (default, backwards-compatible), returns just the
+        ROI mask. When True, returns ``(mask, final_z)`` where
+        ``final_z`` is the slice the user *actually* drew the ROI on
+        (could differ from ``z_index`` if they moved the slider). Pass
+        ``True`` from menu workflows so the recorded ``args.z`` /
+        ``roi_state['z_slice']`` track the real slice — otherwise
+        downstream views (parameter map dialog, ROI overlay PNGs) open
+        on whatever slice was passed in initially.
     """
     app = init_qt_app()
 
@@ -522,7 +545,17 @@ def select_manual_contour_roi_qt(image_4d: np.ndarray, z_index: int) -> np.ndarr
             num_pixels = np.sum(mask)
             print(f"\nManual Contour ROI Statistics (z-slice {final_z}):")
             print(f"  Number of pixels: {num_pixels}")
-        return mask if mask is not None else np.zeros(image_4d[:, :, z_index, 0].shape, dtype=bool)
+        result_mask = mask if mask is not None else np.zeros(
+            image_4d[:, :, z_index, 0].shape, dtype=bool
+        )
     else:
         print("ROI selection cancelled")
-        return np.zeros(image_4d[:, :, z_index, 0].shape, dtype=bool)
+        result_mask = np.zeros(image_4d[:, :, z_index, 0].shape, dtype=bool)
+        # On cancel, fall back to the originally requested z_index so
+        # callers that update args.z don't suddenly point at a slice
+        # the user never confirmed.
+        final_z = z_index
+
+    if return_z:
+        return result_mask, final_z
+    return result_mask

@@ -15,7 +15,7 @@ from PySide6.QtGui import QFont
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from .styles import PROXYLFIT_STYLE, init_qt_app
+from .styles import PROXYLFIT_STYLE, init_qt_app, apply_brain_axes
 
 
 class RegistrationWorker(QThread):
@@ -200,10 +200,24 @@ class RegistrationProgressDialog(QDialog):
                 f"Time: {metrics_info['time']:.1f}s"
             )
 
-            # Add to plot data
-            self.timepoints.append(current)
+            # Plot against the actual timepoint index, not the completion
+            # count — in parallel mode timepoints come back in arbitrary
+            # order, and using `current` as the x-axis makes the live plot
+            # disagree with the final accept-page chart (which is sorted
+            # by timepoint). Fall back to `current` for older callers that
+            # don't pass 'timepoint' in metrics_info.
+            tp = metrics_info.get('timepoint', current)
+            self.timepoints.append(tp)
             self.translations.append(metrics_info['translation_mm'])
             self.mse_values.append(metrics_info['mse'])
+
+            # Sort by timepoint so the line plot stays monotonic in x
+            # regardless of completion order.
+            order = sorted(range(len(self.timepoints)),
+                           key=lambda i: self.timepoints[i])
+            self.timepoints   = [self.timepoints[i]   for i in order]
+            self.translations = [self.translations[i] for i in order]
+            self.mse_values   = [self.mse_values[i]   for i in order]
 
             # Update plots
             self._update_plots(total)
@@ -328,6 +342,8 @@ class RegistrationReviewDialog(QDialog):
         self.im_registered = self.ax_registered.imshow(placeholder, cmap='gray', origin='lower')
         self.im_diff = self.ax_diff.imshow(placeholder, cmap='hot', origin='lower')
         self.im_unregistered = self.ax_unregistered.imshow(placeholder, cmap='gray', origin='lower')
+        for _ax in (self.ax_ref, self.ax_registered, self.ax_diff, self.ax_unregistered):
+            apply_brain_axes(_ax)
 
         # Set up axes titles and styling once
         self.ax_ref.set_title('Reference (t=0)', fontsize=10)
@@ -775,6 +791,8 @@ class T2RegistrationReviewDialog(QDialog):
         self.im_overlay = self.ax_overlay.imshow(np.zeros((10, 10, 3)), origin='lower')
         self.im_diff = self.ax_diff.imshow(placeholder, cmap='hot', origin='lower')
         self.im_t2_orig = self.ax_t2_orig.imshow(placeholder, cmap='gray', origin='lower')
+        for _ax in (self.ax_t1, self.ax_t2_reg, self.ax_overlay, self.ax_diff, self.ax_t2_orig):
+            apply_brain_axes(_ax)
 
         # Set titles
         self.ax_t1.set_title('T1 Reference', fontsize=11, fontweight='bold')

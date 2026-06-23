@@ -8,12 +8,125 @@ Includes functions for:
 """
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 
 import numpy as np
 import SimpleITK as sitk
+
+
+def next_indexed_path(directory: Path, prefix: str, suffix: str) -> Path:
+    """
+    Return ``directory / f"{prefix}_<N>{suffix}"`` for the next available N.
+
+    Scans the directory for existing files matching the
+    ``<prefix>_<N><suffix>`` pattern and picks ``max(N) + 1`` so successive
+    saves never overwrite earlier exports. Used to give per-ROI
+    auto-incremented defaults for kinetic-fit, timecourse, and
+    parameter-map-metrics CSV/PNG exports.
+
+    Parameters
+    ----------
+    directory : Path
+        Target directory. Created (with parents) if it doesn't exist.
+    prefix : str
+        Filename prefix before the index, e.g. ``"timecourse_data"``.
+    suffix : str
+        Extension including the leading dot, e.g. ``".csv"``.
+
+    Returns
+    -------
+    Path
+        ``directory / f"{prefix}_{N}{suffix}"`` where N is the next free
+        positive integer (1 if the directory has no matching files).
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    pattern = re.compile(
+        rf'^{re.escape(prefix)}_(\d+){re.escape(suffix)}$'
+    )
+    max_n = 0
+    for f in directory.iterdir():
+        m = pattern.match(f.name)
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return directory / f"{prefix}_{max_n + 1}{suffix}"
+
+
+def index_from_filename(path: Path, prefix: str, suffix: str) -> Optional[int]:
+    """
+    Extract the ``<N>`` from ``"{prefix}_<N>{suffix}"``-style filenames.
+
+    Used so that companion-PNG names can pick up the same N as the CSV
+    the user just chose, regardless of whether they kept the auto-
+    suggested filename or renamed it before saving. Returns None if the
+    filename doesn't match the pattern.
+    """
+    pattern = re.compile(
+        rf'^{re.escape(prefix)}_(\d+){re.escape(suffix)}$'
+    )
+    m = pattern.match(Path(path).name)
+    return int(m.group(1)) if m else None
+
+
+def _z_step_from_multiframe_ipp(ds) -> Optional[float]:
+    """
+    Compute the geometric Z step (mm) from a multi-frame DICOM's per-frame
+    ImagePositionPatient values.
+
+    This is the most reliable way to determine slice-to-slice distance
+    because it measures the actual slice geometry rather than trusting tags.
+    Some scanners populate SliceThickness with the slice profile width
+    (which can be smaller than the slice spacing when there's a gap) and
+    omit SpacingBetweenSlices entirely.
+
+    Parameters
+    ----------
+    ds : pydicom.Dataset
+        Multi-frame DICOM dataset.
+
+    Returns
+    -------
+    float or None
+        Average distance between adjacent unique z-positions, in mm.
+        Returns None if the dataset isn't multi-frame, has no per-frame
+        position info, or only spans a single z-position.
+    """
+    pfs = getattr(ds, 'PerFrameFunctionalGroupsSequence', None)
+    if not pfs:
+        return None
+
+    z_positions = []
+    for frame in pfs:
+        ipp = None
+        pps = getattr(frame, 'PlanePositionSequence', None)
+        if pps and len(pps) > 0:
+            ipp = getattr(pps[0], 'ImagePositionPatient', None)
+        if ipp is None:
+            ipp = getattr(frame, 'ImagePositionPatient', None)
+        if ipp is not None and len(ipp) >= 3:
+            try:
+                z_positions.append(float(ipp[2]))
+            except (TypeError, ValueError):
+                pass
+
+    if len(z_positions) < 2:
+        return None
+
+    # Many multi-frame DICOMs repeat the same set of z-positions across
+    # timepoints, so dedupe to the unique geometric slice positions before
+    # computing the step.
+    unique = sorted({round(z, 4) for z in z_positions})
+    if len(unique) < 2:
+        return None
+
+    diffs = [unique[i + 1] - unique[i] for i in range(len(unique) - 1)]
+    if not diffs:
+        return None
+    step = abs(sum(diffs) / len(diffs))
+    return step if step > 0 else None
 
 
 def _extract_robust_spacing(filepath: str) -> Tuple[float, float, float]:
@@ -48,12 +161,14 @@ def _extract_robust_spacing(filepath: str) -> Tuple[float, float, float]:
             y_spacing = float(ds.PixelSpacing[0])  # Row spacing (Y)
             x_spacing = float(ds.PixelSpacing[1])  # Column spacing (X)
             
-        # Check SliceThickness
-        if hasattr(ds, 'SliceThickness'):
-            z_spacing = float(ds.SliceThickness)
-        elif hasattr(ds, 'SpacingBetweenSlices'):
+        # Z-spacing: prefer SpacingBetweenSlices (true center-to-center distance)
+        # over SliceThickness (which only describes the thickness of one slice
+        # and ignores any gap between slices in non-contiguous acquisitions).
+        if hasattr(ds, 'SpacingBetweenSlices') and ds.SpacingBetweenSlices is not None:
             z_spacing = float(ds.SpacingBetweenSlices)
-        
+        elif hasattr(ds, 'SliceThickness') and ds.SliceThickness is not None:
+            z_spacing = float(ds.SliceThickness)
+
         # Check multi-frame DICOM (Enhanced DICOM)
         if hasattr(ds, 'SharedFunctionalGroupsSequence'):
             for group in ds.SharedFunctionalGroupsSequence:
@@ -62,13 +177,26 @@ def _extract_robust_spacing(filepath: str) -> Tuple[float, float, float]:
                     if hasattr(pm, 'PixelSpacing') and len(pm.PixelSpacing) >= 2:
                         y_spacing = float(pm.PixelSpacing[0])
                         x_spacing = float(pm.PixelSpacing[1])
-                    if hasattr(pm, 'SliceThickness'):
+                    # Same preference order: SpacingBetweenSlices first
+                    if hasattr(pm, 'SpacingBetweenSlices') and pm.SpacingBetweenSlices is not None:
+                        z_spacing = float(pm.SpacingBetweenSlices)
+                    elif hasattr(pm, 'SliceThickness') and pm.SliceThickness is not None:
                         z_spacing = float(pm.SliceThickness)
         
+        # Geometric truth wins: if this is a multi-frame DICOM with per-frame
+        # ImagePositionPatient values, derive Z spacing from those positions
+        # directly. SliceThickness can describe the slice profile rather than
+        # the slice-to-slice distance (e.g., 0.75 mm thick slices with a
+        # 0.75 mm gap = 1.5 mm spacing), and SpacingBetweenSlices is sometimes
+        # absent from vendor exports.
+        ipp_z = _z_step_from_multiframe_ipp(ds)
+        if ipp_z is not None:
+            z_spacing = ipp_z
+
         # Default Z spacing if not found
         if z_spacing is None:
             z_spacing = 1.0
-            
+
         if x_spacing is not None and y_spacing is not None:
             spacing = (x_spacing, y_spacing, z_spacing)
             return spacing
@@ -94,12 +222,15 @@ def _extract_robust_spacing(filepath: str) -> Tuple[float, float, float]:
                 y_spacing = float(parts[0])  # Row spacing
                 x_spacing = float(parts[1])  # Column spacing
                 
-                # Get Z spacing
+                # Get Z spacing — prefer SpacingBetweenSlices over SliceThickness
                 z_spacing = 1.0  # Default
+                spacing_between_slices_tag = "0018|0088"  # SpacingBetweenSlices
                 slice_thickness_tag = "0018|0050"  # SliceThickness
-                if reader.HasMetaDataKey(slice_thickness_tag):
+                if reader.HasMetaDataKey(spacing_between_slices_tag):
+                    z_spacing = float(reader.GetMetaData(spacing_between_slices_tag))
+                elif reader.HasMetaDataKey(slice_thickness_tag):
                     z_spacing = float(reader.GetMetaData(slice_thickness_tag))
-                
+
                 spacing = (x_spacing, y_spacing, z_spacing)
                 return spacing
                 
@@ -374,9 +505,27 @@ def create_dataset_directory(output_base: str, dataset_name: str) -> Path:
     """
     dataset_dir = Path(output_base) / dataset_name
 
-    # Create main directory and subdirectories
-    subdirs = ['registered', 'registered/dicoms', 'roi_analysis',
-               'parameter_maps', 'derived_images']
+    # Create main directory and subdirectories. Layout:
+    #   <dataset>/registered/             — registered DICOM trees
+    #   <dataset>/registered/dicoms/T1/   — per-slice subdirs (set by save_*)
+    #   <dataset>/registered/dicoms/T2/   — flat
+    #   <dataset>/roi_analysis/           — saved ROI masks/state
+    #   <dataset>/derived_images/         — averaged / difference exports
+    #   <dataset>/parameter_maps/         — DICOM, NPZ, and PNG outputs
+    #   <dataset>/parameter_maps/parameter_map_metrics/
+    #                                     — auto-incremented metrics CSVs
+    #                                       and ROI overlay PNGs, one set
+    #                                       per measurement ROI
+    #   <dataset>/kinetic_fits/           — auto-incremented per-ROI bundle:
+    #                                       timecourse_data_<N>.csv,
+    #                                       kinetic_fit_results_<N>.csv,
+    #                                       kinetic_fit_<N>.png,
+    #                                       kinetic_fit_roi_<N>.png
+    subdirs = [
+        'registered', 'registered/dicoms', 'roi_analysis',
+        'parameter_maps', 'parameter_maps/parameter_map_metrics',
+        'derived_images', 'kinetic_fits',
+    ]
 
     for subdir in subdirs:
         (dataset_dir / subdir).mkdir(parents=True, exist_ok=True)
@@ -604,10 +753,22 @@ def save_registered_as_dicom_series(
     source_dicom: str = None
 ) -> str:
     """
-    Save registered 4D data as a series of 2D DICOM files.
+    Save registered 4D data as a series of 2D DICOM files, organized by slice.
 
-    Each file is a single 2D slice. Files are organized as z{ZZ}_t{TTT}.dcm
-    where slices iterate through all timepoints before moving to the next z-slice.
+    Layout:
+        <output_dir>/registered/dicoms/T1/
+            z00/
+                t000.dcm
+                t001.dcm
+                ...
+            z01/
+                ...
+            series_info.json
+
+    The T1 subfolder sits alongside the T2 subfolder produced by
+    save_registered_t2_as_dicom, and the per-slice z folders avoid having
+    1000+ files in a single directory (which gets unwieldy in Finder /
+    most DICOM viewers).
 
     Parameters
     ----------
@@ -616,7 +777,7 @@ def save_registered_as_dicom_series(
     spacing : tuple
         Voxel spacing (x, y, z) in mm
     output_dir : str
-        Output directory (will create 'registered/dicoms' subdirectory)
+        Output directory (will create 'registered/dicoms/T1' subdirectory)
     series_description : str
         DICOM SeriesDescription tag value
     source_dicom : str, optional
@@ -625,13 +786,18 @@ def save_registered_as_dicom_series(
     Returns
     -------
     str
-        Path to the created DICOM series directory
+        Path to the created DICOM series directory (the T1/ subdir).
     """
     import pydicom
+    import shutil
     from pydicom.dataset import FileDataset
 
-    # Create output directory
-    dicom_dir = get_dataset_path(output_dir, 'registered/dicoms')
+    # Wipe the T1 subdir before writing so a re-run doesn't leave stale
+    # files from a previous shape (e.g., different number of timepoints
+    # after reloading a different DICOM source).
+    dicom_dir = Path(get_dataset_path(output_dir, 'registered/dicoms')) / 'T1'
+    shutil.rmtree(dicom_dir, ignore_errors=True)
+    dicom_dir.mkdir(parents=True, exist_ok=True)
 
     x_dim, y_dim, z_dim, n_timepoints = registered_4d.shape
     total_files = z_dim * n_timepoints
@@ -649,17 +815,20 @@ def save_registered_as_dicom_series(
     original_series = source_metadata.get('OriginalSeriesNumber', 1)
     series_number = original_series + 1000
 
-    # Save each 2D slice as a separate DICOM file
+    # Save each 2D slice as a separate DICOM file. One subfolder per
+    # z-slice; files inside are simply t<TTT>.dcm.
     instance_number = 1
     for z in range(z_dim):
+        slice_dir = dicom_dir / f'z{z:02d}'
+        slice_dir.mkdir(parents=True, exist_ok=True)
+
         for t in range(n_timepoints):
             # Get 2D slice [x, y] -> need [y, x] for DICOM
             slice_2d = registered_4d[:, :, z, t]
             slice_dicom = slice_2d.T  # Transpose to [y, x]
 
-            # Create file with z and t in filename
-            filename = f"z{z:02d}_t{t:03d}.dcm"
-            filepath = dicom_dir / filename
+            filename = f"t{t:03d}.dcm"
+            filepath = slice_dir / filename
 
             # Create minimal DICOM dataset
             file_meta = pydicom.dataset.FileMetaDataset()
@@ -732,9 +901,9 @@ def save_registered_as_dicom_series(
 
     # Save series info JSON
     series_info = {
-        'format_version': '2.0',
-        'format_type': '2d_slices',
-        'file_pattern': 'z{z:02d}_t{t:03d}.dcm',
+        'format_version': '2.1',  # bumped from 2.0: per-slice subdirs
+        'format_type': '2d_slices_per_slice_dirs',
+        'file_pattern': 'z{z:02d}/t{t:03d}.dcm',
         'n_slices': z_dim,
         'n_timepoints': n_timepoints,
         'total_files': total_files,
@@ -756,12 +925,18 @@ def save_registered_as_dicom_series(
 
 def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[float, float, float]]:
     """
-    Load a registered DICOM series (2D slice format) back into 4D array.
+    Load a registered DICOM series (2D slice format) back into a 4D array.
+
+    Auto-detects both the current per-slice-subdir layout
+    (``z{ZZ}/t{TTT}.dcm`` written by save_registered_as_dicom_series since
+    format_version 2.1) and the legacy flat layout
+    (``z{ZZ}_t{TTT}.dcm`` from version 2.0). Pre-existing on-disk
+    registrations from older runs continue to load without re-running.
 
     Parameters
     ----------
     series_dir : str
-        Path to directory containing registered DICOM files (z{ZZ}_t{TTT}.dcm format)
+        Path to directory containing the registered DICOM files.
 
     Returns
     -------
@@ -773,17 +948,24 @@ def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[flo
     Raises
     ------
     FileNotFoundError
-        If the directory doesn't contain valid 2D slice DICOM files
+        If neither layout's marker file is present.
     """
     import pydicom
 
     series_path = Path(series_dir)
 
-    # Check for new 2D slice format
-    if not (series_path / 'z00_t000.dcm').exists():
+    # Detect layout. New: z00/t000.dcm. Old: z00_t000.dcm.
+    new_layout_marker = series_path / 'z00' / 't000.dcm'
+    old_layout_marker = series_path / 'z00_t000.dcm'
+    if new_layout_marker.exists():
+        layout = 'per_slice_dirs'
+    elif old_layout_marker.exists():
+        layout = 'flat'
+    else:
         raise FileNotFoundError(
             f"No valid DICOM series found in {series_path}.\n"
-            "Expected format: z00_t000.dcm, z00_t001.dcm, ...\n"
+            "Expected either z00/t000.dcm (current layout) or z00_t000.dcm "
+            "(legacy flat layout).\n"
             "Please re-run registration to generate updated DICOM output."
         )
 
@@ -804,10 +986,14 @@ def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[flo
     # Initialize 4D array
     registered_4d = np.zeros((x_dim, y_dim, z_dim, n_timepoints), dtype=np.float64)
 
-    # Load each 2D slice
+    # Load each 2D slice using the layout we detected.
     for z in range(z_dim):
         for t in range(n_timepoints):
-            filepath = series_path / f'z{z:02d}_t{t:03d}.dcm'
+            if layout == 'per_slice_dirs':
+                filepath = series_path / f'z{z:02d}' / f't{t:03d}.dcm'
+            else:  # 'flat'
+                filepath = series_path / f'z{z:02d}_t{t:03d}.dcm'
+
             if not filepath.exists():
                 raise FileNotFoundError(f"Missing DICOM file: {filepath}")
 
@@ -821,7 +1007,7 @@ def load_registered_dicom_series(series_dir: str) -> Tuple[np.ndarray, Tuple[flo
             # Transpose from [y, x] to [x, y] and store
             registered_4d[:, :, z, t] = pixel_data.T
 
-    print(f"Loaded registered DICOM series with shape: {registered_4d.shape}")
+    print(f"Loaded registered DICOM series ({layout}) with shape: {registered_4d.shape}")
     return registered_4d, spacing
 
 
@@ -853,10 +1039,15 @@ def save_registered_t2_as_dicom(
         Path to the created DICOM series directory
     """
     import pydicom
+    import shutil
     from pydicom.dataset import FileDataset
 
-    # Create output directory
-    dicom_dir = get_dataset_path(output_dir, 'registered/dicoms/T2')
+    # Wipe the T2 subdir before writing so a re-run doesn't leave stale
+    # files (e.g., if a different T2 source was loaded). Same convention
+    # as the T1 series writer.
+    dicom_dir = Path(get_dataset_path(output_dir, 'registered/dicoms')) / 'T2'
+    shutil.rmtree(dicom_dir, ignore_errors=True)
+    dicom_dir.mkdir(parents=True, exist_ok=True)
 
     x_dim, y_dim, z_dim = registered_t2.shape
 
@@ -1028,6 +1219,213 @@ def load_registered_t2(output_dir: str) -> Tuple[Optional[np.ndarray], Tuple[flo
 
     print(f"  Loaded registered T2 with shape: {registered_t2.shape}")
     return registered_t2, spacing
+
+
+def save_volume_as_dicom_series(
+    volume: np.ndarray,
+    label: str,
+    output_dir: str,
+    spacing: Tuple[float, float, float],
+    source_dicom: Optional[str] = None,
+    series_description: Optional[str] = None,
+    series_offset: int = 1000,
+) -> List[str]:
+    """
+    Save a 3D anatomical volume as a DICOM series in a named subfolder.
+
+    Used by the parameter-map dialog to write reference T1 and T2 volumes
+    alongside the parameter maps in the same export folder so a clinician
+    opening the folder gets parameter maps + anatomical references in one
+    place. Subfolder layout matches ``save_parameter_map_as_dicom`` so the
+    resulting tree is consistent across map-style and anatomical exports.
+
+    Parameters
+    ----------
+    volume : np.ndarray
+        3D image array with shape [x, y, z].
+    label : str
+        Short identifier used as the subfolder name and filename prefix
+        (e.g. ``"T1_baseline"`` or ``"T2"``). Files land at
+        ``<output_dir>/<label>/<label>_z{ZZ}.dcm``.
+    output_dir : str
+        Base output directory. The ``<label>/`` subdirectory is created
+        (and wiped clean if it already exists, matching the parameter-map
+        export's "fresh series only" behavior).
+    spacing : tuple
+        Voxel spacing (x, y, z) in mm.
+    source_dicom : str, optional
+        Path to a source DICOM to copy patient/study metadata from. If
+        omitted, anonymous defaults are used.
+    series_description : str, optional
+        SeriesDescription tag. Defaults to ``f"Registered {label}"``.
+    series_offset : int
+        Added to the source's OriginalSeriesNumber to keep this series
+        unique relative to other series in the same study.
+
+    Returns
+    -------
+    List[str]
+        Paths to the saved DICOM files, one per z-slice.
+    """
+    import pydicom
+    import shutil
+    from pydicom.dataset import FileDataset
+
+    if volume.ndim != 3:
+        raise ValueError(f"Expected 3D volume, got shape {volume.shape}")
+
+    output_path = Path(output_dir)
+    series_dir = output_path / label
+    # Same wipe-before-write convention as save_parameter_map_as_dicom so
+    # stale slices from a previous run don't mix with the new series.
+    shutil.rmtree(series_dir, ignore_errors=True)
+    series_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy source metadata where possible
+    source_metadata = {}
+    if source_dicom:
+        source_metadata = _copy_dicom_metadata(source_dicom)
+
+    series_uid = _generate_uid()
+    study_uid = source_metadata.get('StudyInstanceUID', _generate_uid())
+    original_series = source_metadata.get('OriginalSeriesNumber', 1)
+    series_number = original_series + series_offset
+    desc = series_description or f"Registered {label}"
+
+    x_dim, y_dim, z_dim = volume.shape
+    saved_files: List[str] = []
+
+    for z in range(z_dim):
+        # 2D slice in [x, y]; DICOM stores [row, col] = [y, x].
+        slice_2d = volume[:, :, z].T
+
+        filepath = series_dir / f"{label}_z{z:02d}.dcm"
+
+        file_meta = pydicom.dataset.FileMetaDataset()
+        file_meta.MediaStorageSOPClassUID = pydicom.uid.MRImageStorage
+        file_meta.MediaStorageSOPInstanceUID = _generate_uid()
+        file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+        ds = FileDataset(str(filepath), {}, file_meta=file_meta, preamble=b"\0" * 128)
+
+        # Patient / study
+        ds.PatientID = source_metadata.get('PatientID', 'ANONYMOUS')
+        ds.PatientName = source_metadata.get('PatientName', 'Anonymous')
+        ds.StudyInstanceUID = study_uid
+        ds.StudyDate = source_metadata.get('StudyDate', time.strftime('%Y%m%d'))
+        ds.StudyDescription = source_metadata.get('StudyDescription', 'DCE-MRI Study')
+
+        # Series
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesNumber = series_number
+        ds.SeriesDescription = desc
+
+        # Instance
+        ds.SOPClassUID = pydicom.uid.MRImageStorage
+        ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+        ds.InstanceNumber = z + 1
+
+        # Geometry
+        ds.SliceLocation = float(z * spacing[2])
+        ds.ImagePositionPatient = [0.0, 0.0, float(z * spacing[2])]
+        ds.InStackPositionNumber = z + 1
+
+        ds.Modality = 'MR'
+        # DERIVED/SECONDARY because these come from the registered volume,
+        # not the original acquisition.
+        ds.ImageType = ['DERIVED', 'SECONDARY', 'REGISTERED']
+        ds.Rows = y_dim
+        ds.Columns = x_dim
+        ds.PixelSpacing = [float(spacing[1]), float(spacing[0])]
+        ds.SliceThickness = float(spacing[2])
+        ds.SpacingBetweenSlices = float(spacing[2])
+
+        # Pixel data — anatomical T1/T2 are non-negative; map to uint16 with
+        # a global rescale so the full dynamic range survives.
+        ds.BitsAllocated = 16
+        ds.BitsStored = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 0
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = 'MONOCHROME2'
+
+        slice_clean = np.nan_to_num(slice_2d, nan=0.0)
+        slice_min = float(slice_clean.min())
+        slice_max = float(slice_clean.max())
+        if slice_max > slice_min:
+            scaled = ((slice_clean - slice_min) / (slice_max - slice_min) * 65535).astype(np.uint16)
+            ds.RescaleSlope = (slice_max - slice_min) / 65535
+            ds.RescaleIntercept = slice_min
+        else:
+            scaled = np.zeros_like(slice_clean, dtype=np.uint16)
+            ds.RescaleSlope = 1.0
+            ds.RescaleIntercept = 0.0
+        ds.PixelData = scaled.tobytes()
+
+        ds.save_as(str(filepath))
+        saved_files.append(str(filepath))
+
+    return saved_files
+
+
+def save_volume_as_png_series(volume: np.ndarray,
+                              label: str,
+                              output_dir: str) -> List[str]:
+    """
+    Save a 3D volume as a per-slice PNG series.
+
+    Companion to :func:`save_volume_as_dicom_series`. Used by the
+    parameter-map dialog to write reference T1/T2 anatomical volumes as
+    PNGs alongside the DICOMs (when both export variants are checked).
+
+    Layout: ``<output_dir>/<label>/<label>_z{ZZ}.png``. The subfolder is
+    wiped before writing so re-runs leave only the current series.
+
+    Parameters
+    ----------
+    volume : np.ndarray
+        3D image array with shape [x, y, z].
+    label : str
+        Subfolder name and filename prefix (e.g., ``"T1_baseline"``).
+    output_dir : str
+        Base directory; ``<label>/`` is created underneath.
+
+    Returns
+    -------
+    List[str]
+        Paths to the saved PNG files, one per z-slice.
+    """
+    import shutil
+    import matplotlib.pyplot as plt
+
+    if volume.ndim != 3:
+        raise ValueError(f"Expected 3D volume, got shape {volume.shape}")
+
+    series_dir = Path(output_dir) / label
+    shutil.rmtree(series_dir, ignore_errors=True)
+    series_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: List[str] = []
+    n_z = volume.shape[2]
+    for z in range(n_z):
+        slice_2d = volume[:, :, z]
+        filepath = series_dir / f"{label}_z{z:02d}.png"
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+        # Match the parameter-map PNG export's layout: anatomical in
+        # grayscale, transposed + origin='lower' so axes match the
+        # parameter-map view, no axis ticks for a clean export.
+        ax.imshow(slice_2d.T, cmap='gray', origin='lower')
+        ax.set_title(f"{label} (z={z})")
+        ax.axis('off')
+        fig.tight_layout()
+        fig.savefig(str(filepath), dpi=150, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        plt.close(fig)
+
+        saved.append(str(filepath))
+
+    return saved
 
 
 def save_derived_image_as_dicom(
@@ -1246,12 +1644,16 @@ def save_parameter_map_as_dicom(
         List of paths to saved DICOM file(s)
     """
     import pydicom
+    import shutil
     from pydicom.dataset import FileDataset
 
     output_path = Path(output_dir)
 
-    # Create subfolder for this parameter map
+    # Create subfolder for this parameter map. Wipe any prior export first so
+    # stale files from a previous run with a different slice count or naming
+    # scheme don't get picked up alongside the fresh series.
     map_dir = output_path / map_name
+    shutil.rmtree(map_dir, ignore_errors=True)
     map_dir.mkdir(parents=True, exist_ok=True)
 
     # Get source metadata
@@ -1267,6 +1669,11 @@ def save_parameter_map_as_dicom(
         'r_squared_map': 'R-squared (fit quality)',
         'a1_amplitude_map': 'Tracer Amplitude (A1)',
         'a2_amplitude_map': 'Non-tracer Amplitude (A2)',
+        'a0_est_map': 'Baseline initial estimate (A0_est)',
+        'a2_est_map': 'Non-tracer Amplitude initial estimate (A2_est)',
+        'a1_percent_map': '%Enhancement (A1/A0)',
+        'a2_percent_map': '%NTE (A2/A0)',
+        'a2_percent_est_map': '%NTE_est (A2_est/A0_est)',
         'baseline_map': 'Baseline (A0)',
         't0_map': 'Tracer Onset (t0)',
         'tmax_map': 'Non-tracer Onset (tmax)'
@@ -1284,7 +1691,9 @@ def save_parameter_map_as_dicom(
     map_offsets = {
         'kb_map': 4000, 'kd_map': 4100, 'knt_map': 4200,
         'r_squared_map': 4300, 'a1_amplitude_map': 4400, 'a2_amplitude_map': 4500,
-        'baseline_map': 4600, 't0_map': 4700, 'tmax_map': 4800
+        'baseline_map': 4600, 't0_map': 4700, 'tmax_map': 4800,
+        'a1_percent_map': 4900, 'a2_percent_map': 5000,
+        'a0_est_map': 5100, 'a2_est_map': 5200, 'a2_percent_est_map': 5300,
     }
     series_offset = map_offsets.get(map_name, 4000)
 
